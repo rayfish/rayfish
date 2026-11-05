@@ -8,6 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- macOS: install the bundled `ray` command and tab completion in fish from the app.
 - `rayfish_peer_spurious_congestion_events` exposes loss declarations later
   contradicted by acknowledgements, counted as events on the selected path.
 

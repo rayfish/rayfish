@@ -22,6 +22,7 @@ struct AppUITests {
     @MainActor
     static func main() throws {
         try shellCommandAliases()
+        try fishCommandInstallation()
         _ = NSApplication.shared
         let controller = TunnelController()
         let menu = NSMenu()
@@ -129,12 +130,14 @@ struct AppUITests {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let executable = directory.appendingPathComponent("Rayfish Test's $App")
+        let executable = directory.appendingPathComponent("Rayfish Test's $App\\bundle")
         let command = """
         #!/bin/sh
         if [ "$1" = completions ]; then
           if [ "$2" = zsh ]; then
             printf '%s\\n' 'function _ray_test() { :; }' 'compdef _ray_test ray'
+          elif [ "$2" = fish ]; then
+            printf '%s\\n' 'complete -c ray -f -a peer'
           else
             printf '%s\\n' 'complete -W peer ray'
           fi
@@ -145,23 +148,35 @@ struct AppUITests {
         try command.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
 
-        let original = "# Keep this setting\nexport RAYFISH_TEST=1\n\n# Rayfish command\nalias ray='old'\n"
         let configuration = directory.appendingPathComponent("shellrc")
-        for shell in ["zsh", "bash"] {
+        for shell in ["zsh", "bash", "fish"] {
+            let setting = shell == "fish" ? "set -gx RAYFISH_TEST 1" : "export RAYFISH_TEST=1"
+            let original = "# Keep this setting\n\(setting)\n\n# Rayfish command\nalias ray='old'\n"
             let updated = ShellCommandInstaller.replacingCommand(
                 in: original, executable: executable.path, shell: shell)
-            precondition(updated.hasPrefix("# Keep this setting\nexport RAYFISH_TEST=1\n"))
+            precondition(updated.hasPrefix("# Keep this setting\n\(setting)\n"))
             precondition(!updated.contains("alias ray='old'"))
             precondition(updated.contains("completions \(shell)"))
             precondition(ShellCommandInstaller.replacingCommand(
                 in: updated, executable: executable.path, shell: shell) == updated)
-            let check = shell == "zsh" ? "print -r -- \"${_comps[ray]}\"\n" : "complete -p ray\n"
+            let check: String
+            let options: [String]
+            switch shell {
+            case "zsh":
+                check = "print -r -- \"${_comps[ray]}\"\n"
+                options = ["-f"]
+            case "fish":
+                check = "complete -C 'ray '\n"
+                options = ["--no-config"]
+            default:
+                check = "complete -p ray\n"
+                options = ["--noprofile", "--norc", "-O", "expand_aliases"]
+            }
             try (updated + "ray 'argument with spaces'\n" + check)
                 .write(to: configuration, atomically: true, encoding: .utf8)
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/\(shell)")
-            process.arguments = (shell == "zsh" ? ["-f"] : ["--noprofile", "--norc", "-O", "expand_aliases"])
-                + [configuration.path]
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [shell] + options + [configuration.path]
             let output = Pipe()
             process.standardOutput = output
             try process.run()
@@ -169,8 +184,46 @@ struct AppUITests {
             precondition(process.terminationStatus == 0)
             let result = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             precondition(result.hasPrefix("argument with spaces"))
-            precondition(result.contains(shell == "zsh" ? "_ray_test" : "complete -W"))
+            let expected = shell == "zsh" ? "_ray_test" : shell == "fish" ? "peer" : "complete -W"
+            precondition(result.contains(expected))
         }
-        print("PASS: shell command installation registers completion in zsh and bash")
+        print("PASS: shell command installation registers completion in zsh, bash, and fish")
+    }
+
+    private static func fishCommandInstallation() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let executable = home.appendingPathComponent("ray")
+        try "#!/bin/sh\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+        var environment = ["SHELL": "/opt/test/bin/fish"]
+        precondition(ShellCommandInstaller.shellName(environment: environment) == "fish")
+        let defaultConfig = home.appendingPathComponent(".config/fish/config.fish")
+        let installed = try ShellCommandInstaller.install(
+            executable: executable, home: home, environment: environment)
+        precondition(installed == defaultConfig)
+        precondition(FileManager.default.fileExists(atPath: installed.path))
+
+        environment["XDG_CONFIG_HOME"] = "relative-config"
+        let relativeInstalled = try ShellCommandInstaller.install(
+            executable: executable, home: home, environment: environment)
+        precondition(relativeInstalled == defaultConfig)
+
+        let config = home.appendingPathComponent("custom config")
+        environment["XDG_CONFIG_HOME"] = config.path
+        let customInstalled = try ShellCommandInstaller.install(
+            executable: executable, home: home, environment: environment)
+        precondition(customInstalled == config.appendingPathComponent("fish/config.fish"))
+        let settings = "# Keep this setting\nset -gx RAYFISH_TEST 1\n"
+        try settings.write(to: customInstalled, atomically: true, encoding: .utf8)
+        _ = try ShellCommandInstaller.install(executable: executable, home: home, environment: environment)
+        let contents = try String(contentsOf: customInstalled, encoding: .utf8)
+        precondition(contents.hasPrefix(settings))
+        _ = try ShellCommandInstaller.install(executable: executable, home: home, environment: environment)
+        let reinstalled = try String(contentsOf: customInstalled, encoding: .utf8)
+        precondition(reinstalled == contents)
+        print("PASS: fish installation creates its config directory and preserves settings on reinstall")
     }
 }
