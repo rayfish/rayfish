@@ -25,8 +25,17 @@ IP:
 - **ICMP flood** — `ping -f -c 10000` (as fast as the link accepts)
 - **iperf3 UDP** — `iperf3 -u -b 50M -t 10`, reading `lost_percent`
 
-One additional WebSocket test sends repeated small replies and messages up to
-1 MiB from srv-b to srv-a. Every frame is checked; a 10-second stall fails.
+Before the traffic probes, all hosts must report disabled Linux TUN TCP/UDP
+offload and mesh QUIC segmentation offload. Missing metrics also fail.
+
+WebSocket tests run by default in both directions between srv-a and srv-b.
+Each sends 105,250 frames (72,724,400 payload bytes), mixing small replies with
+messages up to 1 MiB. Every frame is checked; a 10-second socket read timeout
+or a 180-second transfer deadline fails. JSON results record counts, bytes,
+elapsed time, frame reads taking at least 100 ms, and minimum/maximum frame
+read wait. These waits include payload transfer time, not one-way network
+latency. The JSON is saved beside the loss report, including partial results
+when a transfer fails.
 
 A probe **FAILs** only when the rayfish-path loss exceeds the direct-path loss by
 more than `MARGIN` percentage points (default `0.5`), so genuine internet drops

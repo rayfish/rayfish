@@ -4,8 +4,10 @@
 import argparse
 import base64
 import hashlib
+import json
 import socket
 import struct
+import sys
 import time
 
 PORT = 38923
@@ -93,35 +95,59 @@ def server(address):
             sock.sendall(frame(b"", 8))
 
 
-def client(address):
+def client(address, stall_ms=100):
     start = time.monotonic()
     count = total = 0
-    with socket.socket(socket.AF_INET6) as sock:
-        sock.settimeout(TIMEOUT)
-        sock.connect((address, PORT))
-        sock.sendall(
-            b"GET / HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
-            b"Connection: Upgrade\r\nSec-WebSocket-Key: " + KEY
-            + b"\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        )
-        response = read_headers(sock)
-        if b"101 Switching Protocols" not in response or ACCEPT not in response:
-            raise ValueError("WebSocket upgrade failed")
-        for expected in messages():
+    waits = []
+    error = None
+    try:
+        with socket.socket(socket.AF_INET6) as sock:
+            sock.settimeout(TIMEOUT)
+            sock.connect((address, PORT))
+            sock.sendall(
+                b"GET / HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Key: " + KEY
+                + b"\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            response = read_headers(sock)
+            if b"101 Switching Protocols" not in response or ACCEPT not in response:
+                raise ValueError("WebSocket upgrade failed")
+            for expected in messages():
+                frame_start = time.monotonic()
+                try:
+                    opcode, payload = read_frame(sock)
+                finally:
+                    waits.append((time.monotonic() - frame_start) * 1000)
+                if opcode != 2 or payload != expected:
+                    raise ValueError(f"incorrect frame {count}")
+                count += 1
+                total += len(payload)
             opcode, payload = read_frame(sock)
-            if opcode != 2 or payload != expected:
-                raise ValueError(f"incorrect frame {count}")
-            count += 1
-            total += len(payload)
-        opcode, payload = read_frame(sock)
-        if opcode != 8 or payload:
-            raise ValueError("missing WebSocket close frame")
-    print(f"received {count} frames and {total} bytes in {time.monotonic() - start:.2f}s")
+            if opcode != 8 or payload:
+                raise ValueError("missing WebSocket close frame")
+    except (OSError, EOFError, ValueError) as exc:
+        error = str(exc)
+    print(json.dumps({
+        "frames": count,
+        "bytes": total,
+        "seconds": round(time.monotonic() - start, 3),
+        "stall_threshold_ms": stall_ms,
+        "stalls": sum(wait >= stall_ms for wait in waits),
+        "best_frame_wait_ms": round(min(waits), 3) if waits else None,
+        "worst_frame_wait_ms": round(max(waits), 3) if waits else None,
+        "error": error,
+    }), flush=True)
+    return error is None
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("role", choices=("server", "client"))
     parser.add_argument("address")
+    parser.add_argument("--stall-ms", type=float, default=100,
+                        help="report frame reads taking at least this many milliseconds")
     args = parser.parse_args()
-    (server if args.role == "server" else client)(args.address)
+    if args.role == "server":
+        server(args.address)
+    else:
+        sys.exit(0 if client(args.address, args.stall_ms) else 1)

@@ -93,8 +93,9 @@ pub trait TunRead: Send + 'static {
 
 /// A packet the device delivered that the reader could not decode, such as a
 /// Linux offload record that needs more segments than tun-rs can split it into
-/// (#237). Only that packet is lost: the next read starts clean, so the
-/// forwarding loop counts it and keeps reading.
+/// (#237). That entire record is lost, potentially containing multiple IP
+/// packets. The next read starts clean; the forwarding loop counts one failed
+/// record and keeps reading.
 #[derive(Debug)]
 pub struct UnreadablePacket(pub std::io::Error);
 
@@ -244,7 +245,9 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     #[cfg(not(target_os = "linux"))]
     let builder = builder.ipv6(v6, 128).enable(true);
     #[cfg(target_os = "linux")]
-    let builder = builder.name(LINUX_TUN_NAME).offload(true);
+    // Keep Linux TUN segmentation and receive offload disabled while the
+    // burst-stall investigation is open. QUIC offload is configured separately.
+    let builder = builder.name(LINUX_TUN_NAME).offload(false);
     #[cfg(target_os = "windows")]
     let builder = builder
         .mtu_v6(MIN_TUN_MTU)
@@ -273,8 +276,9 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
         ipv6 = %v6,
         tun = %tun_name,
         mtu,
-        tcp_gso = device.tcp_gso(),
-        udp_gso = device.udp_gso(),
+        tun_tcp_offload = device.tcp_gso(),
+        tun_udp_offload = device.udp_gso(),
+        mesh_quic_segmentation_offload = crate::transport::MESH_QUIC_SEGMENTATION_OFFLOAD,
         "TUN device created"
     );
     #[cfg(not(target_os = "linux"))]

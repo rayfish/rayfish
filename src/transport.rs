@@ -333,9 +333,9 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //     to round-robin, so fairness scheduling is pure overhead. (Affects
         //     stream scheduling only, not datagrams, but is the correct setting and
         //     removes a small amount of per-packet work.)
-        //   - GSO on (default): confirmed explicit so a future change can't silently
-        //     regress it. GSO coalesces same-destination segments into one sendmsg,
-        //     cutting syscalls under burst.
+        //   - QUIC segmentation offload is disabled on Linux until failed GSO
+        //     sends recover on existing connections. Other platforms keep GSO
+        //     to coalesce same-destination segments into one sendmsg.
         //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
         //     small send limit. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
@@ -534,6 +534,10 @@ fn is_unroutable(e: &io::Error) -> bool {
 
 const DATAGRAM_SEND_BUFFER_SIZE: usize = 16 * 1024;
 
+/// Mesh QUIC transmit policy, independent of TUN offload. iroh's address
+/// discovery client uses a separate transport configuration.
+pub(crate) const MESH_QUIC_SEGMENTATION_OFFLOAD: bool = !cfg!(target_os = "linux");
+
 /// Bound standalone queueing delay and keep FQ-CoDel's backlog in its scheduler.
 pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
     match engine {
@@ -549,7 +553,11 @@ pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
 pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
-    tracing::info!(engine = engine.as_ref(), "QUIC transport config");
+    tracing::info!(
+        engine = engine.as_ref(),
+        mesh_quic_segmentation_offload = MESH_QUIC_SEGMENTATION_OFFLOAD,
+        "mesh QUIC transport config"
+    );
     QuicTransportConfig::builder()
         .congestion_controller_factory(Arc::new(LossTolerantConfig::default()))
         // There are no competing data streams of equal priority, so disable
@@ -558,8 +566,9 @@ pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
         .send_fairness(false)
         // After a GSO send fails, existing iroh connections can keep using it
         // and stall on Linux: https://github.com/n0-computer/iroh/issues/4555
-        // Disable it here until the transport handles the failure correctly.
-        .enable_segmentation_offload(!cfg!(target_os = "linux"))
+        // Disable it for mesh connections until fallback recovers. iroh-relay's
+        // address-discovery client builds its own default transport config.
+        .enable_segmentation_offload(MESH_QUIC_SEGMENTATION_OFFLOAD)
         // Keep the unreliable datagram queue small. When it fills, noQ discards
         // older datagrams rather than making the forwarding path wait and add
         // latency behind stale traffic.

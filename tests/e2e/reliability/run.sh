@@ -158,6 +158,26 @@ for i in "${!HOSTS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
+# Both layers must report the temporary Linux offload policy before sending
+# bursts. Missing metrics fail too, so an old binary cannot silently pass.
+step "2c. verify Linux TUN and mesh QUIC offload are disabled"
+for i in "${!HOSTS[@]}"; do
+  if on "${PUBS[$i]}" 'curl -fsS http://127.0.0.1:9090/metrics' | awk '
+    $1 == "rayfish_tun_tcp_offload_enabled" ||
+    $1 == "rayfish_tun_udp_offload_enabled" ||
+    $1 == "rayfish_mesh_quic_segmentation_offload_enabled" {
+      seen++
+      if ($2 != 0) enabled = 1
+    }
+    END { exit (seen != 3 || enabled) }
+  '; then
+    pass "${HOSTS[$i]} TUN and mesh QUIC offload disabled"
+  else
+    fail "${HOSTS[$i]} offload enabled or metrics unavailable"
+  fi
+done
+
+# ---------------------------------------------------------------------------
 # Probe every unordered pair in both directions. Results also land in a report.
 RESDIR="$DIR/results"; mkdir -p "$RESDIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -192,22 +212,26 @@ for i in "${!HOSTS[@]}"; do
   done
 done
 
-step "4. mixed-size WebSocket bursts from srv-b to srv-a"
+step "4. mixed-size WebSocket bursts in both directions"
 STREAM_PORT=38923
 STREAM_REMOTE=/tmp/rayfish-stream-test.py
-if on "${PUBS[1]}" "ray firewall add in allow --proto tcp --port $STREAM_PORT >/dev/null" \
-  && scp "${SSH_OPTS[@]}" -i "$KEY" "$DIR/stream.py" "root@[${PUBS[0]}]:$STREAM_REMOTE" >/dev/null \
-  && scp "${SSH_OPTS[@]}" -i "$KEY" "$DIR/stream.py" "root@[${PUBS[1]}]:$STREAM_REMOTE" >/dev/null \
-  && on "${PUBS[1]}" "systemctl stop rayfish-stream-test 2>/dev/null; systemctl reset-failed rayfish-stream-test 2>/dev/null; systemd-run --unit=rayfish-stream-test --quiet python3 $STREAM_REMOTE server ${VPNS[1]}" \
-  && retry_until 30 "on '${PUBS[1]}' 'ss -ltnH | grep -q :$STREAM_PORT'" \
-  && on "${PUBS[0]}" "python3 $STREAM_REMOTE client ${VPNS[1]}"; then
-  pass "mixed-size WebSocket transfer completed"
-else
-  fail "mixed-size WebSocket transfer stalled or lost data"
-  on "${PUBS[1]}" 'journalctl -u rayfish-stream-test -n 20 --no-pager' || true
-fi
-on "${PUBS[1]}" "systemctl stop rayfish-stream-test 2>/dev/null; rm -f $STREAM_REMOTE" || true
-on "${PUBS[0]}" "rm -f $STREAM_REMOTE" || true
+for client in 0 1; do
+  server=$((1-client))
+  stream_result="$RESDIR/$STAMP.stream-$server-$client.json"
+  if on "${PUBS[$server]}" "ray firewall add in allow --proto tcp --port $STREAM_PORT >/dev/null" \
+    && scp "${SSH_OPTS[@]}" -i "$KEY" "$DIR/stream.py" "root@[${PUBS[$client]}]:$STREAM_REMOTE" >/dev/null \
+    && scp "${SSH_OPTS[@]}" -i "$KEY" "$DIR/stream.py" "root@[${PUBS[$server]}]:$STREAM_REMOTE" >/dev/null \
+    && on "${PUBS[$server]}" "systemctl stop rayfish-stream-test 2>/dev/null; systemctl reset-failed rayfish-stream-test 2>/dev/null; systemd-run --unit=rayfish-stream-test --quiet python3 $STREAM_REMOTE server ${VPNS[$server]}" \
+    && retry_until 30 "on '${PUBS[$server]}' 'ss -ltnH | grep -q :$STREAM_PORT'" \
+    && on "${PUBS[$client]}" "timeout --kill-after=2s 180s python3 $STREAM_REMOTE client ${VPNS[$server]}" | tee "$stream_result"; then
+    pass "${HOSTS[$server]} -> ${HOSTS[$client]} mixed-size WebSocket transfer completed"
+  else
+    fail "${HOSTS[$server]} -> ${HOSTS[$client]} mixed-size WebSocket transfer stalled or lost data"
+    on "${PUBS[$server]}" 'journalctl -u rayfish-stream-test -n 20 --no-pager' || true
+  fi
+  on "${PUBS[$server]}" "systemctl stop rayfish-stream-test 2>/dev/null; rm -f $STREAM_REMOTE" || true
+  on "${PUBS[$client]}" "rm -f $STREAM_REMOTE" || true
+done
 
 # ---------------------------------------------------------------------------
 step "report"
@@ -224,6 +248,15 @@ REPORT="$RESDIR/$STAMP.md"
   while IFS=$'\t' read -r f t p r d; do
     printf '| %s | %s | %s | %s%% | %s%% |\n' "$f" "$t" "$p" "$r" "$d"
   done < "$RAW"
+  echo
+  echo 'WebSocket results (frame counts, payload bytes, stalls >=100 ms, frame read wait):'
+  for stream_result in "$RESDIR/$STAMP".stream-*.json; do
+    echo
+    echo "$(basename "$stream_result"):"
+    echo '```json'
+    cat "$stream_result"
+    echo '```'
+  done
 } | tee "$REPORT"
 
 echo
