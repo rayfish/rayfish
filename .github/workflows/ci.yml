@@ -202,7 +202,7 @@ jobs:
           cargo -q test -p rayfish --bin ray --locked --features macos-app cli::help::tests
 
       - name: Install macOS test runner
-        run: brew install just
+        run: brew install just fish
 
       - name: Test native app
         run: just macos-test macos-ipc-test macos-ui-test macos-notification-test
