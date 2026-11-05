@@ -6406,7 +6406,7 @@ dependencies = [
 
 [[package]]
 name = "rayfish"
-version = "0.5.15"
+version = "0.5.16"
 dependencies = [
  "ahash",
  "anyhow",
