@@ -21,6 +21,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Large transfers over the mesh no longer stall as readily during traffic bursts.
 - macOS partial DNS no longer adds `.ray` to short-name searches.
 - Linux partial DNS no longer adds `.ray` when the existing search list is long.
 

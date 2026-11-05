@@ -9,6 +9,52 @@ use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
 #[tokio::test]
+async fn standalone_datagram_burst_reaches_peer() {
+    use iroh::endpoint::presets;
+    use iroh::{Endpoint, RelayMode};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let endpoint = || {
+        Endpoint::builder(presets::N0)
+            .alpns(vec![crate::transport::mesh_alpn()])
+            .relay_mode(RelayMode::Disabled)
+            .transport_config(crate::transport::quic_transport_config(
+                QuicEngine::Standalone,
+            ))
+    };
+    let sender = endpoint().bind().await.unwrap();
+    let receiver = endpoint().bind().await.unwrap();
+    let alpn = crate::transport::mesh_alpn();
+    let (send, recv) = timeout(Duration::from_secs(10), async {
+        tokio::join!(sender.connect(receiver.addr(), &alpn), async {
+            receiver.accept().await.unwrap().await.unwrap()
+        })
+    })
+    .await
+    .unwrap();
+    let send = send.unwrap();
+    let packets: Vec<Bytes> = (0..128u8)
+        .map(|index| Bytes::from(vec![index; 1024]))
+        .collect();
+    send.send_many_datagrams(&packets).unwrap();
+    timeout(Duration::from_secs(10), async {
+        let mut received = [false; 128];
+        for _ in 0..packets.len() {
+            let packet = recv.read_datagram().await.unwrap();
+            let index = usize::from(packet[0]);
+            assert!(!received[index], "datagram arrived twice");
+            assert_eq!(packet, packets[index]);
+            received[index] = true;
+        }
+    })
+    .await
+    .expect("the complete burst reaches the peer");
+    sender.close().await;
+    receiver.close().await;
+}
+
+#[tokio::test]
 async fn self_packets_return_to_tun_without_ssh_translation_or_a_peer() {
     use std::time::Duration;
     use tokio::time::timeout;
