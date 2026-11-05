@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.16] - 2026-11-05
+
 ### Added
 
 - macOS: install the bundled `ray` command and tab completion in fish from the app.
