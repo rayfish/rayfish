@@ -190,6 +190,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if dnsEnabled {
             let dns = NEDNSSettings(servers: ["200::53"])
             dns.matchDomains = exitSelected ? [""] : ["ray"]
+            dns.matchDomainsNoSearch = true
             settings.dnsSettings = dns
         }
         return settings

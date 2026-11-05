@@ -1433,11 +1433,14 @@ pub fn spawn_tun_writer<W: crate::tun::TunWrite>(
         let batch_size = tun.write_batch_size().max(1);
         stats.tun_write_batch_limit.set(batch_size as i64);
         stats
-            .tun_tcp_gso_enabled
+            .tun_tcp_offload_enabled
             .set(i64::from(tun.tcp_gso_enabled()));
         stats
-            .tun_udp_gso_enabled
+            .tun_udp_offload_enabled
             .set(i64::from(tun.udp_gso_enabled()));
+        stats
+            .mesh_quic_segmentation_offload_enabled
+            .set(i64::from(crate::transport::MESH_QUIC_SEGMENTATION_OFFLOAD));
         let mut batch = Vec::with_capacity(batch_size);
         let mut write_error_log = LogBudget::new(WRITE_ERROR_LOG_INTERVAL);
         let mut oversize_log = LogBudget::new(WRITE_ERROR_LOG_INTERVAL);

@@ -9,6 +9,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - macOS: install the bundled `ray` command and tab completion in fish from the app.
+- `rayfish_peer_spurious_congestion_events` exposes loss declarations later
+  contradicted by acknowledgements, counted as events on the selected path.
+
+### Changed
+
+- Linux TUN TCP/UDP segmentation and receive offloads are temporarily disabled.
+- Diagnostics distinguish TUN TCP/UDP offload from mesh QUIC segmentation offload.
+  The TUN metrics are now `rayfish_tun_tcp_offload_enabled` and
+  `rayfish_tun_udp_offload_enabled`; mesh QUIC has its own
+  `rayfish_mesh_quic_segmentation_offload_enabled` metric.
+
+### Fixed
+
+- macOS partial DNS no longer adds `.ray` to short-name searches.
+- Linux partial DNS no longer adds `.ray` when the existing search list is long.
 
 ## [0.5.15] - 2026-11-03
 

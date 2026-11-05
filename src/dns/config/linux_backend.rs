@@ -1640,7 +1640,7 @@ pub(super) fn merge_search_domains(
     }
     let root = SearchDomain::root();
     let mut dropped = out.split_off(MAX_SEARCH_DOMAINS);
-    if !out.contains(&root) {
+    if rayfish.contains(&root) && !out.contains(&root) {
         dropped.retain(|d| *d != root);
         dropped.push(out.pop().expect("cap is non-zero"));
         out.push(root);

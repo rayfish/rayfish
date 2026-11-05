@@ -7,6 +7,8 @@ trap 'rm -rf "$TEST_TMP"' EXIT
 # shellcheck source=lib/common.sh
 source "$ROOT/tests/lib/common.sh"
 
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/tests/test-reliability-stream.py"
+
 check(){
   if "$@" > "$TEST_TMP/check-output" 2>&1; then
     printf 'PASS %s\n' "$*"
@@ -298,6 +300,30 @@ old_binary_deploy(){ (
   [[ $(grep -c '^on host-[ab] .*install -m 755 /tmp/ray-old /usr/local/bin/ray' "$calls") == 2 && $FAILS == 0 ]]
 ) ; }
 
+linux_offload_policy(){ (
+  PUBS=(host); HOSTS=(host)
+  local fixture
+  on(){ printf '%s\n' "$fixture"; }
+  local phase
+  phase="$(sed -n '/^step "2c\. verify Linux/,/^# ---------------------------------------------------------------------------/p' "$ROOT/tests/e2e/reliability/run.sh")"
+  fixture=$'rayfish_tun_tcp_offload_enabled 0\nrayfish_tun_udp_offload_enabled 0\nrayfish_mesh_quic_segmentation_offload_enabled 0'
+  FAILS=0
+  eval "$phase"
+  [[ $FAILS == 0 ]] || return 1
+  fixture=$'rayfish_tun_tcp_offload_enabled 1\nrayfish_tun_udp_offload_enabled 1\nrayfish_mesh_quic_segmentation_offload_enabled 0'
+  FAILS=0
+  eval "$phase"
+  [[ $FAILS == 1 ]] || return 1
+  fixture='rayfish_mesh_quic_segmentation_offload_enabled 0'
+  FAILS=0
+  eval "$phase"
+  [[ $FAILS == 1 ]] || return 1
+  on(){ return 1; }
+  FAILS=0
+  eval "$phase"
+  [[ $FAILS == 1 ]]
+) ; }
+
 check activation
 check activation_failure
 check daemon_readiness
@@ -315,3 +341,4 @@ check bash "$ROOT/tests/test-e2e-connect.sh"
 check bash "$ROOT/tests/test-e2e-invites.sh"
 check abandoned_udp_receiver
 check old_binary_deploy
+check linux_offload_policy

@@ -987,6 +987,13 @@ resolver #2
         assert_eq!(join_domains(&small), "lan ray");
     }
 
+    #[test]
+    fn search_domains_overflow_without_rayfish_does_not_add_ray() {
+        let captured = host(&["a", "b", "c", "d", "e", "f", "g"]);
+        let merged = merge_search_domains(&captured, &[]);
+        assert_eq!(join_domains(&merged), "a b c d e f");
+    }
+
     /// The re-assert loop reads the domains through a shared handle rather than
     /// the snapshot it started with, so a join or leave lands in the file the
     /// next repair writes. This is the staleness `SearchDomains` exists to fix.
