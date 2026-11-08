@@ -29,6 +29,9 @@ const EXIT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "linux")]
 const EXIT_KERNEL_CHECK: Duration = Duration::from_secs(30);
 
+#[cfg(target_os = "linux")]
+const TAILSCALE_CGROUP_CHECK: Duration = Duration::from_secs(1);
+
 /// Per-attempt wait for a control pong. Also paces the readiness loop.
 #[cfg(target_os = "macos")]
 const NUDGE_REPLY_WAIT: Duration = Duration::from_millis(500);
@@ -1403,6 +1406,12 @@ impl Daemon {
                 Err(e) => tracing::debug!(error = %format!("{e:#}"), "cannot list IPv6 routes"),
             }
 
+            #[cfg(target_os = "linux")]
+            if let Some(warning) = self.reassert_tailscale_path_exclusion().await {
+                tracing::warn!("{warning}");
+                warnings.push(warning);
+            }
+
             // Something else on the host can take the link down or delete the
             // address or route later; put them back while we are up.
             #[cfg(target_os = "linux")]
@@ -1731,26 +1740,62 @@ impl Daemon {
     /// them without telling us: a gateway then forwards without masquerading, and
     /// a client's tunnel quietly stops. Every [`EXIT_KERNEL_CHECK`] this re-applies
     /// whatever went missing, re-reads the gateway's own addresses, and re-adds
-    /// the host-firewall forwarding exceptions and mesh SSH accept a reload
-    /// dropped. Linux only, the
+    /// the host-firewall forwarding exceptions, Tailscale path exclusion and
+    /// mesh SSH accept a reload dropped. Linux only, the
     /// one platform whose exit state another tool commonly flushes.
     #[cfg(target_os = "linux")]
     pub(crate) fn spawn_exit_kernel_watch(self: &Arc<Self>) {
+        use crate::hostfw::tailscale::ServiceCgroup;
+
+        enum Check {
+            Kernel,
+            TailscaleCgroup,
+        }
+
         let daemon = Arc::clone(self);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(EXIT_KERNEL_CHECK);
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut cgroup_tick = tokio::time::interval(TAILSCALE_CGROUP_CHECK);
+            cgroup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut last_cgroup = None;
             // The first tick is immediate, and `activate` has just applied.
             tick.tick().await;
             loop {
-                tokio::select! {
+                let check = tokio::select! {
                     _ = daemon.registry.shutdown_token.cancelled() => break,
-                    _ = tick.tick() => {}
-                }
+                    _ = tick.tick() => Check::Kernel,
+                    _ = cgroup_tick.tick() => Check::TailscaleCgroup,
+                };
                 if daemon.active.load(Ordering::SeqCst) {
-                    daemon.check_exit_kernel_state().await;
+                    match check {
+                        Check::Kernel => daemon.check_exit_kernel_state().await,
+                        Check::TailscaleCgroup => {
+                            if crate::instance::is_rootless() {
+                                continue;
+                            }
+                            // Only stat the cgroup on this faster tick. Invoke
+                            // firewall tools when its kernel identity changes.
+                            // A failed read leaves existing protection in place;
+                            // the full reconcile reports the error on its tick.
+                            let Ok(Ok(cgroup)) =
+                                tokio::task::spawn_blocking(ServiceCgroup::current).await
+                            else {
+                                continue;
+                            };
+                            if cgroup == last_cgroup {
+                                continue;
+                            }
+                            last_cgroup = cgroup;
+                        }
+                    }
+                    if let Some(warning) = daemon.reassert_tailscale_path_exclusion().await {
+                        tracing::debug!(warning, "Tailscale path exclusion unavailable");
+                    }
                     #[cfg(feature = "desktop")]
-                    daemon.reassert_ssh_host_firewall().await;
+                    if matches!(check, Check::Kernel) {
+                        daemon.reassert_ssh_host_firewall().await;
+                    }
                 }
             }
         });
@@ -1758,6 +1803,28 @@ impl Daemon {
 
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn spawn_exit_kernel_watch(self: &Arc<Self>) {}
+
+    /// Serialize with standby cleanup so a reload repair cannot reinstall the
+    /// guard after `ray down`. Firewall commands stay off runtime workers.
+    #[cfg(target_os = "linux")]
+    async fn reassert_tailscale_path_exclusion(&self) -> Option<String> {
+        if crate::instance::is_rootless() {
+            return None;
+        }
+        let _guard = self.exit_reconcile.lock().await;
+        if !self.active.load(Ordering::SeqCst) {
+            return None;
+        }
+        let tun_name = self.registry.tun_name.load().as_str().to_owned();
+        match tokio::task::spawn_blocking(move || crate::hostfw::tailscale::ensure(&tun_name)).await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!(
+                "failed to exclude Tailscale from mesh paths: {error}"
+            )),
+            Err(error) => Some(format!("Tailscale path exclusion task failed: {error}")),
+        }
+    }
 
     /// The same tick puts back the mesh SSH host-firewall accept `ray up` added,
     /// which the same reload drops. Quiet: `ray up` already warned with the fix.
@@ -2190,6 +2257,10 @@ impl Daemon {
         // could otherwise re-enable what this is tearing down, or worse, snapshot
         // the half-torn-down sysctls as "original".
         let _guard = self.exit_reconcile.lock().await;
+        #[cfg(target_os = "linux")]
+        if let Err(error) = tokio::task::spawn_blocking(crate::hostfw::tailscale::remove).await {
+            tracing::warn!(%error, "Tailscale path exclusion cleanup task failed");
+        }
         self.registry.exit_server.clear();
         let _ = apply_exit_server_os(&self.registry.exit_server, &tun_name).await;
 

@@ -215,6 +215,7 @@ pub use mesh::{CleanupOutcome, cleanup_after_exit};
 ///   is not left an open router.
 /// - Remove the client full-tunnel rules, which would otherwise outlive the TUN
 ///   they point at.
+/// - Remove the Tailscale path exclusion from the host firewall.
 pub fn restore_host_state() {
     if crate::instance::is_rootless() {
         return;
@@ -223,6 +224,8 @@ pub fn restore_host_state() {
     crate::dns::config::emergency_withdraw_resolvconf();
     crate::exit_node::disable();
     crate::exit_node::teardown_client_routing(None);
+    #[cfg(target_os = "linux")]
+    crate::hostfw::tailscale::remove();
 }
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
@@ -754,7 +757,8 @@ pub struct Daemon {
     /// snapshot, the pf enable token): two interleaved runs can snapshot each
     /// other's intermediate state, after which teardown "restores" forwarding to
     /// on. One reconcile at a time. Tokio's mutex because the critical section
-    /// awaits (blocking-pool `ip`/`nft`/`pfctl` children, offer broadcasts).
+    /// awaits (blocking-pool `ip`/`nft`/`pfctl` children, offer broadcasts). Also
+    /// serializes the Linux Tailscale path exclusion with standby cleanup.
     pub(crate) exit_reconcile: AsyncMutex<()>,
     /// Prometheus metrics-server guard. Owned so it lives for the daemon's whole
     /// lifetime (dropping it stops the export); `None` if the server failed to bind.

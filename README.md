@@ -64,6 +64,11 @@ The script installs the CLI and background service on Linux and macOS. See the
 details, updates, and building from source. All binaries and checksums are on the
 [releases page](https://github.com/rayfish/rayfish/releases/latest).
 
+On Linux with cgroup v2, Rayfish blocks marked UDP from the standard
+`tailscaled.service` to mesh addresses. It uses nftables or ip6tables cgroup
+matching, restores rules after service restarts, and removes them on standby.
+Tailscale can still advertise mesh addresses.
+
 ### Desktop app or daemon
 
 The macOS app does not run the standalone daemon. The Rayfish core runs inside

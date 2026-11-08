@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Linux with cgroup v2: keep Tailscale's system service from using the Rayfish
+  mesh as a direct transport path, without blocking other services that reuse
+  its packet mark.
+
 ## [0.5.16] - 2026-11-05
 
 ### Added

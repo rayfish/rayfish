@@ -23,6 +23,9 @@
 #[cfg(any(target_os = "linux", test))]
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod tailscale;
+
 /// What the host firewall would do to an inbound mesh connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
