@@ -166,6 +166,36 @@ pub(crate) async fn snapshot_is_publishable(
 /// five-minute record can expire. The deadline is absolute: notifications wake
 /// the loop to inspect changed state but do not push this retry back.
 const RECORD_PUBLISH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const RECORD_PUBLISH_RETRY_MAX: Duration = Duration::from_secs(60);
+const RECORD_PUBLISH_RETRY_LIMIT: u32 = 12;
+
+#[derive(Default)]
+struct PublishRetries {
+    hash: Option<blake3::Hash>,
+    failures: u32,
+}
+
+impl PublishRetries {
+    fn failed(&mut self, hash: blake3::Hash, now: Instant) -> Option<(blake3::Hash, Instant)> {
+        if self.hash != Some(hash) {
+            self.hash = Some(hash);
+            self.failures = 0;
+        }
+        self.failures += 1;
+        if self.failures >= RECORD_PUBLISH_RETRY_LIMIT {
+            tracing::error!(%hash, "network record publication failed repeatedly; waiting for a change or restart");
+            return None;
+        }
+        let delay = RECORD_PUBLISH_RETRY_INTERVAL
+            .saturating_mul(1 << (self.failures - 1).min(4))
+            .min(RECORD_PUBLISH_RETRY_MAX);
+        Some((hash, now + delay))
+    }
+
+    fn exhausted(&self, target: Option<blake3::Hash>) -> bool {
+        self.hash == target && self.hash.is_some() && self.failures >= RECORD_PUBLISH_RETRY_LIMIT
+    }
+}
 
 fn mark_group_hash_durability_pending(
     state: &SharedNetworkState,
@@ -305,11 +335,19 @@ pub(crate) fn spawn_network_publisher(
         let mut last_publish: Option<(blake3::Hash, Instant)> =
             initially_published.map(|hash| (hash, Instant::now()));
         let mut retry: Option<(blake3::Hash, Instant)> = None;
+        let mut failures = PublishRetries::default();
         loop {
             let now = Instant::now();
             let needs_persistence = group_hash_needing_persistence(&state, &network_name, false);
             let configured = configured_group_hash(&network_name);
             let target = needs_persistence.or(configured);
+            if failures.exhausted(target) {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = notify.notified() => {}
+                }
+                continue;
+            }
             let due = target.is_some_and(|hash| {
                 let retry_blocked = retry
                     .is_some_and(|(retry_hash, deadline)| retry_hash == hash && now < deadline);
@@ -322,18 +360,17 @@ pub(crate) fn spawn_network_publisher(
                 if state.read().map(|s| s.destroyed).unwrap_or(true) {
                     break;
                 }
-                let proof = match destruction_proof(&registry.transport.pkarr, &net_secret_key)
-                    .await
-                {
-                    Ok(proof) => proof,
-                    Err(error) => {
-                        tracing::warn!(%error, "cannot verify network destruction status");
-                        if let Some(hash) = target {
-                            retry = Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                let proof =
+                    match destruction_proof(&registry.transport.pkarr, &net_secret_key).await {
+                        Ok(proof) => proof,
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot verify network destruction status");
+                            if let Some(hash) = target {
+                                retry = failures.failed(hash, Instant::now());
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
                 if let Some(packet) = proof {
                     registry.schedule_destruction(&network_name, packet);
                     break;
@@ -351,8 +388,7 @@ pub(crate) fn spawn_network_publisher(
                         if let Err(error) = outcome {
                             tracing::warn!(%error, "deferring network record renewal");
                         }
-                        retry = target
-                            .map(|hash| (hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                        retry = target.and_then(|hash| failures.failed(hash, Instant::now()));
                         continue;
                     }
                 }
@@ -372,7 +408,7 @@ pub(crate) fn spawn_network_publisher(
                         persist_group_hash_locked(&state, &blob_store, &network_name, hash, false)
                             .await;
                     if !persistence_ready {
-                        retry = Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                        retry = failures.failed(hash, Instant::now());
                     }
                 }
 
@@ -399,12 +435,11 @@ pub(crate) fn spawn_network_publisher(
                             Ok(packet) => prepared = Some((hash, packet, seed_peers.len())),
                             Err(e) => {
                                 tracing::warn!(error = %e, "failed to build network record");
-                                retry =
-                                    Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                                retry = failures.failed(hash, Instant::now());
                             }
                         }
                     } else {
-                        retry = Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                        retry = failures.failed(hash, Instant::now());
                     }
                 }
                 drop(commit_guard);
@@ -423,13 +458,14 @@ pub(crate) fn spawn_network_publisher(
                             tracing::info!(peers = seed_count, "published network record");
                             last_publish = Some((hash, Instant::now()));
                             retry = None;
+                            failures = PublishRetries::default();
                             registry.records_published.send_replace(());
                         }
                         outcome => {
                             if let Err(e) = outcome {
                                 tracing::warn!(error = %e, "failed to publish network record");
                             }
-                            retry = Some((hash, Instant::now() + RECORD_PUBLISH_RETRY_INTERVAL));
+                            retry = failures.failed(hash, Instant::now());
                         }
                     }
                 }
@@ -992,6 +1028,25 @@ mod tests {
             retry_at
         );
         assert!(attempt_is_due(hash, None, retry, retry_at));
+    }
+
+    #[test]
+    fn publication_failures_back_off_and_stop_for_the_same_snapshot() {
+        let hash = blake3::hash(b"group");
+        let now = Instant::now();
+        let mut retries = PublishRetries::default();
+        for expected in [5, 10, 20, 40, 60, 60, 60, 60, 60, 60, 60] {
+            let (_, deadline) = retries.failed(hash, now).unwrap();
+            assert_eq!(deadline - now, Duration::from_secs(expected));
+        }
+        assert!(retries.failed(hash, now).is_none());
+        assert!(retries.exhausted(Some(hash)));
+        let next = blake3::hash(b"new group");
+        assert!(!retries.exhausted(Some(next)));
+        assert_eq!(
+            retries.failed(next, now).unwrap().1 - now,
+            Duration::from_secs(5)
+        );
     }
 
     #[tokio::test]

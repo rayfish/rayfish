@@ -468,12 +468,21 @@ impl NetworkRegistry {
         } = retry;
         let nk = key.to_string();
         let mut backoff = BACKOFF_INITIAL;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60 * 60);
         loop {
             if self.pending_join_landed(key) {
                 return;
             }
             tokio::select! {
                 _ = self.shutdown_token.cancelled() => return,
+                _ = tokio::time::sleep_until(deadline) => {
+                    let display = name.clone().unwrap_or_else(|| nk.clone());
+                    self.restore_errors.insert(display, "join approval timed out; retry the join".to_string());
+                    if let Err(error) = config::remove_pending_join(&nk) {
+                        tracing::warn!(%error, "could not remove expired pending join");
+                    }
+                    return;
+                }
                 _ = tokio::time::sleep(backoff) => {}
             }
             backoff = (backoff * 2).min(BACKOFF_MAX);

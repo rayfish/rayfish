@@ -106,6 +106,17 @@ class FileNotificationRetryTest {
         } finally { task.close() }
     }
 
+    @Test fun repeatedStatusFailuresBackOffAndStopUntilReset() {
+        val retries = FileStatusRetries()
+        assertEquals(listOf(4_000L, 8_000L, 16_000L, 32_000L, 60_000L, 60_000L, 60_000L),
+            (1..7).map { retries.nextFailure() })
+        assertNull(retries.nextFailure())
+        retries.reset()
+        assertEquals(4_000L, retries.nextFailure())
+        retries.reset()
+        assertEquals(4_000L, retries.nextFailure())
+    }
+
     @Test fun failedCoreReadsRequestRetryInsteadOfReportingIdle() {
         assertEquals(4_000L, reconcileFileStatus({}, {}, {
             OfferNotifier.poll(context) { error("list offers failed") }
