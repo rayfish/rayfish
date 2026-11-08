@@ -8,6 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Repeated background failures now back off and stop retrying, reducing battery use.
 - Linux with cgroup v2: keep Tailscale's system service from using the Rayfish
   mesh as a direct transport path, without blocking other services that reuse
   its packet mark.

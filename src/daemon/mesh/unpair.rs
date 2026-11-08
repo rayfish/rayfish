@@ -267,8 +267,22 @@ where
     Fut: Future<Output = bool>,
 {
     let mut wait = UNPAIR_RETRY_MIN;
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
     loop {
         let left = attempt().await;
+        if left && tokio::time::Instant::now() >= deadline {
+            tracing::error!(
+                "unpair delivery is still pending; automatic retries paused until another event or restart"
+            );
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = nudge.notified() => {
+                    deadline = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+                    wait = UNPAIR_RETRY_MIN;
+                }
+            }
+            continue;
+        }
         let pause = async {
             if left {
                 tokio::time::sleep(wait).await;
@@ -278,7 +292,10 @@ where
         };
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            _ = nudge.notified() => wait = UNPAIR_RETRY_MIN,
+            _ = nudge.notified() => {
+                wait = UNPAIR_RETRY_MIN;
+                deadline = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+            }
             _ = pause => wait = (wait * 2).min(UNPAIR_RETRY_MAX),
         }
     }
