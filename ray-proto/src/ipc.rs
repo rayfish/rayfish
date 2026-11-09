@@ -812,28 +812,12 @@ pub struct ExitNodeStatusView {
     /// Roster peers advertising `exit_node` (display strings: hostname or short
     /// id), so the user can see who is available to route through.
     pub available: Vec<String>,
-    /// The subset of `available` whose roster entry *claims* IPv6 egress. On an
-    /// IPv6-only node these are the gateways known to work, so the list has to
-    /// say which they are rather than let the user pick one that would take the
-    /// traffic and drop it.
-    ///
-    /// Not the complement of "unusable": a gateway whose entry carries no claim
-    /// at all is absent from this list and still selectable, because an absent
-    /// claim is what a coordinator too old to record it leaves behind, and
-    /// refusing on it would make exit nodes unusable on that whole network. Only
-    /// a claim that positively says IPv4-only is refused.
+    /// Gateways whose roster entry explicitly claims IPv6 egress. An unknown
+    /// claim is absent from both family lists but remains selectable.
     #[serde(default)]
     pub available_v6: Vec<String>,
-    /// The subset of `available` that *this* node would refuse, with the family
-    /// it cannot carry named.
-    ///
-    /// Separate from `available_v6` because the two answer different questions
-    /// and stopped agreeing once a gateway could be IPv6-only itself: such a
-    /// gateway claims IPv6 egress (so it is in `available_v6`) and is refused by
-    /// a dual-stack client (because it cannot return IPv4). Marking it usable off
-    /// the first list alone sends the user at the one gateway that will not work.
-    /// Computed daemon-side, where the refusal rule already lives, so the CLI
-    /// never re-derives it and cannot drift from it.
+    /// Gateways this node would refuse. Computed by the daemon using the same
+    /// rule as selection, independently of the individual family lists.
     #[serde(default)]
     pub refused: Vec<String>,
     /// Why the `using` selection above is not the tunnel that is actually
@@ -842,21 +826,20 @@ pub struct ExitNodeStatusView {
     /// The selection is config and the tunnel is kernel state, and they are
     /// deliberately allowed to disagree: a gateway that stops being usable does
     /// not clear the config, so `ray exit-node status` still shows what to change.
-    /// The gap has to be visible, though. Without this the line reads `using:
-    /// <peer>` while every packet leaves directly, which is the one thing a user
-    /// who chose to tunnel needs told, and the reason can arrive without anybody
-    /// touching the selection (the gateway republishes a family claim).
+    /// The reason can change without a new selection, for example when the
+    /// gateway republishes a family claim.
     #[serde(default)]
     pub not_in_effect: Option<String>,
-    /// Which families the tunnel through `using` carries. A tunnel takes the
-    /// families this node's data plane routes *and* the gateway says it can
-    /// return, so it can be narrower than either: on an IPv6-only node, or
-    /// through a gateway that can only return one of the two, the other family
-    /// keeps leaving this host directly. Meaningless when `using` is `None`.
+    /// Which families the tunnel through `using` carries. Unsupported families
+    /// remain captured and blocked. Meaningless when `using` is `None`.
     #[serde(default)]
     pub tunnel_v4: bool,
     #[serde(default)]
     pub tunnel_v6: bool,
+    /// Gateways whose roster entry explicitly claims IPv4 egress. Together with
+    /// `available_v6`, distinguishes single-family offers from dual-stack ones.
+    #[serde(default)]
+    pub available_v4: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2406,6 +2389,7 @@ mod tests {
                 using: Some("gw".into()),
                 available: vec!["gw".into(), "v4only".into()],
                 available_v6: vec!["gw".into()],
+                available_v4: vec!["gw".into(), "v4only".into()],
                 refused: vec!["v4only".into()],
                 not_in_effect: Some("the peer is not in this network's roster".into()),
                 tunnel_v4: false,
@@ -2422,6 +2406,7 @@ mod tests {
                 // an IPv6-only client needs both lists to say "this gateway
                 // exists but cannot carry your only family".
                 assert_eq!(networks[0].available_v6, vec!["gw".to_string()]);
+                assert_eq!(networks[0].available_v4, vec!["gw", "v4only"]);
                 // A selection that is configured but not installed says so, or
                 // `using: gw` reads as a tunnel that is carrying traffic.
                 assert!(networks[0].not_in_effect.is_some());
@@ -2452,6 +2437,7 @@ mod tests {
         let decoded: ExitNodeStatusView = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.available, vec!["gw".to_string()]);
         assert!(decoded.available_v6.is_empty());
+        assert!(decoded.available_v4.is_empty());
     }
 
     #[test]

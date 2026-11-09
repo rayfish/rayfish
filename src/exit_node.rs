@@ -48,7 +48,7 @@ use socket2::{Domain, SockRef};
 mod dns;
 pub mod ipv4;
 mod policy;
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 use dns::PUBLIC_FALLBACK_DNS_V6;
 pub use policy::is_transitable;
 
@@ -707,10 +707,10 @@ pub(crate) fn parse_host_interfaces(out: &str) -> HostInterfaces {
     interfaces
 }
 
-/// Whether this host has an IPv6 default route for gateway egress.
+/// Whether marked gateway traffic has an IPv6 route outside our full tunnel.
 #[cfg(target_os = "linux")]
 fn has_v6_uplink() -> bool {
-    ip_output(&["-6", "route", "show", "default"]).is_some_and(|out| !out.trim().is_empty())
+    has_uplink("-6", PUBLIC_FALLBACK_DNS_V6[0].into())
 }
 
 /// Inspect the physical default, excluding our own full-tunnel routes.
@@ -728,7 +728,7 @@ fn is_tunnel_iface(name: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn has_v4_uplink() -> bool {
-    ip_output(&["-4", "route", "show", "default"]).is_some_and(|out| !out.trim().is_empty())
+    has_uplink("-4", Ipv4Addr::new(1, 1, 1, 1).into())
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]

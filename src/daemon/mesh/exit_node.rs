@@ -549,6 +549,11 @@ impl NetworkRegistry {
                 .filter(|m| m.exit_families.carries_v6())
                 .map(display_name)
                 .collect();
+            let available_v4 = offers
+                .iter()
+                .filter(|m| m.exit_families.carries_v4())
+                .map(display_name)
+                .collect();
             // From the same predicate `ray exit-node use` will run, so the list
             // cannot disagree with what the command does.
             let refused = offers
@@ -587,6 +592,7 @@ impl NetworkRegistry {
                 using: n.exit_node_use,
                 available: offers.iter().map(display_name).collect(),
                 available_v6,
+                available_v4,
                 refused,
                 not_in_effect,
                 tunnel_v4: carries.carries_v4(),
