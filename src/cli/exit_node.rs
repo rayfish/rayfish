@@ -18,6 +18,7 @@ struct ExitNodeRow<'a> {
     using: &'a Option<String>,
     available: &'a [String],
     available_v6: &'a [String],
+    available_v4: &'a [String],
     refused: &'a [String],
     not_in_effect: &'a Option<String>,
     tunnel_v4: bool,
@@ -36,6 +37,7 @@ impl<'a> ExitNodeOutput<'a> {
                     using: &n.using,
                     available: &n.available,
                     available_v6: &n.available_v6,
+                    available_v4: &n.available_v4,
                     refused: &n.refused,
                     not_in_effect: &n.not_in_effect,
                     tunnel_v4: n.tunnel_v4,
@@ -159,19 +161,16 @@ impl DisplayOut for ExitNodeOutput<'_> {
                 println!("  offering: yes (allow: {})", peers.join(", "));
             }
             match (&n.using, n.not_in_effect.as_deref()) {
-                // A selection the daemon is not acting on is the one thing this line
-                // must not print bare: the config says `gw` and the packets leave
-                // directly, and nothing else on screen says so.
+                // The reason describes whether traffic is blocked or routing
+                // could not be installed. Do not assume a direct fallback.
                 (Some(peer), Some(why)) => {
-                    println!("  using: {peer} (NOT in effect: {why}; traffic leaves directly)")
+                    println!("  using: {peer} (NOT in effect: {why})")
                 }
-                // A tunnel takes only the families both ends carry, so a bare
-                // "using: <peer>" would read as a full tunnel over both when it is
-                // one family and a direct path for the other.
+                // Unsupported families stay captured and blocked.
                 (Some(peer), None) => match (n.tunnel_v4, n.tunnel_v6) {
                     (true, true) => println!("  using: {peer}"),
-                    (false, true) => println!("  using: {peer} (IPv6 only; IPv4 leaves directly)"),
-                    (true, false) => println!("  using: {peer} (IPv4 only; IPv6 leaves directly)"),
+                    (false, true) => println!("  using: {peer} (IPv6 only; IPv4 blocked)"),
+                    (true, false) => println!("  using: {peer} (IPv4 only; IPv6 blocked)"),
                     (false, false) => println!("  using: {peer} (carries neither family)"),
                 },
                 (None, _) => println!("  using: direct egress"),
@@ -179,25 +178,61 @@ impl DisplayOut for ExitNodeOutput<'_> {
             if n.available.is_empty() {
                 println!("  available: (none advertised)");
             } else {
-                // A gateway this node would refuse is marked as such, and that beats
-                // marking the ones that carry IPv6: the two lists stopped agreeing
-                // once a gateway could be IPv6-only itself, and it is the refusal
-                // that decides whether `ray exit-node use` works.
                 let listed: Vec<String> = n
                     .available
                     .iter()
-                    .map(|peer| {
-                        if n.refused.contains(peer) {
-                            format!("{peer} (unusable from this node)")
-                        } else if n.available_v6.contains(peer) {
-                            format!("{peer} (IPv6)")
-                        } else {
-                            peer.clone()
-                        }
-                    })
+                    .map(|peer| available_gateway(n, peer))
                     .collect();
                 println!("  available: {}", listed.join(", "));
             }
+        }
+    }
+}
+
+fn available_gateway(status: &ipc::ExitNodeStatusView, peer: &str) -> String {
+    let contains = |peers: &[String]| peers.iter().any(|name| name == peer);
+    let families = match (
+        contains(&status.available_v4),
+        contains(&status.available_v6),
+    ) {
+        (true, true) => "IPv4, IPv6",
+        (true, false) => "IPv4",
+        (false, true) => "IPv6",
+        (false, false) => "capabilities unknown",
+    };
+    if contains(&status.refused) {
+        format!("{peer} (unusable from this node)")
+    } else {
+        format!("{peer} ({families})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_gateways_name_both_families_and_missing_claims() {
+        let status = ipc::ExitNodeStatusView {
+            network: "example".into(),
+            allow: vec![],
+            using: None,
+            available: vec![],
+            available_v4: vec!["dual".into(), "v4".into()],
+            available_v6: vec!["dual".into(), "v6".into()],
+            refused: vec!["down".into()],
+            not_in_effect: None,
+            tunnel_v4: false,
+            tunnel_v6: false,
+        };
+        for (peer, expected) in [
+            ("dual", "dual (IPv4, IPv6)"),
+            ("v4", "v4 (IPv4)"),
+            ("v6", "v6 (IPv6)"),
+            ("legacy", "legacy (capabilities unknown)"),
+            ("down", "down (unusable from this node)"),
+        ] {
+            assert_eq!(available_gateway(&status, peer), expected);
         }
     }
 }

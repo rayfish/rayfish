@@ -35,6 +35,25 @@ pub(super) use crate::sysctl::{ipv6_conf, read_sysctl, write_sysctl};
 #[cfg(target_os = "linux")]
 use crate::hostfw;
 
+/// Ask the kernel using the mark carried by gateway transit, without sending a
+/// packet. Listing main's default misses policy-routed uplinks and counts
+/// unreachable defaults. The client's own tunnel is never a gateway uplink.
+pub(super) fn has_uplink(family: &str, destination: IpAddr) -> bool {
+    ip_output(&[
+        family,
+        "route",
+        "get",
+        &destination.to_string(),
+        "mark",
+        &format!("{SOCKET_MARK:#x}"),
+    ])
+    .is_some_and(|out| {
+        let fields: Vec<_> = out.split_whitespace().collect();
+        fields.windows(2).any(|w| w[0] == "dev" && w[1] != "lo")
+            && !fields.windows(2).any(|w| w == ["table", EXIT_TABLE])
+    })
+}
+
 /// Turn this host into an exit node: enable IPv4/IPv6 forwarding and install an
 /// nftables table that masquerades overlay-sourced traffic that arrived on the
 /// TUN and is leaving by another interface, so replies come back to us and we

@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Daemon shutdown releases its startup lock even when a subprocess has
+  inherited the lock descriptor, allowing an immediate restart.
+- Exit-node status lists IPv4 and IPv6 capabilities explicitly and reports
+  unsupported families as blocked. Linux gateways detect policy-routed uplinks
+  and no longer advertise an unreachable default as an internet connection.
 - Linux with cgroup v2: keep Tailscale's system service from using the Rayfish
   mesh as a direct transport path, without blocking other services that reuse
   its packet mark.
