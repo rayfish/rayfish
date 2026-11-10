@@ -1013,10 +1013,22 @@ impl Drop for IpcSocket {
 /// Probing the socket alone cannot tell two daemons starting together apart:
 /// both see a dead or missing socket, and the slower one unlinks the socket the
 /// faster one just bound. The lock serializes them. The file itself is never
-/// removed; the lock dies with the descriptor, including on a crash.
+/// removed; shutdown explicitly unlocks it, and a crash releases it once all
+/// descriptors (including any inherited by subprocesses) are closed.
 #[cfg(unix)]
 pub(crate) struct DaemonLock {
-    _file: File,
+    file: File,
+}
+
+#[cfg(unix)]
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        // CLOEXEC only closes inherited descriptors at exec. A concurrent fork
+        // can keep one alive beyond our close, so release the shared lock now.
+        if let Err(error) = self.file.unlock() {
+            tracing::warn!(%error, "failed to release daemon lock");
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1042,7 +1054,7 @@ impl DaemonLock {
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self { file })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => {
                 Err(error).with_context(|| format!("failed to lock {}", path.display()))
@@ -1291,6 +1303,21 @@ mod embedded_ipc_tests {
         let tunnel = IpcHost::PacketTunnel { owner_uid: 501 };
         assert!(tunnel.check_authorized(&by_path, Some(&owner)).is_some());
         assert!(tunnel.check_authorized(&by_path, Some(&root)).is_none());
+    }
+
+    #[test]
+    fn daemon_lock_releases_while_an_inherited_descriptor_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ray.sock");
+        let lock = DaemonLock::try_acquire(&path).unwrap().unwrap();
+        // A duplicate shares the lock just like a descriptor inherited by fork.
+        let inherited = lock.file.try_clone().unwrap();
+        assert!(DaemonLock::try_acquire(&path).unwrap().is_none());
+        drop(lock);
+        let replacement = DaemonLock::try_acquire(&path).unwrap();
+        assert!(replacement.is_some());
+        drop(inherited);
+        assert!(DaemonLock::try_acquire(&path).unwrap().is_none());
     }
 
     #[tokio::test]
