@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- macOS: retry promptly when login starts the VPN before the network is ready,
+  instead of waiting 90 seconds after a failed start.
+
 - Linux with cgroup v2: keep Tailscale's system service from using the Rayfish
   mesh as a direct transport path, without blocking other services that reuse
   its packet mark.

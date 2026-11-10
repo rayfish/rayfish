@@ -84,6 +84,71 @@ final class TunnelManagerCache {
     }
 }
 
+// Subscribe before startVPNTunnel: a failed start can cross connecting and
+// disconnected between polls, especially while the network is coming up.
+@MainActor
+final class TunnelConnectionMonitor {
+    private let readStatus: () -> NEVPNStatus
+    private let notificationCenter: NotificationCenter
+    private var observer: NSObjectProtocol?
+    private var observedConnecting = false
+
+    init(connection: NEVPNConnection) {
+        readStatus = { connection.status }
+        notificationCenter = .default
+        observe(connection)
+    }
+
+    init(notificationCenter: NotificationCenter, object: AnyObject, status: @escaping () -> NEVPNStatus) {
+        readStatus = status
+        self.notificationCenter = notificationCenter
+        observe(object)
+    }
+
+    private func observe(_ object: AnyObject) {
+        observer = notificationCenter.addObserver(forName: .NEVPNStatusDidChange, object: object, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.recordStatus() }
+        }
+        recordStatus()
+    }
+
+    deinit {
+        if let observer { notificationCenter.removeObserver(observer) }
+    }
+
+    private func recordStatus() {
+        let status = readStatus()
+        observedConnecting = observedConnecting || status == .connecting || status == .reasserting
+    }
+
+    func wait(
+        timeout: Duration = .seconds(90),
+        initialStatusGrace: Duration = .seconds(2),
+        pause: () async throws -> Void = { try await Task.sleep(for: .milliseconds(100)) },
+        onStatus: (NEVPNStatus) -> Void = { _ in }
+    ) async throws {
+        let clock = ContinuousClock()
+        let started = clock.now
+        while true {
+            try Task.checkCancellation()
+            recordStatus()
+            let status = readStatus()
+            let elapsed = started.duration(to: clock.now)
+            // Keep showing connecting while macOS publishes the new session.
+            if status != .disconnected || observedConnecting || elapsed >= initialStatusGrace {
+                onStatus(status)
+            }
+            if status == .connected { return }
+            if status == .invalid || status == .disconnecting
+                || (status == .disconnected && (observedConnecting || elapsed >= initialStatusGrace)) {
+                throw TunnelIPCError.unavailable
+            }
+            if elapsed >= timeout { throw TunnelIPCError.timedOut }
+            try await pause()
+        }
+    }
+}
+
 @MainActor
 enum TunnelIPC {
     static func request(_ request: ProviderRequest) async throws -> ProviderResponse {

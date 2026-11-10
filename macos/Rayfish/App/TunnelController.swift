@@ -195,46 +195,33 @@ final class TunnelController: ObservableObject {
             let manager = try await TunnelPreferences.configured()
             RayfishLog.startup("tunnel preferences configured", since: started, logger: RayfishLog.app)
             guard !isQuitting else { return }
+            let monitor = TunnelConnectionMonitor(connection: manager.connection)
             if manager.connection.status != .connected && manager.connection.status != .connecting
                 && manager.connection.status != .reasserting {
                 try manager.connection.startVPNTunnel()
             }
             RayfishLog.startup("waiting for VPN connection", since: started, logger: RayfishLog.app)
-            var observedConnecting = false
             connectionStatus = .connecting
-            for _ in 0..<180 {
-                guard !isQuitting else { return }
-                let current = manager.connection.status
-                // startVPNTunnel returns before macOS publishes the new state.
-                // Until then, disconnected and its last error describe the old session.
-                if current == .disconnected && !observedConnecting {
-                    try await Task.sleep(nanoseconds: 500_000_000)
-                    continue
-                }
-                connectionStatus = current
-                observedConnecting = observedConnecting || current == .connecting || current == .reasserting
-                if isConnected {
-                    RayfishLog.startup("VPN connected", since: started, logger: RayfishLog.app)
-                    let response = try await TunnelIPC.request(ProviderRequest(action: .status))
-                    RayfishLog.startup("initial status received", since: started, logger: RayfishLog.app)
-                    status = response.status
-                    if status?.needsTCPHelper == true {
-                        try SSHHelper.register(openSettings: true)
-                        error = SSHHelper.approvalMessage
-                    }
-                    refreshMachines()
-                    UserDefaults.standard.set(true, forKey: Self.migrationCompletedKey)
-                    RayfishLog.startup("connection ready", since: started, logger: RayfishLog.app)
-                    return
-                }
-                if connectionStatus == .disconnected || connectionStatus == .invalid {
-                    try await manager.connection.fetchLastDisconnectError()
-                    throw TunnelIPCError.unavailable
-                }
-                try await Task.sleep(nanoseconds: 500_000_000)
+            do {
+                try await monitor.wait(onStatus: { self.connectionStatus = $0 })
+            } catch TunnelIPCError.unavailable {
+                try await manager.connection.fetchLastDisconnectError()
+                throw TunnelIPCError.unavailable
             }
-            throw TunnelIPCError.timedOut
+            guard !isQuitting else { return }
+            RayfishLog.startup("VPN connected", since: started, logger: RayfishLog.app)
+            let response = try await TunnelIPC.request(ProviderRequest(action: .status))
+            RayfishLog.startup("initial status received", since: started, logger: RayfishLog.app)
+            status = response.status
+            if status?.needsTCPHelper == true {
+                try SSHHelper.register(openSettings: true)
+                error = SSHHelper.approvalMessage
+            }
+            refreshMachines()
+            UserDefaults.standard.set(true, forKey: Self.migrationCompletedKey)
+            RayfishLog.startup("connection ready", since: started, logger: RayfishLog.app)
         } catch {
+            guard !isQuitting else { return }
             RayfishLog.startup("connection attempt failed", since: started, logger: RayfishLog.app)
             self.error = error.localizedDescription
             connectionStatus = (try? await TunnelPreferences.load())?.connection.status ?? .disconnected

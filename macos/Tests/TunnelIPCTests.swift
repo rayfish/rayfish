@@ -20,6 +20,7 @@ struct TunnelIPCTests {
     @MainActor
     static func main() async throws {
         setbuf(stdout, nil)
+        try await testConnectionStartup()
         try await testManagerCache()
         let setting = ProviderRequest(action: .setSetting, setting: .dns, enabled: false)
         let decodedSetting = try JSONDecoder().decode(ProviderRequest.self, from: JSONEncoder().encode(setting))
@@ -86,6 +87,50 @@ struct TunnelIPCTests {
         }
         precondition(immediate == Data("immediate".utf8))
         print("PASS: completed response cannot be replaced by an error")
+    }
+
+    @MainActor
+    private static func testConnectionStartup() async throws {
+        let center = NotificationCenter()
+        let session = NSObject()
+        var status: NEVPNStatus = .disconnected
+        let monitor = TunnelConnectionMonitor(notificationCenter: center, object: session) { status }
+        var polls = 0
+        do {
+            try await monitor.wait(pause: {
+                polls += 1
+                precondition(polls == 1, "A failed start must not wait for the connection timeout")
+                status = .connecting
+                center.post(name: .NEVPNStatusDidChange, object: session)
+                status = .disconnected
+                center.post(name: .NEVPNStatusDidChange, object: session)
+            })
+            fatalError("A start rejected between polls was missed")
+        } catch TunnelIPCError.unavailable {}
+        precondition(polls == 1)
+        print("PASS: a connecting/disconnected burst fails immediately between polls")
+
+        let next = TunnelConnectionMonitor(notificationCenter: center, object: session) { status }
+        try await next.wait(pause: { status = .connected })
+        print("PASS: an initially stale disconnected status can become connected")
+
+        status = .disconnected
+        let silent = TunnelConnectionMonitor(notificationCenter: center, object: session) { status }
+        do {
+            try await silent.wait(initialStatusGrace: .zero, pause: {
+                fatalError("A start with no state transition must not wait for the connection timeout")
+            })
+            fatalError("An unchanged disconnected session was accepted")
+        } catch TunnelIPCError.unavailable {}
+        print("PASS: a start without notifications fails after the initial status grace")
+
+        status = .connecting
+        let stalled = TunnelConnectionMonitor(notificationCenter: center, object: session) { status }
+        do {
+            try await stalled.wait(timeout: .zero)
+            fatalError("A stalled connection did not time out")
+        } catch TunnelIPCError.timedOut {}
+        print("PASS: a stalled connecting session remains bounded")
     }
 
     @MainActor
