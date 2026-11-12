@@ -31,7 +31,8 @@ struct FileHandoffTests {
         try Data("partial".utf8).write(to: auto.appendingPathComponent(".rayfish-00000000000000000000000000000000.part"))
         var pass = await handoff.deliver()
         precondition(pass.movedAny && pass.errors.isEmpty)
-        precondition(try String(contentsOf: downloads.appendingPathComponent("photo (1).jpg"), encoding: .utf8) == "new")
+        let renamed = try String(contentsOf: downloads.appendingPathComponent("photo (1).jpg"), encoding: .utf8)
+        precondition(renamed == "new")
         precondition(files.fileExists(atPath: auto.appendingPathComponent(".rayfish-00000000000000000000000000000000.part").path))
         precondition(files.fileExists(atPath: auto.path))
         print("PASS: auto-accepted files move to Downloads, unfinished ones stay")
@@ -45,12 +46,14 @@ struct FileHandoffTests {
         let staged = staging.appendingPathComponent("notes.txt")
         try Data("new".utf8).write(to: staged)
         pass = await handoff.deliver()
-        precondition(try String(contentsOf: chosen.appendingPathComponent("notes.txt"), encoding: .utf8) == "new")
+        let replaced = try String(contentsOf: chosen.appendingPathComponent("notes.txt"), encoding: .utf8)
+        precondition(replaced == "new")
         precondition(!files.fileExists(atPath: staging.path))
         precondition(pass.delivered.last == FileHandoff.Delivered(staged: staged.path,
                                                                   final: chosen.appendingPathComponent("notes.txt").path))
         precondition(handoff.savedDelivered() == pass.delivered)
-        precondition(!(await handoff.deliver()).movedAny)
+        let again = await handoff.deliver()
+        precondition(!again.movedAny)
         print("PASS: accepted files move to their folder and their staging directory goes")
 
         // The app shows a staged file as still arriving, a moved one where it went.
