@@ -37,7 +37,8 @@ actor FileHandoff {
 
     nonisolated let incoming: URL
     private let downloads: URL
-    private let defaults: UserDefaults
+    // UserDefaults is thread-safe.
+    private nonisolated(unsafe) let defaults: UserDefaults
     private var reported: Set<String> = []
 
     init(root: URL = FileHandoff.root, uid: uid_t = getuid(), downloads: URL? = nil,
@@ -77,14 +78,19 @@ actor FileHandoff {
         var delivered = savedDelivered()
         var movedAny = false
         var errors: [String] = []
-        let directories = (try? files.contentsOfDirectory(at: incoming, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
-        for directory in directories where (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-            let token = directory.lastPathComponent
+        // Paths are built from `incoming` rather than taken from the listing,
+        // which resolves links, so they match the destinations the core reports.
+        let tokens = (try? files.contentsOfDirectory(atPath: incoming.path)) ?? []
+        for token in tokens {
+            let directory = incoming.appendingPathComponent(token, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            guard files.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
             let target = targets[token]
             let destination = target.map { URL(fileURLWithPath: $0.directory, isDirectory: true) } ?? downloads
-            let items = (try? files.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+            let names = (try? files.contentsOfDirectory(atPath: directory.path)) ?? []
             var movedHere = false
-            for item in items where !Self.isPartial(item.lastPathComponent) {
+            for name in names where !Self.isPartial(name) {
+                let item = directory.appendingPathComponent(name)
                 do {
                     let final = try Self.move(item, into: destination, replace: target?.replace ?? false)
                     delivered.append(Delivered(staged: item.path, final: final.path))
