@@ -33,6 +33,7 @@
 		D1F80D5F9B82A6842D4C5959 /* RayfishTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2BE21B08718D68C7706B9B6 /* RayfishTheme.swift */; };
 		D527BAACB0F9DD3A1555227A /* RayfishWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA71389ED2196AE2717E7D28 /* RayfishWindow.swift */; };
 		D66B2459A5264A212C1D6E28 /* RayfishMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9620AE970096D458C784D916 /* RayfishMenu.swift */; };
+		3C9F1E7A2B4D5E6F708192A3 /* FileHandoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D0A2F8B3C5E6F708192A3B4 /* FileHandoff.swift */; };
 		DED3C3C6A18BDF9A381CF37E /* FilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F0349A261081B23823F30AB /* FilesView.swift */; };
 		E58DD777F989195DE8D5FD0D /* TunnelIPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84AE5C6F0FAE105C0FC3BE66 /* TunnelIPC.swift */; };
 		FD38447B788E8D307F8A3732 /* TunnelController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4F80FB7E3C1BFC490855942 /* TunnelController.swift */; };
@@ -79,6 +80,7 @@
 		84AE5C6F0FAE105C0FC3BE66 /* TunnelIPC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelIPC.swift; sourceTree = "<group>"; };
 		84DEDEAC5DB8A3BB715608AE /* RayfishTunnelDevelopment.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = RayfishTunnelDevelopment.entitlements; sourceTree = "<group>"; };
 		84FC3CD94CC9D8002DA5C496 /* Fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Fonts; path = Rayfish/Fonts; sourceTree = SOURCE_ROOT; };
+		4D0A2F8B3C5E6F708192A3B4 /* FileHandoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileHandoff.swift; sourceTree = "<group>"; };
 		8F0349A261081B23823F30AB /* FilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesView.swift; sourceTree = "<group>"; };
 		9620AE970096D458C784D916 /* RayfishMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RayfishMenu.swift; sourceTree = "<group>"; };
 		A53F7BB10F7EB612756DB3C6 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
@@ -162,6 +164,7 @@
 		787A37291A10D53183D58F8A /* App */ = {
 			isa = PBXGroup;
 			children = (
+				4D0A2F8B3C5E6F708192A3B4 /* FileHandoff.swift */,
 				8F0349A261081B23823F30AB /* FilesView.swift */,
 				586C1EF82AFF3A4027DD6CCB /* RayfishApp.swift */,
 				9620AE970096D458C784D916 /* RayfishMenu.swift */,
@@ -342,6 +345,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				3C9F1E7A2B4D5E6F708192A3 /* FileHandoff.swift in Sources */,
 				DED3C3C6A18BDF9A381CF37E /* FilesView.swift in Sources */,
 				A599B9CD1B8A1E701D5A0B0E /* LegacyDaemon.swift in Sources */,
 				C500E290BEBBD70E1B6C2463 /* ProviderMessage.swift in Sources */,

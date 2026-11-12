@@ -17,7 +17,7 @@ struct FilesView: View {
             Text("Files").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
             VStack(alignment: .leading, spacing: 10) {
                 Text("Auto-accept from trusted peers").font(RayfishTheme.heading(15))
-                Text("Files from these exact devices save to your Downloads folder or configured download directory without asking.")
+                Text("Files from these exact devices save to your Downloads folder without asking while Rayfish is open.")
                     .foregroundColor(RayfishTheme.muted)
                 ForEach(controller.status?.fileAutoAcceptPeers ?? [], id: \.self) { peer in
                     HStack {
@@ -86,7 +86,7 @@ struct FilesView: View {
         }.disabled(controller.isLoading)
             .alert("Replace existing file?", isPresented: $showReplaceConfirmation, presenting: replacement) { destination in
                 Button("Replace", role: .destructive) {
-                    Task { await controller.acceptFile(destination.file, directory: destination.directory) }
+                    Task { await controller.acceptFile(destination.file, directory: destination.directory, replace: true) }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: { destination in

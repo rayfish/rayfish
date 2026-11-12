@@ -25,8 +25,19 @@ final class TunnelController: ObservableObject {
 
     @Published var page: RayfishPage = .networks
 
+    private let fileHandoff = FileHandoff()
+    private var deliveredFiles: [FileHandoff.Delivered]
+    private var deliveryTask: Task<Void, Never>?
+    /// The last status from the extension, before `FileHandoff.present`.
+    private var providerStatus: ProviderStatus?
+
     @Published var status: ProviderStatus? {
-        didSet { notifications.update(status) }
+        didSet {
+            providerStatus = status
+            status = FileHandoff.present(status, delivered: deliveredFiles, incoming: fileHandoff.incoming)
+            notifications.update(status)
+            deliverReceivedFiles()
+        }
     }
     @Published private(set) var firewall: ProviderFirewallState?
     @Published private(set) var machines: [ProviderMachine] = []
@@ -59,7 +70,12 @@ final class TunnelController: ObservableObject {
         }
     }
 
+    init() {
+        deliveredFiles = fileHandoff.savedDelivered()
+    }
+
     deinit {
+        deliveryTask?.cancel()
         pollingTask?.cancel()
         machinesTask?.cancel()
         reconnectTask?.cancel()
@@ -424,18 +440,36 @@ final class TunnelController: ObservableObject {
         _ = await perform(ProviderRequest(action: .unblockPeer, peer: peer))
     }
 
-    func acceptFile(_ file: ProviderFile, directory: URL) async {
+    /// Accept `file` into `directory`. The extension cannot write to most of
+    /// the user's folders, so it saves into a staging directory and
+    /// `FileHandoff` moves the file on once it arrives.
+    func acceptFile(_ file: ProviderFile, directory: URL, replace: Bool = false) async {
         guard !isLoading, !isQuitting, receivingFileIDs.insert(file.transferId).inserted else { return }
         defer { receivingFileIDs.remove(file.transferId) }
         error = nil
+        let staging = await fileHandoff.stagingDirectory(for: directory, replace: replace)
         do {
             // Returns once the receive starts; status polling shows its progress.
             let response = try await TunnelIPC.request(ProviderRequest(action: .acceptFile, fileId: file.transferId,
-                                                                      directory: directory.path, uid: getuid(), gid: getgid()))
+                                                                      directory: staging.path, uid: getuid(), gid: getgid()))
             guard isConnected, !isQuitting else { return }
             status = response.status
         } catch {
+            await fileHandoff.forget(staging)
             self.error = error.localizedDescription
+        }
+    }
+
+    /// Move files the extension has finished saving to where they belong,
+    /// then show them there.
+    private func deliverReceivedFiles() {
+        guard deliveryTask == nil else { return }
+        deliveryTask = Task {
+            let pass = await fileHandoff.deliver()
+            deliveryTask = nil
+            deliveredFiles = pass.delivered
+            if let failure = pass.errors.first { error = failure }
+            if pass.movedAny { status = providerStatus }
         }
     }
 
