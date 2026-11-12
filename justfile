@@ -96,6 +96,12 @@ macos-notification-test:
     xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Shared/TunnelIPC.swift macos/Shared/ProviderReply.swift macos/Rayfish/App/RayfishNotifications.swift macos/Tests/NotificationTests.swift -o target/macos-tests/notification-tests
     target/macos-tests/notification-tests
 
+# Check moving received files out of the extension's staging directory.
+macos-handoff-test:
+    mkdir -p target/macos-tests
+    xcrun swiftc -parse-as-library macos/Shared/ProviderMessage.swift macos/Rayfish/App/FileHandoff.swift macos/Tests/FileHandoffTests.swift -o target/macos-tests/handoff-tests
+    target/macos-tests/handoff-tests
+
 # Build a locally testable app with automatic Apple Development signing.
 macos-dev:
     #!/usr/bin/env bash

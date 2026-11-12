@@ -15,6 +15,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mesh as a direct transport path, without blocking other services that reuse
   its packet mark.
 
+- macOS app: received files save to Downloads and other protected folders
+  instead of failing with "Operation not permitted". Auto-accepted files go to
+  Downloads once the app is open. "Replace" now replaces the existing file.
+
 ## [0.5.16] - 2026-11-05
 
 ### Added

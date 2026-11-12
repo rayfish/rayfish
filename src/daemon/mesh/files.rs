@@ -442,8 +442,13 @@ fn dir_owner(_path: &std::path::Path) -> Option<(u32, u32)> {
 /// Resolve the auto-accept target from live config, applying the precedence in
 /// [`pick_download_target`]. `None` means "no configured target": the caller
 /// must leave the offer queued rather than writing as root. The daemon runs as
-/// root, so its own `~/Downloads` is never a valid fallback.
+/// root, so its own `~/Downloads` is never a valid fallback. An embedder's
+/// [`config::set_download_dir_override`] comes before all of it.
 pub(crate) fn resolve_download_target() -> Option<(PathBuf, Option<(u32, u32)>)> {
+    if let Some(dir) = config::download_dir_override() {
+        let owner = dir_owner(&dir);
+        return Some((dir, owner));
+    }
     let cfg = config::load().ok()?;
     let dir = cfg.download_dir.map(PathBuf::from);
     let dir_owned = dir.as_deref().and_then(dir_owner);

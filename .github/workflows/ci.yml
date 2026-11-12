@@ -205,7 +205,7 @@ jobs:
         run: brew install just fish
 
       - name: Test native app
-        run: just macos-test macos-ipc-test macos-ui-test macos-notification-test
+        run: just macos-test macos-ipc-test macos-ui-test macos-notification-test macos-handoff-test
 
       - name: Check Apple bindings
         run: |
