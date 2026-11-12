@@ -211,9 +211,9 @@ async fn ipv6_client_and_gateway_round_trip() -> Result<()> {
         "table",
         "100",
     ])?;
+    let mark = format!("{:#x}", rayfish::exit_node::SOCKET_MARK);
     run(&[
-        "ip", "-6", "rule", "add", "to", "2000::/3", "fwmark", "0x7261", "table", "100", "pref",
-        "90",
+        "ip", "-6", "rule", "add", "to", "2000::/3", "fwmark", &mark, "table", "100", "pref", "90",
     ])?;
     run(&[
         "ip",

@@ -96,15 +96,17 @@ fn selection_problem(
             }),
         };
     }
-    if !data_plane_up {
-        return Some("the data plane is down (`ray up`)".to_string());
-    }
-    let Some(member) = member else {
-        return Some("the peer is not in this network's roster".to_string());
+    // Without a resolved selection the client routing is torn down, so the
+    // reason has to say traffic is not blocked.
+    let reason = if !data_plane_up {
+        "the data plane is down (`ray up`)".to_string()
+    } else if let Some(member) = member {
+        gateway_family_refusal(member, &display_name(member))
+            .unwrap_or_else(|| "the full tunnel is not installed; see the daemon log".to_string())
+    } else {
+        "the peer is not in this network's roster".to_string()
     };
-    gateway_family_refusal(member, &display_name(member)).or(Some(
-        "the full tunnel is not installed; see the daemon log".to_string(),
-    ))
+    Some(format!("{reason}; traffic leaves directly"))
 }
 
 /// Whether the roster's record of our own exit offer disagrees with what we
@@ -970,6 +972,8 @@ mod tests {
         // Not on the roster yet is the other wait.
         let why = selection_problem(None, false, true, None, false).expect("no peer, no tunnel");
         assert!(why.contains("roster"), "{why}");
+        // No resolved selection means no client routing, so nothing is blocked.
+        assert!(why.ends_with("; traffic leaves directly"), "{why}");
 
         // The one that is not a wait: the reason the tunnel came down is the same
         // string `ray exit-node use` would have refused with.
