@@ -85,12 +85,13 @@ use tokio_util::sync::CancellationToken;
 
 mod packet;
 
+#[cfg(test)]
+pub(crate) use packet::IPV6_AH;
+pub(crate) use packet::IPV6_FRAGMENT;
 pub use packet::{
     FragmentKey, IPV6_EXTENSION_HEADERS, Ipv6Fragment, PacketInfo, is_link_scoped_v6,
     parse_ipv6_fragment, parse_packet_info,
 };
-#[cfg(test)]
-pub(crate) use packet::{IPV6_AH, IPV6_FRAGMENT};
 
 // Direction / Protocol / Action live in `ray-proto` so the IPC layer carries them
 // typed (not stringified); re-exported here so the daemon keeps its original

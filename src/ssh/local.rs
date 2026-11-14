@@ -68,8 +68,7 @@ pub(super) async fn uid(client: SocketAddr, server: SocketAddr) -> Option<u32> {
     }
     #[cfg(target_os = "linux")]
     {
-        let table = tokio::fs::read_to_string("/proc/net/tcp6").await.ok()?;
-        let owner = proc_owner(&table, client, server)?;
+        let owner = proc_table_owner(client, server).await?;
         if held_by_this_process(owner.inode).await {
             tracing::warn!(%client, "mesh SSH: refusing self-SSH from a socket the daemon holds");
             return None;
@@ -142,6 +141,27 @@ async fn held_by_this_process(inode: u64) -> bool {
             Err(_) => return true,
         }
     }
+}
+
+/// Look the client up in `/proc/net/tcp6`, retrying a miss a few times. The
+/// kernel serves a large table over several reads, and a socket opened or
+/// closed between them can hide a live row or show one twice. Both read as
+/// "no unique owner", so a busy host would refuse a genuine local login.
+#[cfg(target_os = "linux")]
+async fn proc_table_owner(client: SocketAddr, server: SocketAddr) -> Option<ProcOwner> {
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    for attempt in 0..5 {
+        if attempt > 0 {
+            sleep(Duration::from_millis(20)).await;
+        }
+        let table = tokio::fs::read_to_string("/proc/net/tcp6").await.ok()?;
+        if let Some(owner) = proc_owner(&table, client, server) {
+            return Some(owner);
+        }
+    }
+    None
 }
 
 #[cfg(any(target_os = "linux", test))]

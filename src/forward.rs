@@ -921,7 +921,7 @@ async fn send_fragment(
     };
     let now = tokio::time::Instant::now();
     if fragment.first {
-        if send_routed(ctx, &route, &fragment.info, pkt, Admission::Firewall).await {
+        if send_routed(ctx, &route, &fragment.info, pkt, Admission::FirstFragment).await {
             verdicts.allow(fragment.key, now);
         }
     } else if verdicts.admits(&fragment.key, now) {
@@ -935,8 +935,26 @@ async fn send_fragment(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Admission {
     Firewall,
+    /// A first IPv6 fragment, still subject to firewall admission.
+    FirstFragment,
     /// A later IPv6 fragment whose first fragment already passed.
     Admitted,
+}
+
+impl Admission {
+    fn scheduler_info(self, info: &firewall::PacketInfo) -> firewall::PacketInfo {
+        match self {
+            Self::Firewall => *info,
+            // Later IP fragments have no transport header. Hash every fragment
+            // by its endpoints so FQ-CoDel cannot send a tail before its head.
+            Self::FirstFragment | Self::Admitted => firewall::PacketInfo {
+                protocol: firewall::IPV6_FRAGMENT,
+                src_port: 0,
+                dst_port: 0,
+                ..*info
+            },
+        }
+    }
 }
 
 /// Forwarding state for outbound admission, membership checks, counters, and
@@ -970,7 +988,7 @@ async fn prepare_datagrams(
     }
     // Reachability is "we share a network", enforced by connection existence. The
     // per-host firewall is the fine-grained gate.
-    if admission == Admission::Firewall
+    if admission != Admission::Admitted
         && ctx
             .firewall
             .evaluate_packet(Direction::Out, info, &route.endpoint_id, |network| {
@@ -1093,7 +1111,8 @@ async fn send_routed(
         let sender = slot.get_or_init(|| {
             fq_codel::Sender::spawn(route, Arc::clone(ctx.active), Arc::clone(ctx.stats))
         });
-        sender.enqueue(info, route.handle, encoded, n);
+        let flow_info = admission.scheduler_info(info);
+        sender.enqueue(&flow_info, route.handle, encoded, n);
     } else {
         let datagrams = encoded.datagrams();
         send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]);

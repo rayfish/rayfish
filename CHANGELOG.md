@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Prevent FQ-CoDel from reordering IPv6 fragments and causing packet loss
+  during large UDP transfers.
+
 - macOS: retry promptly when login starts the VPN before the network is ready,
   instead of waiting 90 seconds after a failed start.
 
