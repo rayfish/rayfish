@@ -97,10 +97,13 @@ impl Recipient {
     /// offer comes back to the queue instead.
     pub(crate) fn survives_restart(&self) -> bool {
         #[cfg(windows)]
-        if self.caller_chose_dir && !matches!(self.caller, WindowsCaller::System) {
-            return false;
+        {
+            !self.caller_chose_dir || matches!(self.caller, WindowsCaller::System)
         }
-        true
+        #[cfg(not(windows))]
+        {
+            true
+        }
     }
 
     /// A local caller accepting a file into a directory they named (or the
