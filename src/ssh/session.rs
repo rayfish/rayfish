@@ -1,4 +1,7 @@
 //! Shared session input for PTY and pipe execution.
+//!
+//! Use channel halves here: `into_stream` closes the channel on drop, before
+//! the caller has sent the process's exit status or signal.
 
 use std::future::Future;
 use std::os::fd::AsFd;
@@ -248,11 +251,11 @@ pub(super) async fn run_pty_session(
         .pid
         .store(child.id().unwrap_or(0), Ordering::Relaxed);
 
-    let stream = channel.into_stream();
-    let (mut chan_read, mut chan_write) = tokio::io::split(stream);
+    let (mut channel_read, channel_write) = channel.split();
     let (mut pty_read, mut pty_write) = pty.into_split();
     // Client input and resize requests both write to the PTY.
     let c2p = tokio::spawn(async move {
+        let mut chan_read = channel_read.make_reader();
         let mut buf = [0u8; 8192];
         loop {
             tokio::select! {
@@ -268,6 +271,7 @@ pub(super) async fn run_pty_session(
         }
     });
     let p2c = tokio::spawn(async move {
+        let mut chan_write = channel_write.make_writer();
         let _ = tokio::io::copy(&mut pty_read, &mut chan_write).await;
         let _ = chan_write.shutdown().await;
     });
@@ -325,11 +329,11 @@ pub(super) async fn run_pipe_session(
     let mut stdout = child.stdout.take().context("child stdout")?;
     let mut stderr = child.stderr.take().context("child stderr")?;
 
-    let stream = channel.into_stream();
-    let (mut chan_read, _chan_write) = tokio::io::split(stream);
-    // The channel stream only carries stdin. SSH output uses the handle so
+    let (mut channel_read, _) = channel.split();
+    // The channel reader only carries stdin. SSH output uses the handle so
     // stderr remains extended data instead of mixing with stdout.
     let stdin_task = tokio::spawn(async move {
+        let mut chan_read = channel_read.make_reader();
         let _ = tokio::io::copy(&mut chan_read, &mut stdin).await;
     });
     let stdout_handle = handle.clone();

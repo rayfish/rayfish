@@ -658,6 +658,44 @@ async fn concurrent_channels_keep_their_own_output_and_pty() {
     assert_eq!(pipe_code, Some(0));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipe_and_pty_commands_report_exit_status_before_close() {
+    let handle = Arc::new(connect_to_test_server().await);
+    // Exercise both session runners on a reused connection. Multiple workers
+    // allow an automatic channel close to overtake the exit-status message.
+    for with_pty in [false, true] {
+        for _ in 0..8 {
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let handle = Arc::clone(&handle);
+                tasks.push(tokio::spawn(async move {
+                    let mut channel = handle.channel_open_session().await.expect("open session");
+                    let command = if with_pty {
+                        channel
+                            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                            .await
+                            .expect("request pty");
+                        "printf completed; exit 23"
+                    } else {
+                        "cat >/dev/null; printf completed; exit 23"
+                    };
+                    channel.exec(true, command).await.expect("exec");
+                    if !with_pty {
+                        channel.data(&b"input\n"[..]).await.expect("send stdin");
+                        channel.eof().await.expect("close stdin");
+                    }
+                    let (out, code) = drain(&mut channel).await;
+                    assert_eq!(out, "completed", "pty={with_pty}");
+                    assert_eq!(code, Some(23), "closed without exit status, pty={with_pty}");
+                }));
+            }
+            for task in tasks {
+                task.await.expect("session task");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn direct_tcpip_channel_carries_a_forwarded_connection() {
     // `ssh -L`, `ssh -D` and `ProxyJump` all open this channel type. With
