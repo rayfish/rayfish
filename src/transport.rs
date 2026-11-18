@@ -534,6 +534,8 @@ fn is_unroutable(e: &io::Error) -> bool {
 
 const FQ_CODEL_SEND_BUFFER_SIZE: usize = 16 * 1024;
 const STANDALONE_SEND_BUFFER_SIZE: usize = 1024 * 1024;
+const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+const CONNECTION_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 
 /// Mesh QUIC transmit policy, independent of TUN offload. iroh's address
 /// discovery client uses a separate transport configuration.
@@ -561,6 +563,10 @@ pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
     );
     QuicTransportConfig::builder()
         .congestion_controller_factory(Arc::new(LossTolerantConfig::default()))
+        // Reliable transfers need enough credit to fill high-bandwidth,
+        // high-latency paths without opening extra streams to gain credit.
+        .stream_receive_window(STREAM_RECEIVE_WINDOW.into())
+        .receive_window(CONNECTION_RECEIVE_WINDOW.into())
         // There are no competing data streams of equal priority, so disable
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.

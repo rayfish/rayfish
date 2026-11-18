@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mesh as a direct transport path, without blocking other services that reuse
   its packet mark.
 
+### Performance
+
+- Reliable transfers can use more bandwidth on high-latency paths without
+  opening extra QUIC streams.
+
 ## [0.5.16] - 2026-11-05
 
 ### Added
