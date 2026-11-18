@@ -344,8 +344,14 @@ impl ConnectService {
         Some(tokio::spawn(async move {
             let _running = running;
             let mut backoff = BACKOFF_INITIAL;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60 * 60);
             loop {
                 tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => {
+                        me.record_connection_error(peer, "connect request timed out; try again".to_string());
+                        me.outgoing_connects.remove(&peer);
+                        return;
+                    }
                     _ = me.registry.shutdown_token.cancelled() => return,
                     _ = tokio::time::sleep(backoff) => {}
                 }

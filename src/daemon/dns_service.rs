@@ -510,9 +510,14 @@ impl DnsService {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let mut delay = first_delay;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60 * 60);
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        tracing::error!("system DNS configuration timed out; reconnect to retry");
+                        return;
+                    }
                     _ = tokio::time::sleep(delay) => {}
                 }
                 match dns_config::detect_and_configure(&tun_name, me.mesh_v6).await {

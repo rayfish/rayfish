@@ -1604,3 +1604,25 @@ async fn exchange(
     endpoint.close().await;
     reply
 }
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_unpair_retries_wait_for_a_new_event() {
+    let shutdown = CancellationToken::new();
+    let nudge = Notify::new();
+    let (attempts, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let task = retry_until_done(&shutdown, &nudge, || {
+        attempts.send(()).unwrap();
+        async { true }
+    });
+    tokio::pin!(task);
+    tokio::select! { _ = &mut task => panic!("retry stopped"), _ = observed.recv() => {} }
+    tokio::time::advance(Duration::from_secs(25 * 60 * 60)).await;
+    tokio::select! { _ = &mut task => panic!("retry stopped"), _ = observed.recv() => {} }
+    tokio::time::advance(Duration::from_secs(60 * 60)).await;
+    tokio::select! { biased; _ = &mut task => panic!("retry stopped"), _ = tokio::task::yield_now() => {} }
+    assert!(observed.try_recv().is_err());
+    nudge.notify_one();
+    tokio::select! { _ = &mut task => panic!("retry stopped"), _ = observed.recv() => {} }
+    shutdown.cancel();
+    task.await;
+}

@@ -723,6 +723,22 @@ async fn build_daemon_inner(
                 {
                     registry.poll_nudge.notify_waiters();
                 }
+                if let Ok(config) = config::load() {
+                    if config
+                        .pending_unpairs
+                        .iter()
+                        .any(|entry| entry.cert.user_identity == peer)
+                    {
+                        registry.unpair_nudge.notify_one();
+                    }
+                    if config
+                        .pending_unpair_notices
+                        .iter()
+                        .any(|entry| entry.device == peer)
+                    {
+                        registry.notice_nudge.notify_one();
+                    }
+                }
                 tokio::spawn(async move { files.flush_outbox_for(peer).await });
             })
         },

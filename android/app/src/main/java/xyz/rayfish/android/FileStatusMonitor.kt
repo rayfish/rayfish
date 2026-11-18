@@ -51,13 +51,31 @@ internal fun reconcileFileStatus(
     accept: () -> Unit,
     transfers: () -> Unit,
     offers: () -> Unit,
+    retries: FileStatusRetries? = null,
 ): Long? {
     val accepted = runCatching(accept)
     val transferred = runCatching(transfers)
     val offered = runCatching(offers)
     return if (accepted.isSuccess && transferred.isSuccess && offered.isSuccess) {
+        retries?.reset()
         DownloadsOutcome.nextCheckDelayMs()
-    } else 4_000L
+    } else retries?.nextFailure() ?: if (retries == null) 4_000L else null
+}
+
+/** Limit consecutive failed reconciliations; a new file event starts a new batch. */
+internal class FileStatusRetries {
+    private var failures = 0
+
+    @Synchronized fun reset() { failures = 0 }
+
+    @Synchronized fun nextFailure(): Long? {
+        failures++
+        if (failures >= 8) {
+            android.util.Log.w("RayfishFiles", "file status retries paused until the next change")
+            return null
+        }
+        return (4_000L shl (failures - 1)).coerceAtMost(60_000L)
+    }
 }
 
 /** Reconciles notifications on core changes, with no timer when files are idle. */
@@ -66,6 +84,7 @@ internal class FileStatusMonitor private constructor(private val context: Contex
     @Volatile var isClosed = false
         private set
     private var watch: FileWatch? = null
+    private val retries = FileStatusRetries()
     private val work = DemandTask(ScheduledThreadPoolExecutor(1)) {
         synchronized(reconciliation) {
             if (isClosed) return@DemandTask null
@@ -75,13 +94,14 @@ internal class FileStatusMonitor private constructor(private val context: Contex
                 accept = { FileAutoAccept.run(context) },
                 transfers = { TransferNotifier.poll(context) },
                 offers = { OfferNotifier.poll(context) },
+                retries = retries,
             )
         }
     }
 
     private fun subscribe() {
         watch = NodeHolder.get(context).watchFiles(object : FileChangeListener {
-            override fun onChange() { work.request() }
+            override fun onChange() { retries.reset(); work.request() }
         })
     }
 
