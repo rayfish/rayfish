@@ -11,11 +11,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - SSH: preserve command exit statuses before closing channels, avoiding
   intermittent failures in reused connections and pipelined commands.
 
-- Prevent FQ-CoDel from reordering IPv6 fragments and causing packet loss
-  during large UDP transfers.
-
 - macOS: retry promptly when login starts the VPN before the network is ready,
   instead of waiting 90 seconds after a failed start.
+
+- Prevent FQ-CoDel from reordering IPv6 fragments and causing packet loss
+  during large UDP transfers.
 
 - Linux with cgroup v2: keep Tailscale's system service from using the Rayfish
   mesh as a direct transport path, without blocking other services that reuse
