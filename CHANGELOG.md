@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- SSH: preserve command exit statuses before closing channels, avoiding
+  intermittent failures in reused connections and pipelined commands.
+
 - Prevent FQ-CoDel from reordering IPv6 fragments and causing packet loss
   during large UDP transfers.
 
@@ -17,6 +20,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Linux with cgroup v2: keep Tailscale's system service from using the Rayfish
   mesh as a direct transport path, without blocking other services that reuse
   its packet mark.
+- Repeated background failures now back off and stop retrying, reducing battery use.
 
 ## [0.5.16] - 2026-11-05
 
