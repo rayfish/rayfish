@@ -296,7 +296,7 @@ fn split_device(device: AsyncDevice, mtu: u16) -> (TunReader, TunWriter) {
     let udp_gso = device.udp_gso();
     let dev = Arc::new(device);
     #[cfg(not(target_os = "macos"))]
-    let framed = DeviceFramedRead::new(Arc::clone(&dev), BytesCodec::new());
+    let framed = framed_reader(Arc::clone(&dev));
     #[cfg(target_os = "linux")]
     let writer = TunWriter {
         framed: DeviceFramedWrite::new(dev, BytesCodec::new()),
@@ -313,11 +313,20 @@ fn split_device(device: AsyncDevice, mtu: u16) -> (TunReader, TunWriter) {
     };
     #[cfg(target_os = "macos")]
     let reader = TunReader {
-        inner: MacTunReader::Framed(DeviceFramedRead::new(dev, BytesCodec::new())),
+        inner: MacTunReader::Framed(framed_reader(dev)),
     };
     #[cfg(not(target_os = "macos"))]
     let reader = TunReader { framed };
     (reader, writer)
+}
+
+#[cfg(not(target_os = "android"))]
+fn framed_reader(dev: Arc<AsyncDevice>) -> DeviceFramedRead<BytesCodec, Arc<AsyncDevice>> {
+    let mut reader = DeviceFramedRead::new(dev, BytesCodec::new());
+    // tun-rs sizes its buffer from the initial device MTU. Keep room for every
+    // supported packet if the interface MTU increases while this reader lives.
+    reader.set_read_buffer_size(reader.read_buffer_size().max(usize::from(TUN_MTU)));
+    reader
 }
 
 /// Opens the utun interface owned by `NEPacketTunnelProvider` without routing
@@ -1093,6 +1102,54 @@ impl TunWrite for TunWriter {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root, /dev/net/tun, and an isolated network namespace"]
+    async fn framed_reader_preserves_packets_after_mtu_increase() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use futures::StreamExt;
+        use tokio::net::UdpSocket;
+        use tun_rs::DeviceBuilder;
+
+        let address = Ipv4Addr::new(192, 0, 2, 1);
+        let peer = Ipv4Addr::new(192, 0, 2, 2);
+        let dev = Arc::new(
+            DeviceBuilder::new()
+                .name("mtu-test")
+                .mtu(super::MIN_TUN_MTU)
+                .ipv4(address, 24, None)
+                .offload(false)
+                .build_async()
+                .unwrap(),
+        );
+        let mut reader = super::framed_reader(Arc::clone(&dev));
+        dev.set_mtu(super::TUN_MTU).unwrap();
+        let socket = UdpSocket::bind(SocketAddrV4::new(address, 0))
+            .await
+            .unwrap();
+        let payload = vec![0x42; usize::from(super::TUN_MTU) - 20 - 8];
+        socket
+            .send_to(&payload, SocketAddrV4::new(peer, 12345))
+            .await
+            .unwrap();
+        let receive = async {
+            loop {
+                let packet = reader.next().await.unwrap().unwrap();
+                if packet.first().is_some_and(|byte| byte >> 4 == 4) && packet.get(9) == Some(&17) {
+                    return packet;
+                }
+            }
+        };
+        let packet = tokio::time::timeout(Duration::from_secs(5), receive)
+            .await
+            .unwrap();
+        assert_eq!(packet.len(), usize::from(super::TUN_MTU));
+        assert_eq!(&packet[28..], payload);
+    }
+
     #[cfg(not(target_os = "android"))]
     #[test]
     fn preferred_mtu_rejection_retries_at_ipv6_minimum() {
