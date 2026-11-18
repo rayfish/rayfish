@@ -650,29 +650,67 @@ pub async fn ensure_ipv6_addr(tun_name: &str, v6: Ipv6Addr) -> Result<()> {
 /// shows up as a connection that carries headers and then stalls.
 #[cfg(target_os = "linux")]
 pub async fn route_peer_range(tun_name: &str) -> Result<()> {
-    use rtnetlink::RouteMessageBuilder;
-    use rtnetlink::packet_route::route::{RouteAttribute, RouteMetric};
-
+    let policy = crate::config::load_for_read()?.tcp_congestion;
     with_tun_link(tun_name, async |handle, index| {
         let mtu = tun_link_mtu(&handle, index).await;
+        let algorithm = match policy {
+            crate::config::TcpCongestion::System => None,
+            crate::config::TcpCongestion::Bbr => Some("bbr"),
+        };
+        install_peer_route(&handle, index, mtu, algorithm).await
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn install_peer_route(
+    handle: &rtnetlink::Handle,
+    index: u32,
+    mtu: u16,
+    algorithm: Option<&str>,
+) -> Result<()> {
+    use rtnetlink::RouteMessageBuilder;
+    use rtnetlink::packet_core::DefaultNla;
+    use rtnetlink::packet_route::route::{RouteAttribute, RouteMetric};
+
+    let make_route = |algorithm: Option<&str>| {
         let mut route = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(OVERLAY, OVERLAY_LEN)
             .output_interface(index)
             .build();
+        let mut metrics = vec![RouteMetric::Mtu(u32::from(mtu))];
+        if let Some(algorithm) = algorithm {
+            // RTAX_CC_ALGO is a NUL-terminated name. The typed CcAlgo variant
+            // currently models it as u32, so preserve its actual wire encoding.
+            const RTAX_CC_ALGO: u16 = 16;
+            let mut name = algorithm.as_bytes().to_vec();
+            name.push(0);
+            metrics.push(RouteMetric::Other(DefaultNla::new(RTAX_CC_ALGO, name)));
+        }
+        route.attributes.push(RouteAttribute::Metrics(metrics));
         route
-            .attributes
-            .push(RouteAttribute::Metrics(vec![RouteMetric::Mtu(u32::from(
-                mtu,
-            ))]));
-        handle
+    };
+    if let Some(algorithm) = algorithm {
+        match handle
             .route()
-            .add(route)
+            .add(make_route(Some(algorithm)))
             .replace()
             .execute()
             .await
-            .context("add 200::/7 route via netlink")
-    })
-    .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(%error, %algorithm, "mesh TCP congestion policy unavailable; using system policy")
+            }
+        }
+    }
+    handle
+        .route()
+        .add(make_route(None))
+        .replace()
+        .execute()
+        .await
+        .context("add 200::/7 route via netlink")
 }
 
 /// The largest TCP MSS in an `mtu`-byte IPv6 packet: the MTU less the 40-byte
@@ -1102,6 +1140,48 @@ impl TunWrite for TunWriter {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root, /dev/net/tun, iproute2, and an isolated network namespace"]
+    async fn tcp_route_policy_restores_system_and_falls_back_without_losing_mtu() {
+        use tun_rs::DeviceBuilder;
+
+        let before = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_congestion_control").unwrap();
+        let dev = DeviceBuilder::new()
+            .name("policy-test")
+            .mtu(1280)
+            .offload(false)
+            .build_async()
+            .unwrap();
+        let name = dev.name().unwrap();
+        super::with_tun_link(&name, async |handle, index| {
+            for (requested, expected) in [
+                (Some("bbr"), Some("bbr")),
+                (None, None),
+                (Some("unavailable-test"), None),
+            ] {
+                super::install_peer_route(&handle, index, 1280, requested)
+                    .await
+                    .unwrap();
+                let output = std::process::Command::new("ip")
+                    .args(["-j", "-6", "route", "show", "200::/7", "dev", &name])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                let routes: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(routes[0]["metrics"][0]["mtu"], 1280);
+                assert_eq!(routes[0]["metrics"][0]["congestion"].as_str(), expected);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/net/ipv4/tcp_congestion_control").unwrap(),
+            before
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires root, /dev/net/tun, and an isolated network namespace"]

@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ray config set tcp-congestion bbr` selects BBR for Linux mesh TCP routes
+  after restart, with the system policy retained when BBR is unavailable.
+- `ray config set quic-window-mib` controls the outer QUIC congestion-window
+  ceiling (1-256 MiB, default 16), independently of reliable-stream flow control.
+
 ### Fixed
 
 - Keep complete packets when a tunnel's MTU is raised after startup.

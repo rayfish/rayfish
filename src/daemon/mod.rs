@@ -1331,6 +1331,16 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
         GlobalKey::QuicEngine => {
             format!("QUIC engine set to {}. {restart}", cfg.quic_engine.as_ref())
         }
+        GlobalKey::TcpCongestion => {
+            format!(
+                "Linux mesh TCP congestion policy set to {}. {restart}",
+                cfg.tcp_congestion.as_ref()
+            )
+        }
+        GlobalKey::QuicWindowMib => format!(
+            "QUIC congestion-window ceiling set to {} MiB. {restart}",
+            cfg.quic_window_mib
+        ),
         // "cleared" vs "set" keys off the resulting value, not off `reset`, so
         // `config set download-dir ""` reads the same as `--clear`.
         GlobalKey::DownloadDir if cfg.download_dir.is_none() => {
