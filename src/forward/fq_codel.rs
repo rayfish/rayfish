@@ -494,6 +494,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv6_fragment_burst_keeps_heads_before_tails() {
+        use super::super::{Admission, TAG_LEN};
+        use crate::firewall::{self, IPV6_FRAGMENT};
+
+        let stats = Arc::new(ForwardMetrics::default());
+        let (ingress, mut rx) = channel(INGRESS_CAPACITY);
+        let sender = Sender {
+            ingress,
+            hash: RandomState::with_seeds(1, 2, 3, 4),
+            backlog: Arc::new(AtomicUsize::new(0)),
+            stats: Arc::clone(&stats),
+            active: Arc::new(AtomicBool::new(true)),
+        };
+        let mut expected = Vec::new();
+        // Several heads exhaust one flow's quantum while the short tails
+        // would fit in another, exposing classification-induced reordering.
+        for id in 1..=3u32 {
+            for first in [true, false] {
+                let mut ip = vec![0u8; if first { 1280 } else { 224 }];
+                ip[0] = 0x60;
+                let payload_len = u16::try_from(ip.len() - 40).unwrap();
+                ip[4..6].copy_from_slice(&payload_len.to_be_bytes());
+                ip[6] = IPV6_FRAGMENT;
+                ip[7] = 64;
+                ip[8] = 2;
+                ip[23] = 1;
+                ip[24] = 2;
+                ip[39] = 2;
+                ip[40] = 17;
+                let offset = if first { 1u16 } else { 154 << 3 };
+                ip[42..44].copy_from_slice(&offset.to_be_bytes());
+                ip[44..48].copy_from_slice(&id.to_be_bytes());
+                if first {
+                    ip[48..50].copy_from_slice(&5353u16.to_be_bytes());
+                    ip[50..52].copy_from_slice(&4500u16.to_be_bytes());
+                    ip[52..54].copy_from_slice(&1408u16.to_be_bytes());
+                }
+                let fragment = firewall::parse_ipv6_fragment(&ip).unwrap();
+                let admission = if first {
+                    Admission::FirstFragment
+                } else {
+                    Admission::Admitted
+                };
+                let flow_info = admission.scheduler_info(&fragment.info);
+                let encoded = super::super::fragment::encode(1, &ip, 1502).unwrap();
+                sender.enqueue(&flow_info, 1, encoded, ip.len());
+                expected.push(ip);
+            }
+        }
+        let now = Instant::now();
+        let mut queue = Queue::new(Arc::clone(&stats));
+        while let Ok(packet) = rx.try_recv() {
+            queue.enqueue(packet);
+        }
+        for ip in expected {
+            let packet = queue.dequeue(now).unwrap();
+            let delivered = &packet.encoded.datagrams()[0][TAG_LEN..];
+            let actual = firewall::parse_ipv6_fragment(delivered).unwrap();
+            let expected = firewall::parse_ipv6_fragment(&ip).unwrap();
+            assert_eq!(
+                (actual.key.id, actual.first),
+                (expected.key.id, expected.first),
+                "the scheduler must preserve IP fragment order"
+            );
+            assert_eq!(delivered, ip);
+        }
+        assert!(queue.dequeue(now).is_none());
+        assert_eq!(stats.total_drops(), 0);
+        assert_eq!(sender.queued_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn blocked_sends_drop_their_packet_on_standby_before_transport_capacity_returns() {
         let active = AtomicBool::new(true);
         let transmitted = Cell::new(0);
