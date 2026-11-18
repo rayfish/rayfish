@@ -81,6 +81,8 @@ setting_keys! {
         DiscoveryDns = "discovery-dns", "pkarr discovery server (preset or URL)";
         Dns = "dns", "Magic DNS mode (on|partial|off)";
         QuicEngine = "quic-engine", "QUIC forwarding engine, applies on restart (standalone|fq-codel)";
+        TcpCongestion = "tcp-congestion", "Linux mesh TCP congestion control, applies on restart (system|bbr)";
+        QuicWindowMib = "quic-window-mib", "QUIC congestion-window ceiling in MiB, 1-256, default 16; applies on restart";
         DnsUpstreams = "dns-upstreams", "Magic DNS upstream forwarders, including mesh peer IPv6 addresses (comma-separated)";
         AutoUpdate = "auto-update", "install new releases automatically (on|off)";
         OnDemand = "on-demand", "dial peers lazily on first packet (on|off)";

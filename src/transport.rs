@@ -255,6 +255,7 @@ pub async fn create_endpoint_with_alpns(
         dns_replace: settings.dns_upstreams.replace,
         warm_lookup: &warm_lookup,
         quic_engine: settings.quic_engine,
+        quic_window: settings.quic_window_mib.bytes(),
     };
     let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
@@ -289,6 +290,7 @@ struct BindConfig<'a> {
     dns_replace: bool,
     warm_lookup: &'a WarmLookup,
     quic_engine: QuicEngine,
+    quic_window: u64,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -313,6 +315,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         dns_replace,
         warm_lookup,
         quic_engine,
+        quic_window,
     } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -340,7 +343,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //     bounded send buffer. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
         // Both forwarding engines use loss-tolerant congestion control.
-        .transport_config(quic_transport_config(quic_engine))
+        .transport_config(quic_transport_config_with_window(quic_engine, quic_window))
         // Drop overlay addresses from the gathered direct-address candidates, so a
         // mesh IP bound on the TUN is never stored, published, or offered as a
         // holepunch / NAT-traversal candidate (and so never dialed by a peer, which
@@ -534,6 +537,8 @@ fn is_unroutable(e: &io::Error) -> bool {
 
 const FQ_CODEL_SEND_BUFFER_SIZE: usize = 16 * 1024;
 const STANDALONE_SEND_BUFFER_SIZE: usize = 1024 * 1024;
+const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+const CONNECTION_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 
 /// Mesh QUIC transmit policy, independent of TUN offload. iroh's address
 /// discovery client uses a separate transport configuration.
@@ -553,14 +558,26 @@ pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
 /// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
+#[cfg(test)]
 pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
+    quic_transport_config_with_window(engine, crate::config::QuicWindowMiB::default().bytes())
+}
+
+fn quic_transport_config_with_window(engine: QuicEngine, max_window: u64) -> QuicTransportConfig {
     tracing::info!(
         engine = engine.as_ref(),
         mesh_quic_segmentation_offload = MESH_QUIC_SEGMENTATION_OFFLOAD,
+        max_window,
         "mesh QUIC transport config"
     );
     QuicTransportConfig::builder()
-        .congestion_controller_factory(Arc::new(LossTolerantConfig::default()))
+        .congestion_controller_factory(Arc::new(
+            LossTolerantConfig::default().with_max_window(max_window),
+        ))
+        // Reliable transfers need enough credit to fill high-bandwidth,
+        // high-latency paths without opening extra streams to gain credit.
+        .stream_receive_window(STREAM_RECEIVE_WINDOW.into())
+        .receive_window(CONNECTION_RECEIVE_WINDOW.into())
         // There are no competing data streams of equal priority, so disable
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.
@@ -963,6 +980,7 @@ mod tests {
             dns_replace: true,
             warm_lookup: &lookup,
             quic_engine: QuicEngine::default(),
+            quic_window: crate::config::QuicWindowMiB::default().bytes(),
         };
         timeout(Duration::from_secs(5), async {
             let endpoint = bind_endpoint(&bind, 0).await.unwrap();

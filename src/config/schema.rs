@@ -84,6 +84,76 @@ pub enum QuicEngine {
     FqCodel,
 }
 
+/// Host TCP policy on Linux overlay routes. Other platforms keep their host policy.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::AsRefStr,
+    strum::EnumString,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum TcpCongestion {
+    #[default]
+    System,
+    Bbr,
+}
+
+/// Validated outer QUIC congestion-window ceiling, in MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u16", into = "u16")]
+pub struct QuicWindowMiB(u16);
+
+#[derive(Debug, thiserror::Error)]
+#[error("QUIC window must be an integer from 1 to 256 MiB")]
+pub struct InvalidQuicWindow;
+
+impl Default for QuicWindowMiB {
+    fn default() -> Self {
+        Self(16)
+    }
+}
+impl QuicWindowMiB {
+    pub fn bytes(self) -> u64 {
+        u64::from(self.0) * 1024 * 1024
+    }
+}
+impl TryFrom<u16> for QuicWindowMiB {
+    type Error = InvalidQuicWindow;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        if (1..=256).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidQuicWindow)
+        }
+    }
+}
+impl From<QuicWindowMiB> for u16 {
+    fn from(value: QuicWindowMiB) -> Self {
+        value.0
+    }
+}
+impl std::str::FromStr for QuicWindowMiB {
+    type Err = InvalidQuicWindow;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<u16>()
+            .map_err(|_| InvalidQuicWindow)?
+            .try_into()
+    }
+}
+impl std::fmt::Display for QuicWindowMiB {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Accept legacy saved controller choices while writing only the engine name.
 pub(super) fn deserialize_quic_engine<'de, D: Deserializer<'de>>(
     deserializer: D,
@@ -673,6 +743,11 @@ pub struct AppConfig {
         deserialize_with = "deserialize_quic_engine"
     )]
     pub quic_engine: QuicEngine,
+    /// Linux overlay TCP policy. BBR falls back to the system policy if unavailable.
+    #[serde(default)]
+    pub tcp_congestion: TcpCongestion,
+    #[serde(default)]
+    pub quic_window_mib: QuicWindowMiB,
     /// Recently successful peer transport paths.  These are only connection
     /// hints: iroh still authenticates the endpoint identity in TLS and falls
     /// back to its normal discovery services when a hint is stale.  Keeping
@@ -824,6 +899,8 @@ impl Default for AppConfig {
             dns_upstreams: ServerOverride::default(),
             dns_mode: DnsMode::default(),
             quic_engine: QuicEngine::default(),
+            tcp_congestion: TcpCongestion::default(),
+            quic_window_mib: QuicWindowMiB::default(),
             endpoint_hints: Vec::new(),
             ssh_enabled: false,
             ssh_port: default_ssh_port(),

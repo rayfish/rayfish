@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ray config set tcp-congestion bbr` selects BBR for Linux mesh TCP routes
+  after restart, with the system policy retained when BBR is unavailable.
+- `ray config set quic-window-mib` controls the outer QUIC congestion-window
+  ceiling (1-256 MiB, default 16), independently of reliable-stream flow control.
+
 ### Fixed
 
 - SSH: preserve command exit statuses before closing channels, avoiding
@@ -21,6 +28,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mesh as a direct transport path, without blocking other services that reuse
   its packet mark.
 - Repeated background failures now back off and stop retrying, reducing battery use.
+
+- Keep complete packets when a tunnel's MTU is raised after startup.
+
+### Performance
+
+- Reliable transfers can use more bandwidth on high-latency paths without
+  opening extra QUIC streams.
 
 ## [0.5.16] - 2026-11-05
 

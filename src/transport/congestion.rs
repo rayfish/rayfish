@@ -76,6 +76,13 @@ impl Default for LossTolerantConfig {
     }
 }
 
+impl LossTolerantConfig {
+    pub(crate) fn with_max_window(mut self, max_window: u64) -> Self {
+        self.max_window = max_window.max(self.initial_window);
+        self
+    }
+}
+
 impl ControllerFactory for LossTolerantConfig {
     fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(LossTolerant::new(self, current_mtu))
@@ -197,6 +204,19 @@ mod tests {
     fn congestion(cc: &mut LossTolerant, persistent: bool, ecn: bool) {
         let now = Instant::now();
         cc.on_congestion_event(now, now, persistent, ecn, 1200, 0);
+    }
+
+    #[test]
+    fn configured_ceiling_limits_growth_without_changing_startup() {
+        let config = Arc::new(LossTolerantConfig::default().with_max_window(64 * 1024 * 1024));
+        let mut cc = LossTolerant::new(config, MTU);
+        assert_eq!(cc.window(), INITIAL_WINDOW);
+        ack(&mut cc, u64::MAX, false);
+        assert_eq!(cc.window(), 64 * 1024 * 1024);
+        congestion(&mut cc, false, false);
+        assert_eq!(cc.window(), 64 * 1024 * 1024);
+        congestion(&mut cc, true, false);
+        assert_eq!(cc.window(), 2 * u64::from(MTU));
     }
 
     #[test]

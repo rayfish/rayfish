@@ -16,7 +16,9 @@ use iroh::EndpointId;
 
 pub use ray_proto::settings::{FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
-use super::{AppConfig, DnsMode, InboundPolicy, NetworkConfig, QuicEngine, ServerOverride};
+use super::{
+    AppConfig, DnsMode, InboundPolicy, NetworkConfig, QuicEngine, ServerOverride, TcpCongestion,
+};
 use crate::firewall::{Action, FirewallConfig};
 
 /// Parse an on/off value. An empty value (what `ConfigUnset` sends) resets to
@@ -93,6 +95,23 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
                     .parse()
                     .map_err(|_| anyhow::anyhow!("QUIC engine must be standalone or fq-codel"))?
             }
+        }
+        GlobalKey::QuicWindowMib => {
+            cfg.quic_window_mib = if value.trim().is_empty() {
+                Default::default()
+            } else {
+                value.trim().parse()?
+            };
+        }
+        GlobalKey::TcpCongestion => {
+            cfg.tcp_congestion = if value.trim().is_empty() {
+                TcpCongestion::default()
+            } else {
+                value
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("TCP congestion control must be system or bbr"))?
+            };
         }
         GlobalKey::AutoUpdate => cfg.auto_update = parse_bool(value, false)?,
         GlobalKey::OnDemand => cfg.on_demand = parse_bool(value, true)?,
@@ -235,6 +254,8 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
         GlobalKey::Dns => cfg.dns_mode.as_ref().to_string(),
         GlobalKey::QuicEngine => cfg.quic_engine.as_ref().to_string(),
+        GlobalKey::TcpCongestion => cfg.tcp_congestion.as_ref().to_string(),
+        GlobalKey::QuicWindowMib => cfg.quic_window_mib.to_string(),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
         GlobalKey::OnDemand => on_off(cfg.on_demand),
         GlobalKey::Ssh => on_off(cfg.ssh_enabled),
@@ -635,6 +656,39 @@ mod tests {
         }
         apply_global(&mut cfg, GlobalKey::Dns, "", false).unwrap();
         assert_eq!(cfg.dns_mode, DnsMode::Partial);
+    }
+
+    #[test]
+    fn quic_window_validates_persisted_and_cli_values() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(render_global(&cfg, GlobalKey::QuicWindowMib), "16");
+        apply_global(&mut cfg, GlobalKey::QuicWindowMib, "64", false).unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        let loaded: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(loaded.quic_window_mib.bytes(), 64 * 1024 * 1024);
+        for invalid in ["0", "257", "-1", "1.5", "invalid"] {
+            assert!(apply_global(&mut cfg, GlobalKey::QuicWindowMib, invalid, false).is_err());
+        }
+        assert!(toml::from_str::<AppConfig>("quic_window_mib = 0").is_err());
+        assert!(toml::from_str::<AppConfig>("quic_window_mib = 257").is_err());
+        apply_global(&mut cfg, GlobalKey::QuicWindowMib, "", false).unwrap();
+        assert_eq!(cfg.quic_window_mib.bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn tcp_congestion_persists_and_resets_without_changing_quic() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(render_global(&cfg, GlobalKey::TcpCongestion), "system");
+        apply_global(&mut cfg, GlobalKey::TcpCongestion, "bbr", false).unwrap();
+        let encoded = toml::to_string(&cfg).unwrap();
+        let loaded: AppConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(loaded.tcp_congestion, TcpCongestion::Bbr);
+        assert_eq!(loaded.quic_engine, QuicEngine::Standalone);
+        assert_eq!(render_global(&loaded, GlobalKey::TcpCongestion), "bbr");
+        assert!(apply_global(&mut cfg, GlobalKey::TcpCongestion, "invalid", false).is_err());
+        assert_eq!(cfg.tcp_congestion, TcpCongestion::Bbr);
+        apply_global(&mut cfg, GlobalKey::TcpCongestion, "", false).unwrap();
+        assert_eq!(cfg.tcp_congestion, TcpCongestion::System);
     }
 
     #[test]
