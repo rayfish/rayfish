@@ -14,7 +14,7 @@ actor FileHandoff {
     static let root = URL(fileURLWithPath: "/Library/Application Support/Rayfish/Incoming", isDirectory: true)
     private static let targetsKey = "fileHandoffTargets"
     private static let deliveredKey = "fileHandoffDelivered"
-    private static let deliveredLimit = 100
+    private static let deliveredLimit = 256
 
     struct Target: Codable, Equatable {
         var directory: String
@@ -82,31 +82,42 @@ actor FileHandoff {
         // which resolves links, so they match the destinations the core reports.
         let tokens = (try? files.contentsOfDirectory(atPath: incoming.path)) ?? []
         for token in tokens {
-            let directory = incoming.appendingPathComponent(token, isDirectory: true)
-            var isDirectory: ObjCBool = false
-            guard files.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
+            let container = incoming.appendingPathComponent(token, isDirectory: true)
             let target = targets[token]
+            guard token == "auto" || target != nil else { continue }
+            guard (try? container.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == false else { continue }
             let destination = target.map { URL(fileURLWithPath: $0.directory, isDirectory: true) } ?? downloads
-            let names = (try? files.contentsOfDirectory(atPath: directory.path)) ?? []
-            var movedHere = false
-            for name in names where !Self.isPartial(name) {
-                let item = directory.appendingPathComponent(name)
-                do {
-                    let final = try Self.move(item, into: destination, replace: target?.replace ?? false)
-                    delivered.append(Delivered(staged: item.path, final: final.path))
-                    movedHere = true
-                    reported.remove(item.path)
-                } catch {
-                    if reported.insert(item.path).inserted {
-                        errors.append("Could not move \(item.lastPathComponent) to \(destination.path): \(error.localizedDescription)")
+            let folders = (try? files.contentsOfDirectory(atPath: container.path)) ?? []
+            var movedInContainer = false
+            for temporaryName in folders {
+                // The core gives each offer its own folder, named for the
+                // temporary entry inside it. Other names can be complete.
+                let directory = container.appendingPathComponent(temporaryName, isDirectory: true)
+                let attributes = try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard attributes?.isDirectory == true, attributes?.isSymbolicLink == false else { continue }
+                let names = (try? files.contentsOfDirectory(atPath: directory.path)) ?? []
+                var movedInOffer = false
+                for name in names where name != temporaryName {
+                    let item = directory.appendingPathComponent(name)
+                    guard (try? item.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+                    do {
+                        let final = try Self.move(item, into: destination, replace: target?.replace ?? false)
+                        delivered.append(Delivered(staged: item.path, final: final.path))
+                        movedInOffer = true
+                        reported.remove(item.path)
+                    } catch {
+                        if reported.insert(item.path).inserted {
+                            errors.append("Could not move \(item.lastPathComponent) to \(destination.path): \(error.localizedDescription)")
+                        }
                     }
                 }
+                if movedInOffer {
+                    movedInContainer = true
+                    _ = rmdir(directory.path)
+                }
             }
-            movedAny = movedAny || movedHere
-            // An accept's directory holds one file. Only remove it once that
-            // file is out: an empty one may be a receive about to start.
-            if movedHere, token != "auto", ((try? files.contentsOfDirectory(atPath: directory.path)) ?? ["?"]).isEmpty {
-                try? files.removeItem(at: directory)
+            movedAny = movedAny || movedInContainer
+            if movedInContainer, token != "auto", rmdir(container.path) == 0 {
                 targets[token] = nil
             }
         }
@@ -138,11 +149,6 @@ actor FileHandoff {
             return shown
         }
         return status
-    }
-
-    /// The receive's temporary name, `.rayfish-<hex>.part`.
-    nonisolated static func isPartial(_ name: String) -> Bool {
-        name.hasPrefix(".rayfish-") && name.hasSuffix(".part")
     }
 
     /// `report.pdf`, then `report (1).pdf`, `report (2).pdf`, as the core

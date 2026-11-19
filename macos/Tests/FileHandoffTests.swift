@@ -18,22 +18,26 @@ struct FileHandoffTests {
         precondition(FileHandoff.numberedName("report.pdf", attempt: 0) == "report.pdf")
         precondition(FileHandoff.numberedName("report.pdf", attempt: 2) == "report (2).pdf")
         precondition(FileHandoff.numberedName(".profile", attempt: 1) == ".profile (1)")
-        precondition(FileHandoff.isPartial(".rayfish-0123456789abcdef0123456789abcdef.part"))
-        precondition(!FileHandoff.isPartial(".profile"))
-        print("PASS: numbered and temporary names match the core")
+        print("PASS: numbered names match the core")
 
         // An auto-accepted file goes to Downloads, next to one of the same name.
         let auto = incoming.appendingPathComponent("auto")
-        try files.createDirectory(at: auto, withIntermediateDirectories: true)
+        let first = auto.appendingPathComponent(".rayfish-11111111111111111111111111111111.part")
+        let unfinished = auto.appendingPathComponent(".rayfish-00000000000000000000000000000000.part")
+        try files.createDirectory(at: first, withIntermediateDirectories: true)
+        try files.createDirectory(at: unfinished, withIntermediateDirectories: true)
         try files.createDirectory(at: downloads, withIntermediateDirectories: true)
         try Data("old".utf8).write(to: downloads.appendingPathComponent("photo.jpg"))
-        try Data("new".utf8).write(to: auto.appendingPathComponent("photo.jpg"))
-        try Data("partial".utf8).write(to: auto.appendingPathComponent(".rayfish-00000000000000000000000000000000.part"))
+        let firstFile = first.appendingPathComponent("photo.jpg")
+        let partial = unfinished.appendingPathComponent(unfinished.lastPathComponent)
+        try Data("new".utf8).write(to: firstFile)
+        try Data("partial".utf8).write(to: partial)
         var pass = await handoff.deliver()
         precondition(pass.movedAny && pass.errors.isEmpty)
         let renamed = try String(contentsOf: downloads.appendingPathComponent("photo (1).jpg"), encoding: .utf8)
         precondition(renamed == "new")
-        precondition(files.fileExists(atPath: auto.appendingPathComponent(".rayfish-00000000000000000000000000000000.part").path))
+        precondition(files.fileExists(atPath: partial.path))
+        precondition(!files.fileExists(atPath: first.path))
         precondition(files.fileExists(atPath: auto.path))
         print("PASS: auto-accepted files move to Downloads, unfinished ones stay")
 
@@ -42,8 +46,9 @@ struct FileHandoffTests {
         try Data("old".utf8).write(to: chosen.appendingPathComponent("notes.txt"))
         let staging = await handoff.stagingDirectory(for: chosen, replace: true)
         precondition(staging.deletingLastPathComponent().path == incoming.path)
-        try files.createDirectory(at: staging, withIntermediateDirectories: true)
-        let staged = staging.appendingPathComponent("notes.txt")
+        let manual = staging.appendingPathComponent(".rayfish-22222222222222222222222222222222.part")
+        try files.createDirectory(at: manual, withIntermediateDirectories: true)
+        let staged = manual.appendingPathComponent("notes.txt")
         try Data("new".utf8).write(to: staged)
         pass = await handoff.deliver()
         let replaced = try String(contentsOf: chosen.appendingPathComponent("notes.txt"), encoding: .utf8)
@@ -60,7 +65,7 @@ struct FileHandoffTests {
         let status = ProviderStatus(active: true, ipv6: "200::1", networks: [], pendingRequests: [], connectionRequests: [], files: [
             ProviderFile(transferId: 1, peer: "friend", filename: "notes.txt", size: 3, state: .received, destination: staged.path),
             ProviderFile(transferId: 2, peer: "friend", filename: "late.txt", size: 9, state: .received,
-                         destination: auto.appendingPathComponent("late.txt").path),
+                         destination: unfinished.appendingPathComponent("late.txt").path),
             ProviderFile(transferId: 3, peer: "friend", filename: "cli.txt", size: 1, state: .received, destination: "/path/to/work/cli.txt")
         ])
         let shown = FileHandoff.present(status, delivered: pass.delivered, incoming: incoming)?.files ?? []
@@ -68,5 +73,35 @@ struct FileHandoffTests {
         precondition(shown[1].state == .transferring && shown[1].transferred == 9 && shown[1].destination == nil)
         precondition(shown[2] == status.files?[2])
         print("PASS: status shows files where they were moved")
+
+        // A second auto-accept with the same filename gets its own receipt.
+        let second = auto.appendingPathComponent(".rayfish-33333333333333333333333333333333.part")
+        try files.createDirectory(at: second, withIntermediateDirectories: true)
+        let secondFile = second.appendingPathComponent("photo.jpg")
+        try Data("another".utf8).write(to: secondFile)
+        var repeated = status
+        repeated.files = [
+            ProviderFile(transferId: 4, peer: "friend", filename: "photo.jpg", size: 3, state: .received, destination: firstFile.path),
+            ProviderFile(transferId: 5, peer: "friend", filename: "photo.jpg", size: 7, state: .received, destination: secondFile.path)
+        ]
+        let before = FileHandoff.present(repeated, delivered: pass.delivered, incoming: incoming)?.files
+        precondition(before?[0].destination == downloads.appendingPathComponent("photo (1).jpg").path)
+        precondition(before?[1].state == .transferring)
+        pass = await handoff.deliver()
+        let after = FileHandoff.present(repeated, delivered: pass.delivered, incoming: incoming)?.files
+        precondition(after?[0].destination == before?[0].destination)
+        precondition(after?[1].destination == downloads.appendingPathComponent("photo (2).jpg").path)
+        print("PASS: repeated filenames keep separate deliveries")
+
+        for name in [".rayfish-preview.part", unfinished.lastPathComponent] {
+            let complete = auto.appendingPathComponent(".rayfish-44444444444444444444444444444444.part")
+            try files.createDirectory(at: complete, withIntermediateDirectories: true)
+            try Data("complete".utf8).write(to: complete.appendingPathComponent(name))
+            let delivery = await handoff.deliver()
+            precondition(delivery.movedAny && delivery.errors.isEmpty)
+            precondition(files.fileExists(atPath: downloads.appendingPathComponent(name).path))
+            precondition(files.fileExists(atPath: partial.path))
+        }
+        print("PASS: completed files with temporary-looking names are delivered")
     }
 }

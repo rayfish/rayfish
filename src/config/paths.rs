@@ -126,22 +126,22 @@ pub fn set_config_dir_override(dir: PathBuf) {
 
 /// Directory an embedder receives auto-accepted files into, in place of the
 /// configured download target. See [`set_download_dir_override`].
-static DOWNLOAD_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+static DOWNLOAD_DIR_OVERRIDE: RwLock<Option<(PathBuf, (u32, u32))>> = RwLock::new(None);
 
-/// Save auto-accepted files in `dir`, owned by whoever owns `dir`, whatever
+/// Save auto-accepted files in `dir` for `owner`, whatever
 /// `download-dir` and `download-user` say.
 ///
 /// For the macOS network extension: it runs as root, but macOS privacy
 /// controls still keep it out of the user's Downloads, so it saves into a
 /// staging directory the app then moves files out of.
-pub fn set_download_dir_override(dir: PathBuf) {
+pub fn set_download_dir_override(dir: PathBuf, owner: (u32, u32)) {
     *DOWNLOAD_DIR_OVERRIDE
         .write()
-        .unwrap_or_else(|e| e.into_inner()) = Some(dir);
+        .unwrap_or_else(|e| e.into_inner()) = Some((dir, owner));
 }
 
 /// The directory set by [`set_download_dir_override`], if any.
-pub fn download_dir_override() -> Option<PathBuf> {
+pub fn download_dir_override() -> Option<(PathBuf, (u32, u32))> {
     DOWNLOAD_DIR_OVERRIDE
         .read()
         .unwrap_or_else(|e| e.into_inner())

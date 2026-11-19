@@ -364,7 +364,7 @@ impl Node {
         }
         #[cfg(target_os = "macos")]
         match handoff::prepare(Path::new(handoff::INCOMING), owner_uid) {
-            Ok(dir) => config::set_download_dir_override(dir),
+            Ok((dir, gid)) => config::set_download_dir_override(dir, (owner_uid, gid)),
             Err(error) => tracing::warn!(%error, "cannot prepare the incoming files directory"),
         }
         let state = self
@@ -849,7 +849,11 @@ impl Node {
         // The app names a directory under the handoff directory, which it may
         // have removed since the tunnel started.
         #[cfg(target_os = "macos")]
-        handoff::prepare(Path::new(handoff::INCOMING), uid).map_err(AppleError::network)?;
+        {
+            let (dir, gid) =
+                handoff::prepare(Path::new(handoff::INCOMING), uid).map_err(AppleError::network)?;
+            config::set_download_dir_override(dir, (uid, gid));
+        }
         // The destination is checked before this returns, so a folder the
         // file cannot be saved in fails here rather than after the download.
         self.runtime

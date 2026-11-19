@@ -164,9 +164,9 @@
 		787A37291A10D53183D58F8A /* App */ = {
 			isa = PBXGroup;
 			children = (
-				4D0A2F8B3C5E6F708192A3B4 /* FileHandoff.swift */,
 				8F0349A261081B23823F30AB /* FilesView.swift */,
 				586C1EF82AFF3A4027DD6CCB /* RayfishApp.swift */,
+				4D0A2F8B3C5E6F708192A3B4 /* FileHandoff.swift */,
 				9620AE970096D458C784D916 /* RayfishMenu.swift */,
 				AA1BD3D661631EB1DA93E7F2 /* RayfishNotifications.swift */,
 				F2BE21B08718D68C7706B9B6 /* RayfishTheme.swift */,
@@ -345,12 +345,12 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				3C9F1E7A2B4D5E6F708192A3 /* FileHandoff.swift in Sources */,
 				DED3C3C6A18BDF9A381CF37E /* FilesView.swift in Sources */,
 				A599B9CD1B8A1E701D5A0B0E /* LegacyDaemon.swift in Sources */,
 				C500E290BEBBD70E1B6C2463 /* ProviderMessage.swift in Sources */,
 				5BE7A7A78F920B903B6A207F /* ProviderReply.swift in Sources */,
 				89CA26F63629A9D20AB3769B /* RayfishApp.swift in Sources */,
+				3C9F1E7A2B4D5E6F708192A3 /* FileHandoff.swift in Sources */,
 				D66B2459A5264A212C1D6E28 /* RayfishMenu.swift in Sources */,
 				06642DCA858987EA27C2BA74 /* RayfishNotifications.swift in Sources */,
 				D1F80D5F9B82A6842D4C5959 /* RayfishTheme.swift in Sources */,

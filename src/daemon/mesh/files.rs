@@ -445,9 +445,8 @@ fn dir_owner(_path: &std::path::Path) -> Option<(u32, u32)> {
 /// root, so its own `~/Downloads` is never a valid fallback. An embedder's
 /// [`config::set_download_dir_override`] comes before all of it.
 pub(crate) fn resolve_download_target() -> Option<(PathBuf, Option<(u32, u32)>)> {
-    if let Some(dir) = config::download_dir_override() {
-        let owner = dir_owner(&dir);
-        return Some((dir, owner));
+    if let Some((dir, owner)) = config::download_dir_override() {
+        return Some((dir, Some(owner)));
     }
     let cfg = config::load().ok()?;
     let dir = cfg.download_dir.map(PathBuf::from);

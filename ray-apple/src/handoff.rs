@@ -17,7 +17,7 @@ pub(crate) const INCOMING: &str = "/Library/Application Support/Rayfish/Incoming
 
 /// Create `root/<uid>/auto` for `uid` and return it. `root` is the daemon's
 /// own; `<uid>` is handed to the user with mode 0700.
-pub(crate) fn prepare(root: &Path, uid: u32) -> io::Result<PathBuf> {
+pub(crate) fn prepare(root: &Path, uid: u32) -> io::Result<(PathBuf, u32)> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o755)
@@ -33,17 +33,18 @@ pub(crate) fn prepare(root: &Path, uid: u32) -> io::Result<PathBuf> {
             user.display()
         )));
     }
-    if meta.uid() != uid {
-        lchown(&user, Some(uid), primary_gid(uid))?;
+    let gid = primary_gid(uid).unwrap_or_else(|| meta.gid());
+    if meta.uid() != uid || meta.gid() != gid {
+        lchown(&user, Some(uid), Some(gid))?;
     }
     fs::set_permissions(&user, fs::Permissions::from_mode(0o700))?;
     // The user owns `user` and may swap `auto` for a link, so it is only
-    // created and given away here, never followed. The receive refuses a
-    // link in an auto-accept directory.
+    // created and given away here, never followed. The receive checks the
+    // configured user's ownership if it needs to follow a link.
     let auto = user.join("auto");
     make_dir(&auto)?;
-    lchown(&auto, Some(uid), primary_gid(uid))?;
-    Ok(auto)
+    lchown(&auto, Some(uid), Some(gid))?;
+    Ok((auto, gid))
 }
 
 fn make_dir(path: &Path) -> io::Result<()> {
@@ -90,7 +91,7 @@ mod tests {
     fn prepares_a_private_directory_per_user() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("Incoming");
-        let auto = prepare(&root, me()).unwrap();
+        let (auto, gid) = prepare(&root, me()).unwrap();
         assert_eq!(auto, root.join(me().to_string()).join("auto"));
         assert!(auto.is_dir());
         let mode = fs::metadata(root.join(me().to_string()))
@@ -100,7 +101,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
         // Running it again keeps what is there.
         fs::write(auto.join("file"), b"x").unwrap();
-        assert_eq!(prepare(&root, me()).unwrap(), auto);
+        assert_eq!(prepare(&root, me()).unwrap(), (auto.clone(), gid));
         assert!(auto.join("file").exists());
     }
 

@@ -454,8 +454,11 @@ final class TunnelController: ObservableObject {
                                                                       directory: staging.path, uid: getuid(), gid: getgid()))
             guard isConnected, !isQuitting else { return }
             status = response.status
-        } catch {
+        } catch TunnelIPCError.provider(let message) {
             await fileHandoff.forget(staging)
+            self.error = message
+        } catch {
+            // A lost reply can leave a receive running with this destination.
             self.error = error.localizedDescription
         }
     }
