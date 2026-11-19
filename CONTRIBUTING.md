@@ -25,6 +25,17 @@ cargo -q clippy --all-targets   # must be warning-clean
 CI runs `cargo check`, `cargo clippy -D warnings`, and `cargo test` on every PR.
 Please make sure all three pass locally before opening one.
 
+Repository maintainers can enable alternate GitHub Actions runners:
+
+- Set `BOAT_CI_ENABLED=true` after linking the repository in [Boat CI](https://docs.boat.dev/ci)
+  and enabling public-repository jobs for the maintainers who trigger CI.
+  Boat runs the Linux checks, Docker integration tests, and Android CI.
+- Set `WARPBUILD_MACOS_ENABLED=true` after enabling [WarpBuild for the public repository](https://www.warpbuild.com/docs/ci/public-repos).
+  WarpBuild runs macOS CI and the Apple Silicon app build. The Intel app build
+  uses GitHub's native Intel runner.
+- Fork PRs use GitHub runners. Remove either repository variable to roll its
+  jobs back to GitHub.
+
 ## Running the daemon locally
 
 The always-root daemon does the privileged work; the CLI is unprivileged and

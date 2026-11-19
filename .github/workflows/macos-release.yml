@@ -46,9 +46,10 @@ jobs:
         include:
           - runner: macos-26
             arch: arm64
+          # The Intel app build requires a native runner. WarpBuild is ARM64.
           - runner: macos-26-intel
             arch: x86_64
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.arch == 'arm64' && vars.WARPBUILD_MACOS_ENABLED == 'true' && 'warp-macos-26-arm64-6x' || matrix.runner }}
     timeout-minutes: 120
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
