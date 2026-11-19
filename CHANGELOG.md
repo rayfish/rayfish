@@ -6,18 +6,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- macOS: validate network and Mac names while typing, explain invalid names
-  beside each field, and keep create/join errors visible until editing or retrying.
-- macOS: show network errors without internal Swift type names and escaping.
-- Linux exit nodes detect uplinks that use policy routing or split default routes
-  and reject unreachable defaults.
-- Exit-node status lists IPv4 and IPv6 capabilities, marks unsupported families
-  as blocked, and says when traffic still goes out directly.
-- Daemon shutdown releases its startup lock even when a subprocess inherits the
-  lock descriptor, allowing an immediate restart.
-
 ## [0.5.17] - 2026-11-19
 
 ### Added
