@@ -1,5 +1,7 @@
 //! Swift bindings for the Rayfish core running in an Apple packet tunnel.
 
+#[cfg(unix)]
+mod handoff;
 #[cfg(target_os = "macos")]
 mod logging;
 mod migration;
@@ -359,6 +361,11 @@ impl Node {
         let _ = owner_uid;
         if slot.is_some() {
             return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        match handoff::prepare(Path::new(handoff::INCOMING), owner_uid) {
+            Ok((dir, gid)) => config::set_download_dir_override(dir, (owner_uid, gid)),
+            Err(error) => tracing::warn!(%error, "cannot prepare the incoming files directory"),
         }
         let state = self
             .runtime
@@ -839,6 +846,14 @@ impl Node {
         gid: u32,
     ) -> Result<(), AppleError> {
         let state = self.state()?;
+        // The app names a directory under the handoff directory, which it may
+        // have removed since the tunnel started.
+        #[cfg(target_os = "macos")]
+        {
+            let (dir, gid) =
+                handoff::prepare(Path::new(handoff::INCOMING), uid).map_err(AppleError::network)?;
+            config::set_download_dir_override(dir, (uid, gid));
+        }
         // The destination is checked before this returns, so a folder the
         // file cannot be saved in fails here rather than after the download.
         self.runtime

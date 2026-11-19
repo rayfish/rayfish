@@ -37,6 +37,8 @@
 
 use super::*;
 
+use std::path::Path;
+
 use futures::Stream;
 use iroh::endpoint::{ReadError, WriteError};
 use iroh_blobs::api::proto::Bitfield;
@@ -170,12 +172,26 @@ impl FileService {
         recipient: Recipient,
         policy: ResumePolicy,
     ) -> OpResult<oneshot::Receiver<OpResult<Done>>> {
-        let filename = {
+        let (filename, output) = {
             let pending = self.pending_files.lock().unwrap();
             let Some(file) = pending.iter().find(|file| file.id == id) else {
                 return op_err(format!("no pending file with id {id}"));
             };
-            file.filename.clone()
+            let output = match (output, config::download_dir_override()) {
+                (Some(output), Some((auto, _))) if Path::new(&output).parent() == auto.parent() => {
+                    let temp = dest_name::TempName::for_offer(&file.from, file.offer_id);
+                    // The app can distinguish the temporary entry from any
+                    // finished file, and each offer has its own receipt path.
+                    Some(
+                        Path::new(&output)
+                            .join(temp.as_str())
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+                (output, _) => output,
+            };
+            (file.filename.clone(), output)
         };
         let dir = receive_dir(output.as_deref());
         let checked = recipient.clone();
