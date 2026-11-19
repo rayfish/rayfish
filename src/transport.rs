@@ -11,8 +11,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use anyhow::{Context, Result};
 #[cfg(test)]
 use iroh::address_lookup::memory::MemoryLookup;
+use iroh::dns::DnsResolver;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use iroh::dns::{DnsResolver, NameserverConfig};
+use iroh::dns::NameserverConfig;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
@@ -35,6 +36,7 @@ use std::sync::Arc;
 mod dns;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod dns_socket;
+mod encrypted_first;
 
 /// ALPN for the file-transfer protocol. Version 3 adds offer identities,
 /// receipt replies, and acknowledged decline notifications. Bump on a breaking
@@ -184,8 +186,8 @@ const MAX_CONTROL_PLANE_NAMESERVERS: usize = 4;
 /// there to bring up. `None` means the platform keeps its resolvers somewhere we
 /// cannot read (Android, Windows), which is a different thing from a host that
 /// has none: with nothing configured either, the answer is an empty list and the
-/// caller leaves iroh's own reader in place. Naming a public server there would
-/// step over Android's Private DNS and downgrade those lookups to cleartext.
+/// platform's own reader stays behind encrypted DNS. Naming a plain public
+/// server there would step over Android's Private DNS with cleartext.
 fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<IpAddr>>) -> Vec<IpAddr> {
     if system.is_none() && o.servers.is_empty() {
         return Vec::new();
@@ -215,6 +217,69 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<IpAddr>>) ->
     }
     out
 }
+
+/// The resolver for the endpoint's own names (the relay, the pkarr server).
+///
+/// Encrypted public DNS comes first and `nameservers` only when it fails; see
+/// [`encrypted_first`] for why plain DNS cannot go first or race it. With
+/// `replace`, the operator's servers are the only ones asked.
+///
+/// On Linux and macOS both tiers send from sockets kept off the exit tunnel,
+/// and name explicit servers instead of iroh's default, which reads resolv.conf
+/// at bind and keeps it for the endpoint's life: a resolv.conf that already
+/// points at our magic IP (a restart before the revert, a crash) would make
+/// the control plane wait on the data plane it exists to bring up. Elsewhere an
+/// empty list leaves the platform's own resolver behind encrypted DNS (Android
+/// reads it over JNI).
+fn control_plane_resolver(nameservers: &[IpAddr], dns_replace: bool) -> Result<DnsResolver> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if dns_replace {
+            return dns::plain(nameservers);
+        }
+        let fallback = if nameservers.is_empty() {
+            DnsResolver::new()
+        } else {
+            dns::plain(nameservers)?
+        };
+        Ok(encrypted_first::resolver(dns::encrypted()?, fallback))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let plain = DnsResolver::builder()
+            .add_nameserver_configs(nameservers.iter().copied().map(NameserverConfig::udp));
+        if dns_replace {
+            // Honour an explicit replacement even when every entry was an
+            // overlay address. DNS failure must not select a public resolver.
+            return Ok(plain.disable_fallback().build());
+        }
+        let fallback = if nameservers.is_empty() {
+            DnsResolver::new()
+        } else {
+            plain.build()
+        };
+        let encrypted = PUBLIC_ENCRYPTED_DNS
+            .into_iter()
+            .flat_map(|ip| [NameserverConfig::tls(ip), NameserverConfig::https(ip)]);
+        let encrypted = DnsResolver::builder()
+            .add_nameserver_configs(encrypted)
+            .disable_fallback()
+            .build();
+        Ok(encrypted_first::resolver(encrypted, fallback))
+    }
+}
+
+/// Public resolvers for encrypted DNS where hickory's server groups are not
+/// used. Their certificates name these addresses.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const PUBLIC_ENCRYPTED_DNS: [IpAddr; 6] = [
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+    IpAddr::V6(Ipv6Addr::new(0x2620, 0xfe, 0, 0, 0, 0, 0, 0xfe)),
+];
 
 /// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).
 /// When `tor` is true and the `tor` feature is enabled, adds the Tor custom transport
@@ -351,35 +416,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         // so multi-homing / roaming is unaffected.
         .direct_addr_filter(OverlayAddrFilter);
 
-    // Resolve our own names (the relay, the pkarr server) against an explicit
-    // list instead of iroh's default, which reads the host's resolv.conf at bind
-    // and keeps it for the endpoint's life. Two things follow from that default:
-    // a host whose nameserver stopped answering takes the daemon's control plane
-    // with it, and a resolv.conf that already points at our magic IP (a restart
-    // before the revert, a crash) makes the control plane wait on the data plane
-    // it exists to bring up. Not setting `with_system_defaults` is deliberate:
-    // the resolver never reads the file, so neither can come back.
-    //
-    // An explicit replacement stays authoritative even when filtering removes
-    // every server. Otherwise the platform owns an empty resolver list.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if !nameservers.is_empty() || dns_replace {
-        builder = builder.dns_resolver(dns::resolver(nameservers, !dns_replace)?);
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    // Without an override, empty means the platform owns resolver selection
-    // (Android reads it over JNI and honours Private DNS). An explicit replace
-    // still applies when filtering leaves no usable servers.
-    if !nameservers.is_empty() || dns_replace {
-        let mut resolver = DnsResolver::builder()
-            .add_nameserver_configs(nameservers.iter().copied().map(NameserverConfig::udp));
-        if dns_replace {
-            // Honour an explicit replacement even when every entry was an
-            // overlay address. DNS failure must not select a public resolver.
-            resolver = resolver.disable_fallback();
-        }
-        builder = builder.dns_resolver(resolver.build());
-    }
+    builder = builder.dns_resolver(control_plane_resolver(nameservers, dns_replace)?);
 
     // Loop prevention for the exit-node client full-tunnel: keep iroh's own sockets
     // (the underlay UDP sockets and the relay connection) off the default route that

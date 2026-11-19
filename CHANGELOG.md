@@ -15,6 +15,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- On Wi-Fi networks that rewrite DNS answers, such as some hotel or venue
+  filters, devices now join the mesh. Rayfish looks up its relays over
+  encrypted DNS first and uses the network's DNS only if that fails.
+
 - SSH: preserve command exit statuses before closing channels, avoiding
   intermittent failures in reused connections and pipelined commands.
 
