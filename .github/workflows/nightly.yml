@@ -87,7 +87,11 @@ jobs:
             runner: macos-latest
             name: ray-macos-x86_64
 
-    runs-on: ${{ matrix.runner }}
+    # Keep the Ubuntu 22.04 glibc floor for Linux GNU binaries.
+    runs-on: >-
+      ${{ (vars.BOAT_BUILDS_ENABLED == 'true' && matrix.target == 'x86_64-unknown-linux-musl' && 'boat-large')
+        || (vars.WARPBUILD_MACOS_ENABLED == 'true' && endsWith(matrix.target, '-apple-darwin') && 'warp-macos-26-arm64-6x')
+        || matrix.runner }}
 
     steps:
       - uses: actions/checkout@v7

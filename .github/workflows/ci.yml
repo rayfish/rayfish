@@ -28,9 +28,8 @@ jobs:
       release_tag: ''
     secrets: inherit
 
-  # Fork PRs use GitHub runners. Boat restricts who can run public-repo jobs.
   check:
-    runs-on: ${{ vars.BOAT_CI_ENABLED == 'true' && !github.event.pull_request.head.repo.fork && 'boat-large' || 'ubuntu-22.04' }}
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
 
@@ -78,7 +77,7 @@ jobs:
         run: E2E_BACKEND=docker tests/e2e.sh rootless
 
   docker-e2e:
-    runs-on: ${{ vars.BOAT_CI_ENABLED == 'true' && !github.event.pull_request.head.repo.fork && 'boat-large' || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     env:
       E2E_BACKEND: docker
       E2E_AUTO_TEARDOWN: "1"
@@ -180,7 +179,7 @@ jobs:
   # build compiles: the TUN/route/DNS backends are per-OS `cfg` branches, and
   # macOS was only ever built on release, where a break costs a failed tag.
   macos:
-    runs-on: ${{ vars.WARPBUILD_MACOS_ENABLED == 'true' && !github.event.pull_request.head.repo.fork && 'warp-macos-26-arm64-6x' || 'macos-latest' }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -244,7 +243,7 @@ jobs:
   # neither is compiled by the job above, so a PR could go green and break the
   # tag build. Compile the native target and test the app without producing an APK.
   android:
-    runs-on: ${{ vars.BOAT_CI_ENABLED == 'true' && !github.event.pull_request.head.repo.fork && 'boat-large' || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 

@@ -116,7 +116,11 @@ jobs:
             runner: macos-latest
             name: ray-macos-x86_64
 
-    runs-on: ${{ matrix.runner }}
+    # Keep the Ubuntu 22.04 glibc floor for Linux GNU binaries.
+    runs-on: >-
+      ${{ (vars.BOAT_BUILDS_ENABLED == 'true' && matrix.target == 'x86_64-unknown-linux-musl' && 'boat-large')
+        || (vars.WARPBUILD_MACOS_ENABLED == 'true' && endsWith(matrix.target, '-apple-darwin') && 'warp-macos-26-arm64-6x')
+        || matrix.runner }}
 
     steps:
       - uses: actions/checkout@v7
@@ -328,7 +332,7 @@ jobs:
     # against glibc 2.39 and won't load on 22.04 (glibc 2.35). Safe here because
     # this job's output is Android-target (bionic .so + APK), so the host glibc
     # never becomes an end-user floor the way it does for the desktop binaries.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.BOAT_BUILDS_ENABLED == 'true' && 'boat-large' || 'ubuntu-24.04' }}
     permissions:
       contents: write
     steps:
@@ -355,7 +359,7 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           # The default also requests the retired `tools` package.
           packages: platform-tools
@@ -377,7 +381,7 @@ jobs:
 
       - name: Install NDK
         run: |
-          sdkmanager "ndk;27.2.12479018" "build-tools;35.0.0"
+          sdkmanager "platforms;android-36" "ndk;27.2.12479018" "build-tools;35.0.0"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       # Gradle's cargoNdkBuild task only rebuilds the .so; the Kotlin bindings
