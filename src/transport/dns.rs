@@ -11,9 +11,11 @@ use hickory_resolver::config::{CLOUDFLARE, GOOGLE, NameServerConfig, QUAD9, Reso
 use hickory_resolver::net::runtime::{
     RuntimeProvider, TokioRuntimeProvider, iocompat::AsyncIoTokioAsStd,
 };
+use hickory_resolver::net::{DnsError as HickoryDnsError, NetError};
+use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::RData;
 use iroh::dns::{BoxIter, DnsError, DnsResolver, Resolver, TxtRecordData};
-use n0_error::StdResultExt;
+use n0_error::AnyError;
 use socket2::{Domain, SockRef};
 use tokio::net::{TcpSocket, UdpSocket};
 use tokio::time::timeout;
@@ -94,7 +96,9 @@ impl Resolver for UnderlayResolver {
     fn lookup_ipv4(&self, host: String) -> BoxFuture<'static, Result<BoxIter<Ipv4Addr>, DnsError>> {
         let resolver = self.resolver.clone();
         Box::pin(async move {
-            let lookup = resolver.ipv4_lookup(host).await.anyerr()?;
+            let Some(lookup) = answered(resolver.ipv4_lookup(host).await)? else {
+                return Ok(Box::new(std::iter::empty()) as BoxIter<_>);
+            };
             let addresses: Vec<_> = lookup
                 .answers()
                 .iter()
@@ -109,7 +113,9 @@ impl Resolver for UnderlayResolver {
     fn lookup_ipv6(&self, host: String) -> BoxFuture<'static, Result<BoxIter<Ipv6Addr>, DnsError>> {
         let resolver = self.resolver.clone();
         Box::pin(async move {
-            let lookup = resolver.ipv6_lookup(host).await.anyerr()?;
+            let Some(lookup) = answered(resolver.ipv6_lookup(host).await)? else {
+                return Ok(Box::new(std::iter::empty()) as BoxIter<_>);
+            };
             let addresses: Vec<_> = lookup
                 .answers()
                 .iter()
@@ -127,7 +133,9 @@ impl Resolver for UnderlayResolver {
     ) -> BoxFuture<'static, Result<BoxIter<TxtRecordData>, DnsError>> {
         let resolver = self.resolver.clone();
         Box::pin(async move {
-            let lookup = resolver.txt_lookup(host).await.anyerr()?;
+            let Some(lookup) = answered(resolver.txt_lookup(host).await)? else {
+                return Ok(Box::new(std::iter::empty()) as BoxIter<_>);
+            };
             let records: Vec<_> = lookup
                 .answers()
                 .iter()
@@ -157,13 +165,31 @@ impl Resolver for UnderlayResolver {
     }
 }
 
+/// iroh's own resolver answers NODATA with no records and NXDOMAIN with
+/// [`DnsError::NxDomain`], so a caller can tell an answer from a failure.
+/// Hickory reports both as errors; this sorts them the same way.
+fn answered<L>(result: Result<L, NetError>) -> Result<Option<L>, DnsError> {
+    match result {
+        Ok(lookup) => Ok(Some(lookup)),
+        Err(NetError::Dns(HickoryDnsError::NoRecordsFound(records)))
+            if records.response_code == ResponseCode::NXDomain =>
+        {
+            Err(n0_error::e!(DnsError::NxDomain))
+        }
+        Err(NetError::Dns(HickoryDnsError::NoRecordsFound(_))) => Ok(None),
+        Err(error) => Err(AnyError::from_std(error).into()),
+    }
+}
+
 /// Plain DNS to exactly `nameservers`, with no public fallback behind them.
 pub(super) fn plain(nameservers: &[IpAddr]) -> anyhow::Result<DnsResolver> {
     let mut config = ResolverConfig::default();
     for ip in nameservers {
         config.add_name_server(NameServerConfig::udp_and_tcp(*ip));
     }
-    build(config, None)
+    // Ask every server at once, so silent ones cannot hold the lookup past
+    // its deadline before a working one is tried.
+    build(config, nameservers.len().max(1))
 }
 
 /// DNS over HTTPS to Cloudflare, Google and Quad9. Their certificates name
@@ -177,16 +203,14 @@ pub(super) fn encrypted() -> anyhow::Result<DnsResolver> {
     }
     // Race a few servers, so a network that drops one provider's traffic does
     // not hold the lookup until the timeout.
-    build(config, Some(4))
+    build(config, 4)
 }
 
-fn build(config: ResolverConfig, concurrent: Option<usize>) -> anyhow::Result<DnsResolver> {
+fn build(config: ResolverConfig, concurrent: usize) -> anyhow::Result<DnsResolver> {
     let mut builder =
         HickoryResolver::builder_with_config(config.clone(), UnderlayRuntime::default());
     builder.options_mut().negative_max_ttl = Some(Duration::ZERO);
-    if let Some(concurrent) = concurrent {
-        builder.options_mut().num_concurrent_reqs = concurrent;
-    }
+    builder.options_mut().num_concurrent_reqs = concurrent;
     let resolver = builder.build()?;
     Ok(DnsResolver::custom(UnderlayResolver { resolver, config }))
 }
@@ -229,6 +253,7 @@ mod tests {
         let underlay = super::super::encrypted_first::resolver(
             encrypted().expect("encrypted resolver builds"),
             plain(&primary).expect("plain resolver builds"),
+            Vec::new(),
         );
         assert!(
             underlay

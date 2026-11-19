@@ -221,8 +221,10 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<IpAddr>>) ->
 /// The resolver for the endpoint's own names (the relay, the pkarr server).
 ///
 /// Encrypted public DNS comes first and `nameservers` only when it fails; see
-/// [`encrypted_first`] for why plain DNS cannot go first or race it. With
-/// `replace`, the operator's servers are the only ones asked.
+/// [`encrypted_first`] for why plain DNS cannot go first or race it. Names
+/// under `local_names`, the configured relay and discovery hosts, ask
+/// `nameservers` first. With `replace`, the operator's servers are the only
+/// ones asked.
 ///
 /// On Linux and macOS both tiers send from sockets kept off the exit tunnel,
 /// and name explicit servers instead of iroh's default, which reads resolv.conf
@@ -231,7 +233,11 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<IpAddr>>) ->
 /// the control plane wait on the data plane it exists to bring up. Elsewhere an
 /// empty list leaves the platform's own resolver behind encrypted DNS (Android
 /// reads it over JNI).
-fn control_plane_resolver(nameservers: &[IpAddr], dns_replace: bool) -> Result<DnsResolver> {
+fn control_plane_resolver(
+    nameservers: &[IpAddr],
+    dns_replace: bool,
+    local_names: Vec<String>,
+) -> Result<DnsResolver> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if dns_replace {
@@ -242,7 +248,11 @@ fn control_plane_resolver(nameservers: &[IpAddr], dns_replace: bool) -> Result<D
         } else {
             dns::plain(nameservers)?
         };
-        Ok(encrypted_first::resolver(dns::encrypted()?, fallback))
+        Ok(encrypted_first::resolver(
+            dns::encrypted()?,
+            fallback,
+            local_names,
+        ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -258,15 +268,33 @@ fn control_plane_resolver(nameservers: &[IpAddr], dns_replace: bool) -> Result<D
         } else {
             plain.build()
         };
+        // HTTPS before TLS: the resolver starts the first few servers in this
+        // order, and a network that drops port 853 must not hold every slot.
         let encrypted = PUBLIC_ENCRYPTED_DNS
             .into_iter()
-            .flat_map(|ip| [NameserverConfig::tls(ip), NameserverConfig::https(ip)]);
+            .map(NameserverConfig::https)
+            .chain(PUBLIC_ENCRYPTED_DNS.into_iter().map(NameserverConfig::tls));
         let encrypted = DnsResolver::builder()
             .add_nameserver_configs(encrypted)
             .disable_fallback()
             .build();
-        Ok(encrypted_first::resolver(encrypted, fallback))
+        Ok(encrypted_first::resolver(encrypted, fallback, local_names))
     }
+}
+
+/// The DNS names of the relay and discovery servers the operator configured.
+/// The `rayfish` presets are public names, so they stay encrypted-first.
+fn configured_hosts(relay: &ServerOverride, discovery: &ServerOverride) -> Vec<String> {
+    relay
+        .servers
+        .iter()
+        .chain(&discovery.servers)
+        .filter(|entry| entry.as_str() != "rayfish")
+        .filter_map(|entry| match url::Url::parse(entry).ok()?.host()? {
+            url::Host::Domain(name) => Some(name.to_owned()),
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+        })
+        .collect()
 }
 
 /// Public resolvers for encrypted DNS where hickory's server groups are not
@@ -416,7 +444,11 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         // so multi-homing / roaming is unaffected.
         .direct_addr_filter(OverlayAddrFilter);
 
-    builder = builder.dns_resolver(control_plane_resolver(nameservers, dns_replace)?);
+    builder = builder.dns_resolver(control_plane_resolver(
+        nameservers,
+        dns_replace,
+        configured_hosts(relay, discovery),
+    )?);
 
     // Loop prevention for the exit-node client full-tunnel: keep iroh's own sockets
     // (the underlay UDP sockets and the relay connection) off the default route that
@@ -831,6 +863,29 @@ mod tests {
     /// daemon never asks our own resolver for the names it needs to reach the
     /// network. Anything else and a restart that finds our own resolv.conf still
     /// in place waits on the data plane it is trying to bring up.
+    #[test]
+    fn configured_hosts_are_custom_domain_names() {
+        let relay = ServerOverride {
+            servers: vec![
+                "rayfish".into(),
+                "https://relay.home.example".into(),
+                "http://192.0.2.7:3340".into(),
+            ],
+            replace: false,
+        };
+        let discovery = ServerOverride {
+            servers: vec![
+                "http://[2001:db8::1]:8080".into(),
+                "https://dns.home.example/pkarr".into(),
+            ],
+            replace: true,
+        };
+        assert_eq!(
+            configured_hosts(&relay, &discovery),
+            ["relay.home.example", "dns.home.example"]
+        );
+    }
+
     #[test]
     fn control_plane_never_points_at_an_overlay_resolver() {
         let overlays: Vec<IpAddr> = [
