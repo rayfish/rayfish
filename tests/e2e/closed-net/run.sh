@@ -113,7 +113,8 @@ step "4. co-coordinator grant — srv-a promotes srv-b (admin add / list)"
 B_ID="$(peer_endpoint "$A" srv-b "$NET")"
 echo "   srv-b id (as seen by srv-a): ${B_ID:0:16}…"
 [[ -n "$B_ID" ]] || { fail "could not resolve srv-b's id"; summary; }
-on "$A" "ray admin $NET add $B_ID" 2>&1 | strip | sed 's/^/   a| /'
+on "$A" "ray admin $NET add $B_ID" 2>&1 | strip | sed 's/^/   a| /' \
+  || { fail "admin grant failed"; summary; }
 # admin list should now show two key-holders (the local node + srv-b).
 if retry_until 30 "[[ \"\$(on '$A' 'ray admin $NET list --json' | jq -r 'length')\" -ge 2 ]]"; then
   pass "srv-a's 'admin list' shows two key-holders"

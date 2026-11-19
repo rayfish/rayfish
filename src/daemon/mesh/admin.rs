@@ -3,6 +3,8 @@
 
 use super::super::*;
 
+const ADMIN_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(35);
+
 impl NetworkRegistry {
     /// Coordinator-only: grant the per-network secret key to a member over an
     /// authenticated mesh stream, making it a co-coordinator (can publish /
@@ -89,8 +91,29 @@ impl NetworkRegistry {
                 ));
             }
         }
+        let mut publications = self.records_published.subscribe();
         if !self.store_and_publish_group(network).await {
             return unsaved_snapshot_error(network).into();
+        }
+        // A caller can stop this coordinator as soon as the handoff succeeds.
+        // Confirm publication first so a restart uses the live signed roster
+        // instead of restoring this grant as an unpublished local snapshot.
+        let publication = tokio::time::timeout(ADMIN_PUBLICATION_TIMEOUT, async {
+            loop {
+                let net = config::load_network(network)?.context("network was deleted")?;
+                if net.last_group_hash_published {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                publications.changed().await?;
+            }
+        })
+        .await
+        .context("timed out waiting for the signed network record")
+        .and_then(|result| result);
+        if let Err(error) = publication {
+            return ipc_err(format!(
+                "peer saved the network key, but confirming publication of the grant failed: {error:#}"
+            ));
         }
         IpcMessage::Ok {
             message: format!("granted network key to {}", identity.fmt_short()),
@@ -267,6 +290,89 @@ mod tests {
         assert!(matches!(reply, IpcMessage::Error { .. }), "{reply:?}");
         let net = config::load_network("home").unwrap().unwrap();
         assert!(net.admins.contains(&grantee));
+        daemon.shutdown_and_close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn admin_grant_waits_for_the_signed_roster_to_publish() {
+        use crate::daemon::mesh::destruction::tests::{ConfigDir, Relay, create};
+
+        let _lock = config::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ConfigDir::set(dir.path());
+        let relay = Relay::start().await;
+        relay.configure();
+        let daemon = build_headless(false).await.unwrap();
+        create(&daemon, "home").await;
+        let grantee = SecretKey::generate().public();
+        daemon
+            .registry
+            .networks
+            .get("home")
+            .unwrap()
+            .state
+            .write()
+            .unwrap()
+            .group
+            .members
+            .add(crate::membership::Member {
+                identity: grantee,
+                is_coordinator: false,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                last_seen: None,
+                exit_node: false,
+                exit_families: crate::membership::ExitFamilies::Neither,
+            });
+
+        relay.fail.store(true, Ordering::Relaxed);
+        let grant = daemon.registry.record_admin_grant("home", grantee);
+        tokio::pin!(grant);
+        let pending = async {
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                poll.tick().await;
+                if !config::load_network("home")
+                    .unwrap()
+                    .unwrap()
+                    .last_group_hash_published
+                {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            reply = &mut grant => panic!("grant returned before publication: {reply:?}"),
+            observed = tokio::time::timeout(Duration::from_secs(5), pending) => observed.unwrap(),
+        }
+
+        relay.fail.store(false, Ordering::Relaxed);
+        let reply = tokio::time::timeout(Duration::from_secs(10), grant)
+            .await
+            .unwrap();
+        assert!(matches!(reply, IpcMessage::Ok { .. }), "{reply:?}");
+        let net = config::load_network("home").unwrap().unwrap();
+        assert!(net.last_group_hash_published);
+
+        relay.fail.store(true, Ordering::Relaxed);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            daemon.registry.record_admin_grant("home", grantee),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(reply, IpcMessage::Ok { .. }), "{reply:?}");
+        assert!(
+            config::load_network("home")
+                .unwrap()
+                .unwrap()
+                .last_group_hash_published
+        );
         daemon.shutdown_and_close().await;
     }
 

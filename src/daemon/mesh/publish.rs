@@ -506,8 +506,9 @@ fn write_group_hash_pointer(
 ) -> bool {
     let floor = state.read().unwrap().last_record_timestamp;
     match config::update_network(network, |net| {
+        let already_published = net.last_group_hash == Some(hash) && net.last_group_hash_published;
         net.last_group_hash = Some(hash);
-        net.last_group_hash_published = published;
+        net.last_group_hash_published = already_published || published;
         raise_saved_record_floor(net, floor);
         Ok(())
     }) {
