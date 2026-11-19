@@ -28,30 +28,25 @@ jobs:
       sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          # Full history + tags so git-cliff can list commits since last stable.
-          fetch-depth: 0
 
-      - name: Move the nightly tag to this commit
+      - name: Prepare nightly release notes
         id: meta
         run: |
           SHA=$(git rev-parse --short=8 HEAD)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          python3 scripts/changelog.py pending > "$RUNNER_TEMP/pending-notes.md"
+          printf 'Rolling nightly built from master @ %s. Install with `ray update --nightly`.\n' "$SHA" > "$RUNNER_TEMP/nightly-notes.md"
+          if [[ -s "$RUNNER_TEMP/pending-notes.md" ]]; then
+            printf '\n## Pending release notes\n\n' >> "$RUNNER_TEMP/nightly-notes.md"
+            cat "$RUNNER_TEMP/pending-notes.md" >> "$RUNNER_TEMP/nightly-notes.md"
+          fi
+
+      - name: Move the nightly tag to this commit
+        run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git tag -f nightly
           git push -f origin nightly
-
-      # Changes landed since the last stable vX.Y.Z (the `nightly` tag is not a
-      # release boundary per cliff.toml's tag_pattern).
-      - name: Generate changes-since-stable
-        id: notes
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --unreleased --strip all
-        env:
-          OUTPUT: CHANGELOG.md
 
       - name: Create / refresh the nightly pre-release
         uses: softprops/action-gh-release@v2
@@ -60,11 +55,7 @@ jobs:
         with:
           tag_name: nightly
           name: nightly (${{ steps.meta.outputs.sha }})
-          body: |
-            Rolling nightly built from master @ ${{ steps.meta.outputs.sha }}. Install with `ray update --nightly`.
-
-            ## Changes since the last stable release
-            ${{ steps.notes.outputs.content }}
+          body_path: ${{ runner.temp }}/nightly-notes.md
           prerelease: true
 
   build:

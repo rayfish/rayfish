@@ -27,47 +27,54 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Full history + tags so git-cliff can diff against the previous tag.
+          # Manual releases need to check whether the version tag already exists.
           fetch-depth: 0
 
       - name: Extract version
         id: extract_version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          elif [ "${{ github.event_name }}" = "push" ]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
           else
             VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
             TAG="v${VERSION}"
           fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Expected a version tag such as v1.2.3"
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release notes
+        env:
+          TAG: ${{ steps.extract_version.outputs.tag }}
+        run: |
+          if [[ "$TAG" == *-* ]]; then
+            python3 scripts/changelog.py pending --require-entries > "$RUNNER_TEMP/release-notes.md"
+          else
+            python3 scripts/changelog.py notes "${TAG#v}" > "$RUNNER_TEMP/release-notes.md"
+          fi
 
       - name: Create Git tag
         if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.extract_version.outputs.tag }}
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git tag -a "${{ steps.extract_version.outputs.tag }}" -m "Release ${{ steps.extract_version.outputs.tag }}" 2>/dev/null || true
-          git push origin "${{ steps.extract_version.outputs.tag }}" 2>/dev/null || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Grouped changelog for this tag (since the previous vX.Y.Z) + a compare
-      # link, rendered from the conventional commit messages by cliff.toml.
-      - name: Generate release notes
-        id: notes
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          # --latest (not --current): pick the newest tag matching cliff.toml's
-          # tag_pattern from the full timeline, instead of relying on "the tag at
-          # HEAD". On a tag-push the runner checks out a detached HEAD and the
-          # rolling `nightly` tag also sits on the commit, which breaks
-          # --current's HEAD-tag detection ("No tag exists for the current commit").
-          args: --latest --strip all
-        env:
-          OUTPUT: CHANGELOG.md
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            if [[ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$(git rev-parse HEAD)" ]]; then
+              echo "::error::Run this workflow from the commit tagged $TAG"
+              exit 1
+            fi
+          else
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "refs/tags/$TAG"
+          fi
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -76,7 +83,7 @@ jobs:
         with:
           tag_name: ${{ steps.extract_version.outputs.tag }}
           name: ${{ steps.extract_version.outputs.tag }}
-          body: ${{ steps.notes.outputs.content }}
+          body_path: ${{ runner.temp }}/release-notes.md
           draft: false
           prerelease: ${{ contains(steps.extract_version.outputs.tag, '-') }}
 

@@ -77,7 +77,15 @@ just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 
 ## Git
 
-- Conventional commit subjects (`feat`/`fix`/`docs`/...) so git-cliff can generate the changelog.
-- Any user-visible change gets an `[Unreleased]` CHANGELOG entry (`Added`/`Changed`/`Fixed`/`Security`/`Performance`, in that order), written from the user's view. Skip internal churn.
+- Use conventional commit subjects (`feat`/`fix`/`docs`/...).
+- For each user-visible change, add a new `changelogs/unreleased/<issue-or-branch>.md`
+  with `### Added`, `### Changed`, `### Fixed`, `### Security`, or `### Performance`
+  sections and Markdown bullets. Give each fragment a unique name. Write from
+  the user's view and skip internal changes. Validate with
+  `python3 scripts/changelog.py check` and preview with
+  `python3 scripts/changelog.py pending`.
+- Before tagging a stable release, run `python3 scripts/changelog.py freeze VERSION`
+  with the version without its `v` prefix. Commit the updated `CHANGELOG.md` and
+  fragment deletions so the tag includes the release notes.
 - Keep `docs/` untracked. It holds local plans and specifications.
 - Deploy the apps (Android, macOS, iOS) only for a patch or minor release, cut with a `v*` tag. No app builds in nightlies, and no uploads to TestFlight, the App Store, the Play Store, or a GitHub release from master pushes or PRs. The `nightly` pre-release carries only the `ray` CLI and daemon binaries, for `ray update --nightly`.

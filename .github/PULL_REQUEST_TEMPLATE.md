@@ -1,6 +1,5 @@
 <!--
-Keep the title as a conventional commit subject (feat/fix/docs/style/ci/chore/...),
-since release notes are generated from commit subjects by git-cliff.
+Keep the title as a conventional commit subject (feat/fix/docs/style/ci/chore/...).
 Example: fix(ssh): reuse the host's OpenSSH ed25519 key for mesh SSH
 -->
 
@@ -27,5 +26,5 @@ cargo -q clippy
 - [ ] Title is a conventional commit subject (`feat`/`fix`/`docs`/`style`/`ci`/...).
 - [ ] `cargo -q build`, `cargo -q test`, and `cargo -q clippy` pass.
 - [ ] Docs updated (`README.md` / `AGENTS.md`) if behavior changed.
-- [ ] `CHANGELOG.md` updated under `## [Unreleased]` if the change is user-visible.
+- [ ] Added a new file under `changelogs/unreleased/` if the change is user-visible.
 - [ ] Bumped the relevant ALPN version if a wire protocol changed incompatibly.

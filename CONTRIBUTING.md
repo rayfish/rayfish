@@ -66,14 +66,25 @@ Read the relevant module docs for design details. A few rules:
 - Use `tracing` for logging (spans on network lifecycle handlers and per-peer
   tasks). The daemon is fail-fast: panics are logged and the process aborts so
   the service manager restarts it.
-- Update the docs (`AGENTS.md`, `README.md`, `CHANGELOG.md`) when you finish a
+- Update the docs (`AGENTS.md`, `README.md`) when you finish a
   feature or a significant change.
 
 ## Pull requests
 
 - Keep changes focused and accompanied by tests where practical.
-- Note user-facing changes under `## [Unreleased]` in `CHANGELOG.md`.
+- Add a new file under `changelogs/unreleased/` for each user-facing change.
+  Use the issue or branch name, such as `123-file-resume.md`. Add Markdown
+  bullets under `### Added`, `### Changed`, `### Fixed`, `### Security`, or
+  `### Performance`. Run `python3 scripts/changelog.py check`.
 - Make sure the working tree is clean and `cargo clippy` / `cargo test` pass.
+
+## Release notes
+
+Preview pending notes with `python3 scripts/changelog.py pending`. Before
+tagging a stable release, run `python3 scripts/changelog.py freeze VERSION`
+with the new version (without the `v` prefix). Commit `CHANGELOG.md` and the
+fragment deletions so the tag includes the version's notes. Nightlies and
+prereleases render the pending files without consuming them.
 
 ## Security issues
 

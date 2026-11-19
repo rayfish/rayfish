@@ -173,9 +173,7 @@ pub struct GhRelease {
     /// used to annotate `ray update --list`.
     #[serde(default)]
     pub prerelease: bool,
-    /// The release notes (git-cliff renders these from conventional commits in
-    /// `release.yml`). Printed by `ray update` so the user sees what each pending
-    /// version changes; `None`/empty for releases without notes.
+    /// Release notes displayed by `ray update` for each pending version.
     #[serde(default)]
     pub body: Option<String>,
 }
