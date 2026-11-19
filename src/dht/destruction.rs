@@ -2,7 +2,6 @@
 //! used by roster publishers, so a stale live publication cannot erase deletion.
 
 use super::*;
-use iroh::address_lookup::pkarr::PkarrError;
 
 const DESTROYED: &str = "destroyed";
 const KEY_CONTEXT: &str = "rayfish network destruction discovery v1";
@@ -79,34 +78,23 @@ pub(crate) fn decode_index(packet: &SignedPacket, network: EndpointId) -> Result
 /// A missing discovery record is normal for a live network. Any record returned
 /// must carry a valid proof signed by the original network key.
 pub(crate) async fn resolve(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     discovery: EndpointId,
     network: EndpointId,
 ) -> Result<Option<SignedPacket>> {
-    match tokio::time::timeout(RESOLVE_TIMEOUT, client.resolve(discovery))
+    client
+        .resolve(discovery)
         .await
-        .context("timed out checking network destruction")?
-    {
-        Ok(packet) => Ok(Some(decode_index(&packet, network)?)),
-        Err(error) => {
-            let error = anyhow::Error::new(error);
-            if error.chain().any(|cause| {
-                matches!(cause.downcast_ref::<PkarrError>(),
-                Some(PkarrError::HttpRequest { status, .. }) if status.as_u16() == 404)
-            }) {
-                Ok(None)
-            } else {
-                Err(error.context("could not check network destruction"))
-            }
-        }
-    }
+        .context("could not check network destruction")?
+        .map(|packet| decode_index(&packet, network))
+        .transpose()
 }
 
-pub(crate) async fn publish(client: &PkarrRelayClient, packet: &SignedPacket) -> Result<()> {
-    tokio::time::timeout(PUBLISH_TIMEOUT, client.publish(packet))
+pub(crate) async fn publish(client: &PkarrClient, packet: &SignedPacket) -> Result<()> {
+    client
+        .publish(packet)
         .await
-        .context("timed out publishing network destruction")?
-        .map_err(|e| anyhow::anyhow!("publish network destruction: {e:#}"))
+        .context("publish network destruction")
 }
 
 #[cfg(test)]

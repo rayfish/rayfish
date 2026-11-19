@@ -130,7 +130,7 @@ pub(crate) fn apply_suggested_firewall(
 /// and a stale one must not undo a fresher record we already applied. Same floor,
 /// same reason, as the mesh path.
 pub(crate) async fn resolve_signed(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     net_pubkey: EndpointId,
 ) -> Option<(blake3::Hash, Vec<EndpointId>, u64)> {
     let packet = dht::resolve_network_packet(client, net_pubkey).await.ok()?;

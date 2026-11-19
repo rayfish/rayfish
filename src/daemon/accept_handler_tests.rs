@@ -259,6 +259,7 @@ pub(crate) fn sample_registry(
                 lan_peers: Arc::new(LanPeers::new()),
                 warm_lookup: WarmLookup::default(),
                 pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
+                mainline: None,
             },
         )
         .expect("test endpoint is open"),

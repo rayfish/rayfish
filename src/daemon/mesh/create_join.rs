@@ -752,12 +752,7 @@ impl NetworkRegistry {
         let pkarr_client = &self.transport.pkarr;
         let record = dht::resolve_network_packet(pkarr_client, net_pubkey)
             .await
-            .with_context(|| {
-                format!(
-                    "could not look up this network at {}",
-                    self.transport.pkarr_relay_url
-                )
-            })?;
+            .context("could not look up this network")?;
 
         if dht::destruction::is_destroyed(&record) {
             self.forget_destroyed_key(&record).await?;

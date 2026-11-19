@@ -5,10 +5,12 @@
 //! can publish or update the record.
 
 use anyhow::{Context as _, Result, ensure};
+use iroh::address_lookup::pkarr::PkarrError;
 use iroh::{
     EndpointId, SecretKey, address_lookup::PkarrRelayClient, dns::DnsResolver, endpoint::Endpoint,
 };
 use iroh_dns::pkarr::SignedPacket;
+use n0_mainline::errors::{ConcurrencyError, PutMutableError};
 use url::Url;
 
 const RECORD_NAME: &str = "_rayfish";
@@ -17,20 +19,15 @@ pub(crate) const RECORD_TTL: u32 = 300;
 const PKARR_RELAY_URL: &str = "https://dns.iroh.link/pkarr";
 
 pub(crate) mod destruction;
+pub(crate) mod mainline;
+use mainline::Mainline;
 
-/// Cap on a single record resolution. The relay is plain HTTPS and iroh's
-/// client sets no total timeout, so a blackholed relay (or a host whose DNS
-/// stopped resolving the relay's own name) would otherwise leave `ray join`
-/// hanging with nothing on screen.
+/// Bound each discovery backend so an unreachable server cannot stall a join.
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Bound publication too, so a blackholed relay cannot hold a publisher or an
-/// admission waiting on its record forever.
+/// Bound publication for the publishers and admissions that wait for it.
 const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Resolve the pkarr relay URL for one daemon from its startup configuration.
-/// The URL is then carried in [`crate::daemon::foundation::Transport`], rather
-/// than in process-global state, so independently rebuilt embedders cannot
-/// borrow a prior daemon's discovery configuration.
 pub fn pkarr_relay_url(o: &crate::config::ServerOverride) -> Url {
     crate::config::discovery_urls(o)
         .ok()
@@ -43,17 +40,108 @@ pub fn pkarr_relay_url(o: &crate::config::ServerOverride) -> Url {
 // Pkarr client
 // ---------------------------------------------------------------------------
 
-pub fn create_pkarr_client(ep: &Endpoint, relay_url: &Url) -> Result<PkarrRelayClient> {
+#[derive(Clone)]
+pub struct PkarrClient {
+    relay: PkarrRelayClient,
+    mainline: Option<Mainline>,
+}
+
+pub fn create_pkarr_client(ep: &Endpoint, relay_url: &Url) -> Result<PkarrClient> {
     let tls_config = ep.tls_config().clone();
     let dns_resolver: DnsResolver = ep
         .dns_resolver()
         .context("endpoint has no DNS resolver")?
         .clone();
-    Ok(PkarrRelayClient::new(
-        relay_url.clone(),
-        tls_config,
-        dns_resolver,
-    ))
+    Ok(PkarrClient {
+        relay: PkarrRelayClient::new(relay_url.clone(), tls_config, dns_resolver),
+        mainline: None,
+    })
+}
+
+impl PkarrClient {
+    pub(crate) fn with_mainline(mut self, mainline: Option<Mainline>) -> Self {
+        self.mainline = mainline;
+        self
+    }
+
+    pub(crate) async fn resolve(&self, key: EndpointId) -> Result<Option<SignedPacket>> {
+        let relay = resolve_relay(&self.relay, key);
+        let Some(mainline) = &self.mainline else {
+            return relay.await;
+        };
+        match tokio::join!(mainline.resolve(key), relay) {
+            (Ok(Some(dht)), Ok(Some(relay))) => {
+                // Destruction is terminal across both backends, even if a
+                // stale coordinator published another roster in the meantime.
+                let prefer_relay = match (
+                    destruction::is_destroyed(&dht),
+                    destruction::is_destroyed(&relay),
+                ) {
+                    (true, false) => false,
+                    (false, true) => true,
+                    _ => relay.more_recent_than(&dht),
+                };
+                Ok(Some(if prefer_relay { relay } else { dht }))
+            }
+            (Ok(Some(packet)), _) | (_, Ok(Some(packet))) => Ok(Some(packet)),
+            (Ok(None), _) | (_, Ok(None)) => Ok(None),
+            (Err(dht), Err(relay)) => {
+                Err(dht.context(format!("pkarr relay lookup failed: {relay:#}")))
+            }
+        }
+    }
+
+    async fn publish(&self, packet: &SignedPacket) -> Result<()> {
+        let relay = async {
+            tokio::time::timeout(PUBLISH_TIMEOUT, self.relay.publish(packet))
+                .await
+                .context("timed out publishing to pkarr relay")?
+                .context("publish to pkarr relay")
+        };
+        let Some(mainline) = &self.mainline else {
+            return relay.await;
+        };
+        match tokio::join!(mainline.publish(packet), relay) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(dht), Err(relay)) => {
+                Err(dht.context(format!("pkarr relay publication failed: {relay:#}")))
+            }
+            (Err(dht), Ok(()))
+                if matches!(
+                    dht.downcast_ref::<PutMutableError>(),
+                    Some(PutMutableError::Concurrency(
+                        ConcurrencyError::NotMostRecent
+                    ))
+                ) =>
+            {
+                Err(dht.context("Mainline DHT already has a newer record"))
+            }
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => {
+                tracing::debug!(error = %format!("{error:#}"), "pkarr publication reached one backend");
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn resolve_relay(relay: &PkarrRelayClient, key: EndpointId) -> Result<Option<SignedPacket>> {
+    let result = tokio::time::timeout(RESOLVE_TIMEOUT, relay.resolve(key))
+        .await
+        .context("timed out resolving pkarr relay record")?;
+    match result {
+        Ok(packet) => Ok(Some(packet)),
+        Err(error) => {
+            let error = anyhow::Error::new(error);
+            if error.chain().any(|cause| {
+                matches!(cause.downcast_ref::<PkarrError>(),
+                    Some(PkarrError::HttpRequest { status, .. }) if status.as_u16() == 404)
+            }) {
+                Ok(None)
+            } else {
+                Err(error.context("resolve pkarr relay record"))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +267,7 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec
 // ---------------------------------------------------------------------------
 
 pub async fn publish_network(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     key: &SecretKey,
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
@@ -193,18 +281,13 @@ pub async fn publish_network(
 ///
 /// Callers that order their records against local state sign the packet while
 /// they hold that state's lock and publish it after releasing the lock. The
-/// packet's timestamp is taken at signing, and the relay keeps the most recent
-/// one, so a record signed earlier cannot replace a later one even when its
-/// publish finishes last.
-pub async fn publish_record(client: &PkarrRelayClient, packet: &SignedPacket) -> Result<()> {
-    match tokio::time::timeout(PUBLISH_TIMEOUT, client.publish(packet)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(anyhow::anyhow!("failed to publish network record: {e:#}")),
-        Err(_) => Err(anyhow::anyhow!(
-            "timed out publishing network record after {}s",
-            PUBLISH_TIMEOUT.as_secs()
-        )),
-    }
+/// packet's timestamp is taken at signing, and discovery backends order records
+/// by that timestamp.
+pub async fn publish_record(client: &PkarrClient, packet: &SignedPacket) -> Result<()> {
+    client
+        .publish(packet)
+        .await
+        .context("failed to publish network record")
 }
 
 /// Resolves the raw signed network record packet. Use this when you need fields
@@ -212,10 +295,13 @@ pub async fn publish_record(client: &PkarrRelayClient, packet: &SignedPacket) ->
 /// pre-dial compatibility check. Decode the standard fields with
 /// [`decode_network_record`].
 pub async fn resolve_network_packet(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     network_pubkey: EndpointId,
 ) -> Result<SignedPacket> {
-    let packet = resolve_packet(client, network_pubkey).await?;
+    let packet = client
+        .resolve(network_pubkey)
+        .await?
+        .context("network record not found")?;
     if !destruction::is_destroyed(&packet)
         && let Some(key) = destruction::discovery_id(&packet)
         && let Some(destroyed) = destruction::resolve(client, key, network_pubkey).await?
@@ -225,27 +311,8 @@ pub async fn resolve_network_packet(
     Ok(packet)
 }
 
-async fn resolve_packet(
-    client: &PkarrRelayClient,
-    network_pubkey: EndpointId,
-) -> Result<SignedPacket> {
-    // `{e:#}` rather than `{e}`: the top-level Display of iroh's lookup error is
-    // the bare "Service 'pkarr' failed", which says nothing. The alternate form
-    // renders the source chain, so a DNS failure resolving the relay reads as
-    // such instead of looking like the network record is missing.
-    let resolve = client.resolve(network_pubkey);
-    match tokio::time::timeout(RESOLVE_TIMEOUT, resolve).await {
-        Ok(Ok(packet)) => Ok(packet),
-        Ok(Err(e)) => Err(anyhow::anyhow!("{e:#}")),
-        Err(_) => Err(anyhow::anyhow!(
-            "timed out after {}s",
-            RESOLVE_TIMEOUT.as_secs()
-        )),
-    }
-}
-
 pub async fn resolve_network(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     network_pubkey: EndpointId,
 ) -> Result<(blake3::Hash, Vec<EndpointId>)> {
     let packet = resolve_network_packet(client, network_pubkey).await?;
@@ -262,6 +329,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use iroh::{SecretKey, endpoint::presets};
+    use n0_mainline::Dht;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -273,6 +341,8 @@ mod tests {
         let valid = encode_network_record(&network, &hash, &[seed])
             .unwrap()
             .to_relay_payload();
+        let updated_hash = blake3::hash(b"updated blob");
+        let updated = encode_network_record(&network, &updated_hash, &[seed]).unwrap();
         let forged = encode_network_record(&SecretKey::from([9; 32]), &hash, &[seed])
             .unwrap()
             .to_relay_payload();
@@ -281,9 +351,11 @@ mod tests {
         let path = format!("GET /pkarr/{} HTTP/1.1\r\n", network.public().to_z32());
         let server = tokio::spawn(async move {
             for (status, payload) in [
-                ("200 OK", valid),
+                ("200 OK", valid.clone()),
                 ("200 OK", forged),
                 ("404 Not Found", vec![]),
+                ("200 OK", valid.clone()),
+                ("200 OK", valid),
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -311,13 +383,75 @@ mod tests {
             .unwrap();
         let client = create_pkarr_client(&endpoint, &url).unwrap();
         assert_eq!(
-            decode_network_record(&resolve_packet(&client, network.public()).await.unwrap())
+            decode_network_record(&client.resolve(network.public()).await.unwrap().unwrap())
                 .unwrap(),
             (hash, vec![seed])
         );
-        assert!(resolve_packet(&client, network.public()).await.is_err());
-        assert!(resolve_packet(&client, network.public()).await.is_err());
+        assert!(client.resolve(network.public()).await.is_err());
+        assert!(client.resolve(network.public()).await.unwrap().is_none());
+
+        let offline = Mainline::for_test(Dht::builder().no_bootstrap().build().unwrap());
+        let fallback = client.clone().with_mainline(Some(offline));
+        let resolved = fallback.resolve(network.public()).await.unwrap().unwrap();
+        assert_eq!(decode_network_record(&resolved).unwrap().0, hash);
+
+        let testnet = n0_mainline::Testnet::new(5).await.unwrap();
+        let dht = Mainline::for_test(
+            Dht::builder()
+                .bootstrap(&testnet.bootstrap)
+                .build()
+                .unwrap(),
+        );
+        dht.publish(&updated).await.unwrap();
+        let dual = client.with_mainline(Some(dht));
+        let resolved = dual.resolve(network.public()).await.unwrap().unwrap();
+        assert_eq!(resolved.as_bytes(), updated.as_bytes());
+
         server.await.unwrap();
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn mainline_records_work_when_the_relay_is_unavailable() {
+        let testnet = n0_mainline::Testnet::new(5).await.unwrap();
+        let new_dht = || {
+            Mainline::for_test(
+                Dht::builder()
+                    .bootstrap(&testnet.bootstrap)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let endpoint = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let url = "http://127.0.0.1:1/pkarr".parse().unwrap();
+        let relay_client = create_pkarr_client(&endpoint, &url).unwrap();
+        let publisher = relay_client.clone().with_mainline(Some(new_dht()));
+        let resolver = relay_client.with_mainline(Some(new_dht()));
+        let network = SecretKey::generate();
+        let hash = blake3::hash(b"roster");
+        let seed = SecretKey::generate().public();
+
+        let bytes = publish_network(&publisher, &network, &hash, &[seed])
+            .await
+            .unwrap();
+        let resolved = resolve_network_packet(&resolver, network.public())
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_bytes(), bytes);
+        assert_eq!(
+            decode_network_record(&resolved).unwrap(),
+            (hash, vec![seed])
+        );
+
+        // Only the destruction index is updated. A reader with a live roster
+        // must still discover the separately signed proof.
+        let destroyed = destruction::encode(&network).unwrap();
+        let index = destruction::encode_index(&network, &destroyed).unwrap();
+        destruction::publish(&publisher, &index).await.unwrap();
+        let resolved = resolve_network_packet(&resolver, network.public())
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_bytes(), destroyed.as_bytes());
         endpoint.close().await;
     }
 

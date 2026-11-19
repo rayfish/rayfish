@@ -722,8 +722,8 @@ pub struct AppConfig {
     /// Custom iroh transport relay servers (NAT-traversal fallback).
     #[serde(default)]
     pub relay: ServerOverride,
-    /// Custom iroh discovery-DNS / pkarr server (endpoint resolution + record
-    /// publish). Also redirects the `dht.rs` pkarr client.
+    /// Custom iroh discovery-DNS / pkarr server for endpoint and network
+    /// records. With `replace`, public discovery uses the configured servers.
     #[serde(default)]
     pub discovery_dns: ServerOverride,
     /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).

@@ -24,6 +24,7 @@ use iroh::{
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 use crate::config::{AppConfig, QuicEngine, ServerOverride};
+use crate::dht::mainline::{EndpointLookup, Mainline};
 use crate::endpoint_hints::WarmLookup;
 use crate::exit_node::{LoopPrevention, is_transitable};
 
@@ -321,6 +322,17 @@ pub async fn create_endpoint_with_alpns(
     tor: bool,
     settings: &AppConfig,
 ) -> Result<(Endpoint, WarmLookup)> {
+    let (endpoint, warm_lookup, _) =
+        create_endpoint_with_discovery(secret_key, alpns, tor, settings).await?;
+    Ok((endpoint, warm_lookup))
+}
+
+pub(crate) async fn create_endpoint_with_discovery(
+    secret_key: SecretKey,
+    alpns: Vec<Vec<u8>>,
+    tor: bool,
+    settings: &AppConfig,
+) -> Result<(Endpoint, WarmLookup, Option<Mainline>)> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
     // it for the ephemeral fallback. Falling back to port 0 keeps the guarantee
@@ -338,12 +350,14 @@ pub async fn create_endpoint_with_alpns(
     // Hints came from paths that previously completed an identity-authenticated
     // QUIC handshake; if an address has gone stale, iroh tries discovery as usual.
     let warm_lookup = WarmLookup::from_hints(settings.endpoint_hints.clone())?;
+    let mainline = Mainline::start(&settings.discovery_dns);
     let bind = BindConfig {
         secret_key: &secret_key,
         alpns: &alpns,
         tor,
         relay: &settings.relay,
         discovery: &settings.discovery_dns,
+        mainline: mainline.as_ref(),
         nameservers: &nameservers,
         dns_replace: settings.dns_upstreams.replace,
         warm_lookup: &warm_lookup,
@@ -366,7 +380,7 @@ pub async fn create_endpoint_with_alpns(
 
     tracing::info!(id = %ep.id().fmt_short(), "iroh endpoint ready");
 
-    Ok((ep, warm_lookup))
+    Ok((ep, warm_lookup, mainline))
 }
 
 /// Everything a bind attempt needs except the port. The port is the one value
@@ -379,6 +393,7 @@ struct BindConfig<'a> {
     tor: bool,
     relay: &'a ServerOverride,
     discovery: &'a ServerOverride,
+    mainline: Option<&'a Mainline>,
     nameservers: &'a [IpAddr],
     dns_replace: bool,
     warm_lookup: &'a WarmLookup,
@@ -404,6 +419,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         tor,
         relay,
         discovery,
+        mainline,
         nameservers,
         dns_replace,
         warm_lookup,
@@ -461,6 +477,9 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         builder = builder.relay_mode(mode);
     }
     builder = apply_discovery(builder, discovery)?;
+    if let Some(mainline) = mainline {
+        builder = builder.address_lookup(EndpointLookup::new(mainline.clone(), secret_key.clone()));
+    }
     // `discovery-dns = replace` clears the preset lookup chain above, so add
     // this after `apply_discovery`: warm hints must remain available regardless
     // of whether the operator replaces the public discovery service.
@@ -1068,6 +1087,7 @@ mod tests {
             tor: false,
             relay: &offline,
             discovery: &discovery,
+            mainline: None,
             nameservers: &[],
             dns_replace: true,
             warm_lookup: &lookup,

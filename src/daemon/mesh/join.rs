@@ -587,7 +587,7 @@ async fn connect_to_roster_peers(
 async fn perform_join_handshake(
     initial_conn: &Connection,
     ep: &Endpoint,
-    pkarr: &PkarrRelayClient,
+    pkarr: &PkarrClient,
     network_name: &str,
     blob_store: &FsStore,
     peers: &PeerTable,

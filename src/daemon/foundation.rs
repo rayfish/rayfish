@@ -11,6 +11,7 @@
 //! the crate-level `transport` module that owns iroh endpoint setup.
 
 use super::*;
+use crate::dht::mainline::Mainline;
 use crate::endpoint_hints::WarmLookup;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use iroh::{RelayMap, RelayUrl};
@@ -33,13 +34,8 @@ pub(crate) struct Transport {
     /// Recent authenticated paths, also refreshed by live connections. Lookup
     /// excludes expired paths and falls back to normal discovery.
     pub(crate) warm_lookup: WarmLookup,
-    /// The discovery relay selected for this daemon at startup. Keeping this
-    /// with the endpoint prevents a later embedded daemon from inheriting a
-    /// prior instance's process-global setting.
-    pub(crate) pkarr_relay_url: Url,
-    /// The one HTTP client for that relay, shared by every publisher and
-    /// resolver so they reuse its connection pool.
-    pub(crate) pkarr: PkarrRelayClient,
+    /// Signed record discovery shared by every publisher and resolver.
+    pub(crate) pkarr: PkarrClient,
     /// Phones go outgoing-only after an idle period: mesh peer links close and
     /// the relay is dropped, so nothing unsolicited reaches the radio. Shared
     /// with mDNS, which skips its windows while this is set.
@@ -63,6 +59,7 @@ pub(crate) struct TransportBootstrap {
     pub(crate) lan_peers: Arc<LanPeers>,
     pub(crate) warm_lookup: WarmLookup,
     pub(crate) pkarr_relay_url: Url,
+    pub(crate) mainline: Option<Mainline>,
     #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(crate) suspended: Arc<AtomicBool>,
     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -77,7 +74,8 @@ impl Transport {
         stats: Arc<ForwardMetrics>,
         bootstrap: TransportBootstrap,
     ) -> Result<Self> {
-        let pkarr = dht::create_pkarr_client(&endpoint, &bootstrap.pkarr_relay_url)?;
+        let pkarr = dht::create_pkarr_client(&endpoint, &bootstrap.pkarr_relay_url)?
+            .with_mainline(bootstrap.mainline);
         Ok(Self {
             endpoint,
             identity,
@@ -85,7 +83,6 @@ impl Transport {
             stats,
             lan_peers: bootstrap.lan_peers,
             warm_lookup: bootstrap.warm_lookup,
-            pkarr_relay_url: bootstrap.pkarr_relay_url,
             pkarr,
             #[cfg(any(target_os = "android", target_os = "ios"))]
             suspended: bootstrap.suspended,
@@ -102,7 +99,6 @@ impl Transport {
     #[cfg(test)]
     pub(crate) fn set_pkarr_relay(&mut self, url: Url) {
         self.pkarr = dht::create_pkarr_client(&self.endpoint, &url).expect("endpoint is open");
-        self.pkarr_relay_url = url;
     }
 
     #[cfg(any(target_os = "android", target_os = "ios"))]

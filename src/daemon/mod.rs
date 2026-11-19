@@ -52,7 +52,6 @@ use std::time::{Duration, Instant};
 use dashmap::{DashMap, DashSet};
 
 use anyhow::{Context, Result};
-use iroh::address_lookup::PkarrRelayClient;
 use iroh::endpoint::{Connection, Endpoint, VarInt};
 use iroh::{EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
@@ -69,7 +68,7 @@ use crate::config;
 use crate::config::settings::{self, FirewallKey, GlobalKey, NetworkKey, NodeKey};
 use crate::config::{AppConfig, NetworkConfig};
 use crate::control::{self, ControlMsg};
-use crate::dht;
+use crate::dht::{self, PkarrClient};
 use crate::dns;
 use crate::dns::config as dns_config;
 use crate::firewall::{self, SharedFirewall};

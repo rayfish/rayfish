@@ -334,8 +334,8 @@ async fn build_daemon_inner(
         .networks
         .iter()
         .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
-    let (ep, warm_lookup) =
-        transport::create_endpoint_with_alpns(key.clone(), alpns, use_tor, &app_config).await?;
+    let (ep, warm_lookup, mainline) =
+        transport::create_endpoint_with_discovery(key.clone(), alpns, use_tor, &app_config).await?;
     *endpoint_out = Some(ep.clone());
 
     // Built before the blob store below, because the provider event pump that
@@ -601,6 +601,7 @@ async fn build_daemon_inner(
             lan_peers,
             warm_lookup,
             pkarr_relay_url,
+            mainline,
             #[cfg(any(target_os = "android", target_os = "ios"))]
             suspended,
             #[cfg(any(target_os = "android", target_os = "ios"))]

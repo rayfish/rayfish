@@ -1476,6 +1476,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "crc32fast"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2003,6 +2018,12 @@ name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
+
+[[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "ecdsa"
@@ -3840,7 +3861,7 @@ dependencies = [
  "iroh-base",
  "iroh-dns",
  "iroh-metrics",
- "lru",
+ "lru 0.18.3",
  "n0-error",
  "n0-future",
  "noq",
@@ -4248,6 +4269,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4462,7 +4489,7 @@ dependencies = [
  "derive_more 2.1.1",
  "ipconfig",
  "jni 0.22.4",
- "lru",
+ "lru 0.18.3",
  "n0-error",
  "n0-future",
  "ndk-context",
@@ -4518,6 +4545,26 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
+]
+
+[[package]]
+name = "n0-mainline"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9624231d16070e2c4de0bbd37246eb8052ffdb832d6a3fa501abdbf4cb9549c9"
+dependencies = [
+ "crc",
+ "dyn-clone",
+ "ed25519-dalek 3.0.0",
+ "futures-core",
+ "hex",
+ "lru 0.19.0",
+ "n0-error",
+ "noq-udp",
+ "rand 0.10.2",
+ "sha1_smol",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6449,6 +6496,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "n0-error",
+ "n0-mainline",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

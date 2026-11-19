@@ -3,7 +3,6 @@
 //! Also holds the thin `Daemon` direct-connection (`ray connect`) handlers that
 //! delegate to `ConnectService`.
 
-use iroh::address_lookup::pkarr::PkarrError;
 use iroh_dns::pkarr::SignedPacket;
 
 use super::super::*;
@@ -16,9 +15,9 @@ const RECORD_REPUBLISH_INTERVAL: Duration = Duration::from_secs((dht::RECORD_TTL
 /// `snapshot_commit`, refusing a snapshot a reconverge has since replaced.
 ///
 /// The replay floor is not raised here but by [`publish_signed_record`], once
-/// the relay has taken the record and under the same lock that clears the
+/// a discovery backend has taken the record and under the same lock that clears the
 /// authored marker. Raising it at signing would, when the publish then fails,
-/// refuse another coordinator's newer record the relay still holds, and the
+/// refuse another coordinator's newer record discovery still serves, and the
 /// retry would publish over that edit.
 pub(crate) fn sign_current_network_record(
     state: &SharedNetworkState,
@@ -55,26 +54,12 @@ async fn synchronize_before_renewal(
     if has_authored_snapshot(state, network) {
         return Ok(true);
     }
-    let resolved = tokio::time::timeout(
-        Duration::from_secs(15),
-        registry.transport.pkarr.resolve(network_key),
-    )
-    .await
-    .context("timed out checking the canonical network record")
-    .and_then(|result| result.map_err(anyhow::Error::new));
-    let packet = match resolved {
-        Ok(packet) => packet,
+    let packet = match registry.transport.pkarr.resolve(network_key).await {
+        Ok(Some(packet)) => packet,
+        // A genesis record or expired lease has no canonical successor.
+        Ok(None) => return Ok(true),
         Err(_) if has_authored_snapshot(state, network) => return Ok(true),
-        Err(error) => {
-            if error.chain().any(|cause| {
-                matches!(cause.downcast_ref::<PkarrError>(),
-                    Some(PkarrError::HttpRequest { status, .. }) if status.as_u16() == 404)
-            }) {
-                // A genesis record or expired lease has no canonical successor.
-                return Ok(true);
-            }
-            return Err(error.context("could not check the canonical network record"));
-        }
+        Err(error) => return Err(error.context("could not check the canonical network record")),
     };
     if dht::destruction::is_destroyed(&packet) {
         registry.schedule_destruction(network, packet);
@@ -296,18 +281,14 @@ fn next_attempt_deadline(
 }
 
 /// The proof that this network was destroyed, if there is one: the copy saved
-/// locally, else the one on the relay. A saved proof that cannot be read falls
-/// back to the relay rather than stopping publication for good. `Err` only when
-/// the relay cannot answer either.
-async fn destruction_proof(
-    client: &PkarrRelayClient,
-    key: &SecretKey,
-) -> Result<Option<SignedPacket>> {
+/// locally, else the one in discovery. A saved proof that cannot be read falls
+/// back to discovery. `Err` only when discovery cannot answer either.
+async fn destruction_proof(client: &PkarrClient, key: &SecretKey) -> Result<Option<SignedPacket>> {
     match config::destruction::load(key.public()) {
         Ok(Some(packet)) => return Ok(Some(packet)),
         Ok(None) => {}
         Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "cannot read local network destruction status; asking the relay");
+            tracing::warn!(error = %format!("{error:#}"), "cannot read local network destruction status, checking discovery");
         }
     }
     dht::destruction::resolve(
@@ -626,7 +607,7 @@ pub(crate) async fn persist_group_hash_locked(
 /// an older blob, reads as newer than nothing, and is applied and then
 /// republished over our own edit.
 pub(crate) async fn publish_signed_record(
-    client: &PkarrRelayClient,
+    client: &PkarrClient,
     state: &SharedNetworkState,
     network: &str,
     hash: blake3::Hash,
@@ -640,7 +621,7 @@ pub(crate) async fn publish_signed_record(
     Ok(mark_group_hash_published(network, hash, published))
 }
 
-/// Refuse any record authored before `packet`, a record the relay took, and
+/// Refuse any record authored before `packet`, a record discovery accepted, and
 /// keep it as the last published unless a later one is already held.
 fn raise_record_floor(state: &SharedNetworkState, packet: &SignedPacket) {
     let published = packet.timestamp().as_micros();
