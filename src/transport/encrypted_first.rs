@@ -5,6 +5,9 @@
 //! every relay name to its block page. A rewritten answer is not a failure, so
 //! racing the network's nameservers, or asking them first, lets it win and the
 //! node reaches no relay. Encrypted answers cannot be rewritten in transit.
+//!
+//! Any failure falls back, NXDOMAIN included: a self-hosted relay can have a
+//! name only the local network's DNS knows.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
