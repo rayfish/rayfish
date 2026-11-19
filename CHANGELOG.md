@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.17] - 2026-11-19
+
 ### Added
 
 - `ray config set tcp-congestion bbr` selects BBR for Linux mesh TCP routes
