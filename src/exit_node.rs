@@ -707,12 +707,6 @@ pub(crate) fn parse_host_interfaces(out: &str) -> HostInterfaces {
     interfaces
 }
 
-/// Whether this host has an IPv6 default route for gateway egress.
-#[cfg(target_os = "linux")]
-fn has_v6_uplink() -> bool {
-    ip_output(&["-6", "route", "show", "default"]).is_some_and(|out| !out.trim().is_empty())
-}
-
 /// Inspect the physical default, excluding our own full-tunnel routes.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn has_v6_uplink() -> bool {
@@ -724,11 +718,6 @@ fn has_v6_uplink() -> bool {
 #[cfg(any(target_os = "macos", target_os = "freebsd", test))]
 fn is_tunnel_iface(name: &str) -> bool {
     name.starts_with("utun") || name.starts_with("tun")
-}
-
-#[cfg(target_os = "linux")]
-fn has_v4_uplink() -> bool {
-    ip_output(&["-4", "route", "show", "default"]).is_some_and(|out| !out.trim().is_empty())
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
