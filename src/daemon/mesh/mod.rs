@@ -23,6 +23,7 @@ mod firewall;
 mod install;
 mod invite;
 mod join;
+mod network_dns;
 mod ping;
 mod publish;
 mod reconverge;

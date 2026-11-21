@@ -47,6 +47,7 @@ impl MemberFixture {
         let key = SecretKey::generate();
         let me = daemon.registry.transport.identity.local_identity();
         let bytes = crate::membership::canonical_group_bytes(&GroupBlob {
+            dns_upstreams: Vec::new(),
             members: MemberList::from(vec![Member {
                 identity: me,
                 hostname: Some("test-node".to_string()),
@@ -126,6 +127,7 @@ impl MemberFixture {
             let mut members = s.group.members.clone();
             edit(&mut members);
             crate::membership::canonical_group_bytes(&GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: members.clone(),
                 approved: s.group.approved.clone(),
                 suggested_firewall: s.group.suggested_firewall.clone(),

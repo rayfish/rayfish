@@ -920,6 +920,7 @@ impl NetworkRegistry {
     /// Split out of the daemon's `refresh_alpns` (whose ALPN half is a no-op now
     /// the mesh ALPN is static) for the teardown path.
     pub(crate) async fn refresh_search_domains(&self) {
+        self.refresh_network_dns().await;
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         let tun_name = self.tun_name.load().as_str().to_owned();
         self.dns.set_search_domains(&network_names, &tun_name).await;
@@ -1434,6 +1435,8 @@ impl NetworkRegistry {
             last_record_timestamp: None,
             transport: None,
             auto_accept_firewall: false,
+            accept_dns: false,
+            dns_upstreams: Vec::new(),
             // Own-device file offers are auto-accepted by default (identity-checked).
             auto_accept_files: true,
             admins: vec![],
@@ -1524,6 +1527,7 @@ impl NetworkRegistry {
 
         Ok(NetworkState {
             group: GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: member_list,
                 approved,
                 suggested_firewall: SuggestedFirewall::default(),

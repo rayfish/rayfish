@@ -178,6 +178,7 @@ fn member(identity: EndpointId, coordinator: bool) -> Member {
 fn network_state(key: &SecretKey, members: Vec<Member>) -> SharedNetworkState {
     let mut state = NetworkState {
         group: GroupBlob {
+            dns_upstreams: Vec::new(),
             members: MemberList::from(members),
             approved: ApprovedList::new(),
             suggested_firewall: SuggestedFirewall::default(),

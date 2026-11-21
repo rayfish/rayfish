@@ -8,6 +8,7 @@ pub(crate) fn make_network_state() -> SharedNetworkState {
     let net_pub = net_secret.public();
     Arc::new(RwLock::new(NetworkState {
         group: GroupBlob {
+            dns_upstreams: Vec::new(),
             members: MemberList::new(),
             approved: ApprovedList::new(),
             suggested_firewall: SuggestedFirewall::default(),
@@ -100,6 +101,7 @@ fn convergence_is_tracked_as_the_hash_we_accepted() {
     // with `ray join <code> --name <alias>` re-encodes a name the coordinator
     // never published and can never match its record.
     let published = canonical_group_bytes(&GroupBlob {
+        dns_upstreams: Vec::new(),
         members: s.group.members.clone(),
         approved: s.group.approved.clone(),
         suggested_firewall: s.group.suggested_firewall.clone(),

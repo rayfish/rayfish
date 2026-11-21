@@ -110,6 +110,7 @@ proptest! {
         }
 
         let blob = |members: Vec<Member>| GroupBlob {
+            dns_upstreams: Vec::new(),
             members: MemberList::from(members),
             approved: ApprovedList::new(),
             suggested_firewall: Default::default(),
@@ -128,6 +129,7 @@ proptest! {
     #[test]
     fn blob_hash_matches_canonical_bytes(roster in roster_strategy(8)) {
         let blob = GroupBlob {
+            dns_upstreams: Vec::new(),
             members: MemberList::from(roster),
             approved: ApprovedList::new(),
             suggested_firewall: Default::default(),

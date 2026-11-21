@@ -24,6 +24,7 @@ fn hold_network(daemon: &Daemon, name: &str, members: &[(EndpointId, bool)]) {
     }
     let mut state = NetworkState {
         group: GroupBlob {
+            dns_upstreams: Vec::new(),
             members: list,
             approved: ApprovedList::new(),
             suggested_firewall: SuggestedFirewall::default(),

@@ -2557,6 +2557,7 @@ mod direct_grant_tests {
         }
         Arc::new(RwLock::new(NetworkState {
             group: GroupBlob {
+                dns_upstreams: Vec::new(),
                 members: list,
                 approved: ApprovedList::new(),
                 suggested_firewall: SuggestedFirewall::default(),

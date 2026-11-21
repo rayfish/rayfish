@@ -25,7 +25,7 @@ pub(super) fn resolved_link_domains(search: &[SearchDomain]) -> Vec<(String, boo
         domains.push((root.to_string(), true));
     }
     // A selected exit takes every lookup, so the link becomes the default DNS route.
-    if crate::exit_node::full_tunnel_active() {
+    if crate::exit_node::full_tunnel_active() || crate::dns::resolver::network_dns_active() {
         domains.push((".".to_owned(), true));
     }
     for d in search {
@@ -387,7 +387,7 @@ impl DnsConfigurator for SystemdResolvedDBus {
 
         // SetLinkDomains(ifindex, [(domain, routing_only)])
         let mut domains: Vec<(&str, bool)> = vec![(DNS_DOMAIN, true)];
-        if crate::exit_node::full_tunnel_active() {
+        if crate::exit_node::full_tunnel_active() || crate::dns::resolver::network_dns_active() {
             domains.push((".", true));
         }
         resolved_call(&conn, "SetLinkDomains", &(self.ifindex, &domains))
@@ -455,7 +455,11 @@ impl DnsConfigurator for SystemdResolvedCli {
 
         let status = Command::new("resolvectl")
             .args(["domain", &self.tun_iface, &format!("~{DNS_DOMAIN}")])
-            .args(crate::exit_node::full_tunnel_active().then_some("~."))
+            .args(
+                (crate::exit_node::full_tunnel_active()
+                    || crate::dns::resolver::network_dns_active())
+                .then_some("~."),
+            )
             .status()
             .await
             .context("resolvectl domain")?;
