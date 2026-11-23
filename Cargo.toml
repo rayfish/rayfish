@@ -256,14 +256,14 @@ windows-sys = { version = "0.61.2", features = [
 # Drop this patch when an upstream release includes it.
 iroh-mdns-address-lookup = { git = "https://github.com/n0-computer/iroh-address-lookups", rev = "6f103e7a92ddbd2007383527ab5024c983e3c1c6" }
 # iroh 1.3 from the fork's `rayfish` branch, which merges these PR branches:
-# https://github.com/n0-computer/iroh/pull/4397 (direct address filter)
+# the fork's network monitor branch (replaces PR 4397, the direct address filter)
 # https://github.com/n0-computer/iroh/pull/4406 (socket configuration hook)
 # https://github.com/n0-computer/iroh/pull/4616 (release a removed home relay)
 # iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
-iroh = { git = "https://github.com/rayfish/iroh", rev = "9dab676bb935caeddde67af273fcdc7d61daf6fc" }
-iroh-base = { git = "https://github.com/rayfish/iroh", rev = "9dab676bb935caeddde67af273fcdc7d61daf6fc" }
-iroh-dns = { git = "https://github.com/rayfish/iroh", rev = "9dab676bb935caeddde67af273fcdc7d61daf6fc" }
-iroh-relay = { git = "https://github.com/rayfish/iroh", rev = "9dab676bb935caeddde67af273fcdc7d61daf6fc" }
+iroh = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f61feb5c380e31710392877b4" }
+iroh-base = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f61feb5c380e31710392877b4" }
+iroh-dns = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f61feb5c380e31710392877b4" }
+iroh-relay = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f61feb5c380e31710392877b4" }
 # illumos forks, until upstream support lands. The netwatch fork carries the
 # configure-socket hook (n0-computer/net-tools#182) plus illumos support.
 netdev = { git = "https://github.com/extrowerk/netdev.git", branch = "illumos" }

@@ -613,7 +613,7 @@ pub fn is_overlay_ip(ip: IpAddr) -> bool {
 /// **Not ours.** The overlay is IPv6-only, so this range belongs to whatever
 /// other VPN shares the host, and the callers that ask are keeping *its*
 /// addresses out of places they would do damage: iroh's advertised transport
-/// candidates ([`crate::transport::OverlayAddrFilter`]) and the daemon's own
+/// candidates ([`crate::transport::UnderlayMonitor`]) and the daemon's own
 /// control-plane nameservers. Kept apart from [`is_overlay_ip`] because one
 /// predicate answering both questions is what made this easy to get wrong.
 pub fn is_cgnat_range(ip: Ipv4Addr) -> bool {
