@@ -245,9 +245,13 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     #[cfg(not(target_os = "linux"))]
     let builder = builder.ipv6(v6, 128).enable(true);
     #[cfg(target_os = "linux")]
-    // Keep Linux TUN segmentation and receive offload disabled while the
-    // burst-stall investigation is open. QUIC offload is configured separately.
-    let builder = builder.name(LINUX_TUN_NAME).offload(false);
+    // TUN offload hands the reader whole TCP/UDP segments to split into
+    // datagrams. Keep it paired with mesh QUIC segmentation offload: without
+    // GSO, cheap TUN reads outrun one-datagram sends and the standalone
+    // engine's datagram queue becomes a standing delay.
+    let builder = builder
+        .name(LINUX_TUN_NAME)
+        .offload(crate::transport::MESH_QUIC_SEGMENTATION_OFFLOAD);
     #[cfg(target_os = "windows")]
     let builder = builder
         .mtu_v6(MIN_TUN_MTU)

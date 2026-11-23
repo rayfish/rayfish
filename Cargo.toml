@@ -255,11 +255,12 @@ windows-sys = { version = "0.61.2", features = [
 # the fork's network monitor branch (replaces PR 4397, the direct address filter)
 # https://github.com/n0-computer/iroh/pull/4406 (socket configuration hook)
 # https://github.com/n0-computer/iroh/pull/4616 (release a removed home relay)
+# Carries the live GSO segment limit fix (n0-computer/iroh#4645).
 # iroh-base/-dns/-relay are patched too so the fork and registry copies don't clash.
-iroh = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f61feb5c380e31710392877b4" }
-iroh-base = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f61feb5c380e31710392877b4" }
-iroh-dns = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f61feb5c380e31710392877b4" }
-iroh-relay = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f61feb5c380e31710392877b4" }
+iroh = { git = "https://github.com/rayfish/iroh", rev = "5cb8add0b31a5e05a2a00ce4b1afd7e5245122e0" }
+iroh-base = { git = "https://github.com/rayfish/iroh", rev = "5cb8add0b31a5e05a2a00ce4b1afd7e5245122e0" }
+iroh-dns = { git = "https://github.com/rayfish/iroh", rev = "5cb8add0b31a5e05a2a00ce4b1afd7e5245122e0" }
+iroh-relay = { git = "https://github.com/rayfish/iroh", rev = "5cb8add0b31a5e05a2a00ce4b1afd7e5245122e0" }
 # illumos forks, until upstream support lands. The netwatch fork carries the
 # configure-socket hook (n0-computer/net-tools#182) plus illumos support.
 netdev = { git = "https://github.com/extrowerk/netdev.git", branch = "illumos" }

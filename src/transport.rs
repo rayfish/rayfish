@@ -448,9 +448,9 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //     to round-robin, so fairness scheduling is pure overhead. (Affects
         //     stream scheduling only, not datagrams, but is the correct setting and
         //     removes a small amount of per-packet work.)
-        //   - QUIC segmentation offload is disabled on Linux until failed GSO
-        //     sends recover on existing connections. Other platforms keep GSO
-        //     to coalesce same-destination segments into one sendmsg.
+        //   - QUIC segmentation offload coalesces same-destination segments
+        //     into one sendmsg. When the kernel refuses a GSO send, the socket
+        //     falls back to single datagrams for every connection on it.
         //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
         //     bounded send buffer. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
@@ -730,9 +730,8 @@ const STANDALONE_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 
-/// Mesh QUIC transmit policy, independent of TUN offload. iroh's address
-/// discovery client uses a separate transport configuration.
-pub(crate) const MESH_QUIC_SEGMENTATION_OFFLOAD: bool = !cfg!(target_os = "linux");
+/// Mesh QUIC transmit policy, independent of TUN offload.
+pub(crate) const MESH_QUIC_SEGMENTATION_OFFLOAD: bool = true;
 
 /// Keep FQ-CoDel's backlog in its scheduler and allow standalone traffic bursts.
 pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
@@ -772,10 +771,10 @@ fn quic_transport_config_with_window(engine: QuicEngine, max_window: u64) -> Qui
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.
         .send_fairness(false)
-        // After a GSO send fails, existing iroh connections can keep using it
-        // and stall on Linux: https://github.com/n0-computer/iroh/issues/4555
-        // Disable it for mesh connections until fallback recovers. iroh-relay's
-        // address-discovery client builds its own default transport config.
+        // Linux before 6.11 refuses GSO sends when the NIC lacks TX checksum
+        // offload. noq-udp then drops the socket to one datagram per send, and
+        // the patched iroh reads that limit on every transmit, so open
+        // connections fall back too (n0-computer/iroh#4555).
         .enable_segmentation_offload(MESH_QUIC_SEGMENTATION_OFFLOAD)
         // When this bounded queue fills, noQ discards older datagrams rather
         // than making the forwarding path wait behind stale traffic.
