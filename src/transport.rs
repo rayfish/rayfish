@@ -725,7 +725,12 @@ fn is_unroutable(e: &io::Error) -> bool {
     )
 }
 
-const FQ_CODEL_SEND_BUFFER_SIZE: usize = 16 * 1024;
+/// The FQ-CoDel scheduler fills only part of this; see `forward::fq_codel`.
+const FQ_CODEL_SEND_BUFFER_SIZE: usize = if cfg!(target_os = "linux") {
+    256 * 1024
+} else {
+    16 * 1024
+};
 const STANDALONE_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;

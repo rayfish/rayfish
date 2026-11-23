@@ -3,8 +3,10 @@
 //! RFC 8290: salted flow buckets, byte deficits, new/old active lists, and
 //! RFC 8289 CoDel per bucket (5 ms target, 100 ms interval). We drop rather
 //! than mark ECN. The `fq-codel` engine uses loss-tolerant congestion control
-//! and a short QUIC queue:
-//! backpressure must retain packets here for scheduling and delay measurement.
+//! and keeps QUIC's queue short: backpressure must retain packets here for
+//! scheduling and delay measurement. "Short" is about 3 ms of the measured send
+//! rate (at least 16 KiB), so a fast path still hands QUIC deep enough batches
+//! for segmentation offload while a slow link keeps its backlog under CoDel.
 //! This controls our queue, not queues already built in a router or Wi-Fi link.
 
 use std::collections::VecDeque;
@@ -36,6 +38,15 @@ const INGRESS_CAPACITY: usize = 256;
 const INGRESS_BATCH: usize = 64;
 const SEND_BATCH: usize = 32;
 const PACKET_OVERHEAD: usize = 256;
+/// Time's worth of the send rate QUIC's datagram queue may hold.
+const FILL_TIME: Duration = Duration::from_millis(3);
+/// QUIC queue floor, also the whole queue below roughly 44 Mbit/s.
+const MIN_FILL: usize = 16 * 1024;
+/// How often the send rate is sampled.
+const RATE_WINDOW: Duration = Duration::from_millis(10);
+/// Wait while QUIC holds more than the fill limit. Shorter than `FILL_TIME`,
+/// so the queue cannot drain dry while the scheduler sleeps.
+const FILL_POLL: Duration = Duration::from_millis(1);
 static BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8 * MAX_BYTES)));
 
 pub(crate) struct Sender {
@@ -120,6 +131,10 @@ async fn run_sender(
     stats: Arc<ForwardMetrics>,
 ) {
     let mut queue = Queue::new(Arc::clone(&stats));
+    let mut fill = QuicFill::new(
+        crate::transport::datagram_send_buffer_size(crate::config::QuicEngine::FqCodel),
+        Instant::now(),
+    );
     'worker: loop {
         if rx.is_closed() {
             break;
@@ -149,8 +164,9 @@ async fn run_sender(
             let Some(packet) = queue.dequeue(Instant::now()) else {
                 break;
             };
-            match send_packet(&conn, &mut rx, &mut queue, &packet, &active).await {
+            match send_packet(&conn, &mut rx, &mut queue, &mut fill, &packet, &active).await {
                 Ok(SendOutcome::Sent) => {
+                    fill.record(packet.bytes, Instant::now());
                     stats.record_tx(packet.ip_len);
                     activity.touch();
                 }
@@ -188,18 +204,50 @@ async fn send_packet(
     conn: &Connection,
     rx: &mut Receiver<Packet>,
     queue: &mut Queue,
+    fill: &mut QuicFill,
     packet: &Packet,
     active: &AtomicBool,
 ) -> Result<SendOutcome, DropReason> {
-    if !active.load(Ordering::Acquire) {
-        return Ok(SendOutcome::Standby);
-    }
     let frames = packet.encoded.datagrams();
-    if conn.datagram_send_buffer_space() >= packet.bytes {
-        return match conn.send_many_datagrams(frames) {
-            Ok(n) if n == frames.len() => Ok(SendOutcome::Sent),
-            _ => Err(DropReason::SendFailure),
-        };
+    loop {
+        if !active.load(Ordering::Acquire) {
+            return Ok(SendOutcome::Standby);
+        }
+        let space = conn.datagram_send_buffer_space();
+        let queued = fill.capacity.saturating_sub(space);
+        if queued + packet.bytes <= fill.limit() {
+            return match conn.send_many_datagrams(frames) {
+                Ok(n) if n == frames.len() => Ok(SendOutcome::Sent),
+                _ => Err(DropReason::SendFailure),
+            };
+        }
+        // A packet larger than the limit still goes out once QUIC is idle.
+        if queued == 0 || space < packet.bytes {
+            break;
+        }
+        // QUIC has room but already holds enough: keep the backlog here,
+        // classifying arrivals, until it drains below the limit.
+        let pause = tokio::time::sleep(FILL_POLL);
+        tokio::pin!(pause);
+        let mut incoming_batch = 0;
+        loop {
+            tokio::select! {
+                biased;
+                _ = conn.closed() => return Err(DropReason::NoPeer),
+                _ = &mut pause => break,
+                incoming = rx.recv() => {
+                    let Some(incoming) = incoming else {
+                        return Err(DropReason::NoPeer);
+                    };
+                    queue.enqueue(incoming);
+                    incoming_batch += 1;
+                    if incoming_batch == INGRESS_BATCH {
+                        incoming_batch = 0;
+                        tokio::task::yield_now().await;
+                    }
+                },
+            }
+        }
     }
     for frame in frames {
         let send = while_active(active, conn.send_datagram_wait(frame.clone()));
@@ -229,6 +277,51 @@ async fn send_packet(
         }
     }
     Ok(SendOutcome::Sent)
+}
+
+/// How full the scheduler lets QUIC's datagram queue get, from the rate the
+/// queue has been accepting packets.
+struct QuicFill {
+    capacity: usize,
+    window_start: Instant,
+    window_bytes: usize,
+    /// Bytes per second.
+    rate: f64,
+}
+
+impl QuicFill {
+    fn new(capacity: usize, now: Instant) -> Self {
+        Self {
+            capacity,
+            window_start: now,
+            window_bytes: 0,
+            rate: 0.0,
+        }
+    }
+
+    fn limit(&self) -> usize {
+        // Truncation is fine: the value is clamped to a byte count below.
+        let bytes = (self.rate * FILL_TIME.as_secs_f64()) as usize;
+        bytes.clamp(MIN_FILL, self.capacity.max(MIN_FILL))
+    }
+
+    fn record(&mut self, bytes: usize, now: Instant) {
+        self.window_bytes += bytes;
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed < RATE_WINDOW {
+            return;
+        }
+        let sample = self.window_bytes as f64 / elapsed.as_secs_f64();
+        // Follow increases at once; halve per window otherwise, and forget the
+        // old rate after an idle gap so a slow link is not overfilled.
+        self.rate = if elapsed > RATE_WINDOW * 10 {
+            sample
+        } else {
+            sample.max(self.rate / 2.0)
+        };
+        self.window_start = now;
+        self.window_bytes = 0;
+    }
 }
 
 async fn while_active<T>(active: &AtomicBool, send: impl Future<Output = T>) -> Option<T> {
@@ -742,6 +835,27 @@ mod tests {
         assert_eq!(queue.dequeue(now).unwrap().bucket, 1);
         assert_eq!(backlog.load(Ordering::Relaxed), 0);
         drop(queue);
+    }
+
+    #[test]
+    fn quic_fill_scales_with_send_rate_and_forgets_it_when_idle() {
+        let start = Instant::now();
+        let mut fill = QuicFill::new(256 * 1024, start);
+        assert_eq!(fill.limit(), MIN_FILL);
+
+        // 1 MB per 10 ms is 100 MB/s: 3 ms of that is 300 KB, capped at capacity.
+        fill.record(1_000_000, start + RATE_WINDOW);
+        assert_eq!(fill.limit(), 256 * 1024);
+
+        // 25 KB per 10 ms is 2.5 MB/s, below the floor; the old rate halves first.
+        fill.record(25_000, start + RATE_WINDOW * 2);
+        assert_eq!(fill.limit(), 150_000);
+        fill.record(25_000, start + RATE_WINDOW * 3);
+        assert_eq!(fill.limit(), 75_000);
+
+        // After an idle gap the old rate no longer counts.
+        fill.record(25_000, start + RATE_WINDOW * 20);
+        assert_eq!(fill.limit(), MIN_FILL);
     }
 
     #[test]
