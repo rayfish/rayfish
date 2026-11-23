@@ -96,6 +96,7 @@ pub fn apply_global(cfg: &mut AppConfig, key: GlobalKey, value: &str, replace: b
                     .map_err(|_| anyhow::anyhow!("QUIC engine must be standalone or fq-codel"))?
             }
         }
+        GlobalKey::MeshOffload => cfg.mesh_offload = parse_bool(value, true)?,
         GlobalKey::QuicWindowMib => {
             cfg.quic_window_mib = if value.trim().is_empty() {
                 Default::default()
@@ -254,6 +255,7 @@ pub fn render_global(cfg: &AppConfig, key: GlobalKey) -> String {
         GlobalKey::Mdns => on_off(cfg.mdns_enabled),
         GlobalKey::Dns => cfg.dns_mode.as_ref().to_string(),
         GlobalKey::QuicEngine => cfg.quic_engine.as_ref().to_string(),
+        GlobalKey::MeshOffload => on_off(cfg.mesh_offload),
         GlobalKey::TcpCongestion => cfg.tcp_congestion.as_ref().to_string(),
         GlobalKey::QuicWindowMib => cfg.quic_window_mib.to_string(),
         GlobalKey::AutoUpdate => on_off(cfg.auto_update),
@@ -689,6 +691,25 @@ mod tests {
         assert_eq!(cfg.tcp_congestion, TcpCongestion::Bbr);
         apply_global(&mut cfg, GlobalKey::TcpCongestion, "", false).unwrap();
         assert_eq!(cfg.tcp_congestion, TcpCongestion::System);
+    }
+
+    #[test]
+    fn mesh_offload_defaults_on_and_persists_off() {
+        let key = GlobalKey::MeshOffload;
+        let mut cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(render_global(&cfg, key), "on");
+
+        apply_global(&mut cfg, key, "off", false).unwrap();
+        let persisted = toml::to_string(&cfg).unwrap();
+        let mut cfg: AppConfig = toml::from_str(&persisted).unwrap();
+        assert_eq!(render_global(&cfg, key), "off");
+        assert_eq!(cfg.mesh_quic_offload_enabled(), !cfg!(target_os = "linux"));
+        assert!(apply_global(&mut cfg, key, "invalid", false).is_err());
+        assert_eq!(render_global(&cfg, key), "off");
+
+        apply_global(&mut cfg, key, "", false).unwrap();
+        assert_eq!(render_global(&cfg, key), "on");
+        assert!(cfg.mesh_quic_offload_enabled());
     }
 
     #[test]

@@ -309,6 +309,7 @@ impl Daemon {
                 | GlobalKey::AutoUpdate
                 | GlobalKey::OnDemand
                 | GlobalKey::QuicEngine
+                | GlobalKey::MeshOffload
                 | GlobalKey::TcpCongestion
                 | GlobalKey::QuicWindowMib
                 | GlobalKey::DownloadDir

@@ -740,6 +740,8 @@ pub struct Daemon {
     /// startup; when set, `run_daemon` spawns the periodic update task. Echoed
     /// back in `ray status`.
     auto_update: bool,
+    #[cfg(target_os = "linux")]
+    linux_mesh_offload: bool,
     /// Handles for the packet-forwarding tasks spawned by
     /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
@@ -1329,6 +1331,10 @@ fn global_set_message(cfg: &AppConfig, key: GlobalKey, reset: bool) -> String {
         },
         GlobalKey::QuicEngine => {
             format!("QUIC engine set to {}. {restart}", cfg.quic_engine.as_ref())
+        }
+        GlobalKey::MeshOffload => {
+            let value = config::settings::render_global(cfg, key);
+            format!("Linux mesh offload set to {value}. {restart}")
         }
         GlobalKey::TcpCongestion => {
             format!(

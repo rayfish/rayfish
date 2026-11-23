@@ -230,6 +230,14 @@ enum MacTunWriter {
 /// shares the host, and the overlay carries no IPv4 to put there.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
+    create_with_offload(v6, true).await
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) async fn create_with_offload(
+    v6: Ipv6Addr,
+    _linux_offload: bool,
+) -> Result<(TunReader, TunWriter, String)> {
     // `ipv6(v6, 128)` assigns just our own address (a /128, no connected route).
     // `enable(true)` brings the link up at creation (as the old `.up()` did);
     // `set_link_up` and the peer-range route helpers still run later on
@@ -249,9 +257,7 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
     // datagrams. Keep it paired with mesh QUIC segmentation offload: without
     // GSO, cheap TUN reads outrun one-datagram sends and the standalone
     // engine's datagram queue becomes a standing delay.
-    let builder = builder
-        .name(LINUX_TUN_NAME)
-        .offload(crate::transport::MESH_QUIC_SEGMENTATION_OFFLOAD);
+    let builder = builder.name(LINUX_TUN_NAME).offload(_linux_offload);
     #[cfg(target_os = "windows")]
     let builder = builder
         .mtu_v6(MIN_TUN_MTU)
@@ -282,7 +288,7 @@ pub async fn create(v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
         mtu,
         tun_tcp_offload = device.tcp_gso(),
         tun_udp_offload = device.udp_gso(),
-        mesh_quic_segmentation_offload = crate::transport::MESH_QUIC_SEGMENTATION_OFFLOAD,
+        mesh_quic_segmentation_offload = _linux_offload,
         "TUN device created"
     );
     #[cfg(not(target_os = "linux"))]

@@ -1034,6 +1034,7 @@ mod tests {
         assert_eq!(domain("firewall.default-in"), ["allow", "deny"]);
         assert_eq!(domain("quic-engine"), ["standalone", "fq-codel"]);
         assert_eq!(domain("tcp-congestion"), ["system", "bbr"]);
+        assert_eq!(domain("mesh-offload"), ["on", "off"]);
         assert_eq!(domain("inbound"), ["anyone", "known", "none"]);
 
         // Free-form values: a trailing parenthesis that is prose, not a domain.

@@ -743,6 +743,9 @@ pub struct AppConfig {
         deserialize_with = "deserialize_quic_engine"
     )]
     pub quic_engine: QuicEngine,
+    /// Enable Linux TUN offload and mesh QUIC UDP segmentation together.
+    #[serde(default = "default_true")]
+    pub mesh_offload: bool,
     /// Linux overlay TCP policy. BBR falls back to the system policy if unavailable.
     #[serde(default)]
     pub tcp_congestion: TcpCongestion,
@@ -899,6 +902,7 @@ impl Default for AppConfig {
             dns_upstreams: ServerOverride::default(),
             dns_mode: DnsMode::default(),
             quic_engine: QuicEngine::default(),
+            mesh_offload: true,
             tcp_congestion: TcpCongestion::default(),
             quic_window_mib: QuicWindowMiB::default(),
             endpoint_hints: Vec::new(),
@@ -932,6 +936,10 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub(crate) fn mesh_quic_offload_enabled(&self) -> bool {
+        !cfg!(target_os = "linux") || self.mesh_offload
+    }
+
     /// Idle timeout for on-demand teardown, falling back to
     /// [`DEFAULT_IDLE_TIMEOUT_SECS`] when unset.
     pub fn idle_timeout(&self) -> Duration {

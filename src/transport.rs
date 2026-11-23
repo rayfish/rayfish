@@ -366,6 +366,7 @@ pub(crate) async fn create_endpoint_with_discovery(
         warm_lookup: &warm_lookup,
         quic_engine: settings.quic_engine,
         quic_window: settings.quic_window_mib.bytes(),
+        mesh_offload: settings.mesh_quic_offload_enabled(),
     };
     let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
@@ -402,6 +403,7 @@ struct BindConfig<'a> {
     warm_lookup: &'a WarmLookup,
     quic_engine: QuicEngine,
     quic_window: u64,
+    mesh_offload: bool,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -428,6 +430,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         warm_lookup,
         quic_engine,
         quic_window,
+        mesh_offload,
     } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -455,7 +458,11 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //     bounded send buffer. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
         // Both forwarding engines use loss-tolerant congestion control.
-        .transport_config(quic_transport_config_with_window(quic_engine, quic_window))
+        .transport_config(quic_transport_config_with_window(
+            quic_engine,
+            quic_window,
+            mesh_offload,
+        ))
         // Hide overlay and unroutable addresses from iroh's view of the local
         // network, so a mesh IP bound on the TUN is never published, offered as a
         // holepunch candidate, or kept as a path after a network change (and so
@@ -735,9 +742,6 @@ const STANDALONE_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 
-/// Mesh QUIC transmit policy, independent of TUN offload.
-pub(crate) const MESH_QUIC_SEGMENTATION_OFFLOAD: bool = true;
-
 /// Keep FQ-CoDel's backlog in its scheduler and allow standalone traffic bursts.
 pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
     match engine {
@@ -754,13 +758,21 @@ pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
 #[cfg(test)]
 pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
-    quic_transport_config_with_window(engine, crate::config::QuicWindowMiB::default().bytes())
+    quic_transport_config_with_window(
+        engine,
+        crate::config::QuicWindowMiB::default().bytes(),
+        AppConfig::default().mesh_quic_offload_enabled(),
+    )
 }
 
-fn quic_transport_config_with_window(engine: QuicEngine, max_window: u64) -> QuicTransportConfig {
+fn quic_transport_config_with_window(
+    engine: QuicEngine,
+    max_window: u64,
+    mesh_offload: bool,
+) -> QuicTransportConfig {
     tracing::info!(
         engine = engine.as_ref(),
-        mesh_quic_segmentation_offload = MESH_QUIC_SEGMENTATION_OFFLOAD,
+        mesh_quic_segmentation_offload = mesh_offload,
         max_window,
         "mesh QUIC transport config"
     );
@@ -780,7 +792,7 @@ fn quic_transport_config_with_window(engine: QuicEngine, max_window: u64) -> Qui
         // offload. noq-udp then drops the socket to one datagram per send, and
         // the patched iroh reads that limit on every transmit, so open
         // connections fall back too (n0-computer/iroh#4555).
-        .enable_segmentation_offload(MESH_QUIC_SEGMENTATION_OFFLOAD)
+        .enable_segmentation_offload(mesh_offload)
         // When this bounded queue fills, noQ discards older datagrams rather
         // than making the forwarding path wait behind stale traffic.
         .datagram_send_buffer_size(datagram_send_buffer_size(engine))
@@ -1254,6 +1266,7 @@ mod tests {
             warm_lookup: &lookup,
             quic_engine: QuicEngine::default(),
             quic_window: crate::config::QuicWindowMiB::default().bytes(),
+            mesh_offload: AppConfig::default().mesh_quic_offload_enabled(),
         };
         timeout(Duration::from_secs(5), async {
             let endpoint = bind_endpoint(&bind, 0).await.unwrap();

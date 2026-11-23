@@ -81,9 +81,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(embedded_tun))]
     {
         let my_ipv6 = derive_ipv6(&daemon.transport.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) = tun::create(my_ipv6)
-            .await
-            .context("failed to create TUN device")?;
+        #[cfg(target_os = "linux")]
+        let device = tun::create_with_offload(my_ipv6, daemon.linux_mesh_offload);
+        #[cfg(not(target_os = "linux"))]
+        let device = tun::create(my_ipv6);
+        let (tun_reader, tun_writer, tun_name) =
+            device.await.context("failed to create TUN device")?;
         daemon.registry.tun_name.store(Arc::new(tun_name));
         daemon.fatal.arm();
         daemon.attach_tun(tun_reader, tun_writer).await;
@@ -337,6 +340,9 @@ async fn build_daemon_inner(
     let (ep, warm_lookup, mainline) =
         transport::create_endpoint_with_discovery(key.clone(), alpns, use_tor, &app_config).await?;
     *endpoint_out = Some(ep.clone());
+    stats
+        .mesh_quic_segmentation_offload_enabled
+        .set(i64::from(app_config.mesh_quic_offload_enabled()));
 
     // Built before the blob store below, because the provider event pump that
     // feeds it (a bit further down, once `blobs_proto` exists) needs the
@@ -803,6 +809,8 @@ async fn build_daemon_inner(
         protocol_router: Arc::clone(&protocol_router),
         mdns,
         auto_update,
+        #[cfg(target_os = "linux")]
+        linux_mesh_offload: app_config.mesh_offload,
         tun_tasks: Mutex::new(None),
         #[cfg(target_os = "macos")]
         external_exit_tun: AtomicBool::new(false),
