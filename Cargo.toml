@@ -113,7 +113,7 @@ mime_guess = "2"
 rand = "0.10"
 rmp-serde = "1"
 libc = "0.2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
@@ -197,7 +197,7 @@ harness = false
 # dependency that can't cross-compile there. The desktop TUN code in `src/tun.rs`
 # is likewise `#[cfg(not(target_os = "android"))]`.
 [target.'cfg(not(target_os = "android"))'.dependencies]
-tun-rs = { version = "2", features = ["async", "async_framed"] }
+tun-rs = { version = "2.8.18", features = ["async", "async_framed"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hyper = { version = "1", features = ["client", "server", "http1"], optional = true }
@@ -264,4 +264,3 @@ iroh-relay = { git = "https://github.com/rayfish/iroh", rev = "8640ea3bfbe8e10f6
 # configure-socket hook (n0-computer/net-tools#182) plus illumos support.
 netdev = { git = "https://github.com/extrowerk/netdev.git", branch = "illumos" }
 netwatch = { git = "https://github.com/extrowerk/net-tools", branch = "illumos-0.19" }
-tun-rs = { git = "https://github.com/extrowerk/tun-rs", branch = "illumos" }

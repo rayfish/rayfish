@@ -224,7 +224,8 @@ mod linux {
                 .open(self.dir.join("trace_pipe"))
                 .map_err(|e| debug!(error = %e, "listen events: cannot open the trace pipe"))
                 .ok()?;
-            AsyncFd::new(file)
+            // SAFETY: the File owns the descriptor and stays in the AsyncFd until drop.
+            unsafe { AsyncFd::register(file) }
                 .map_err(|e| debug!(error = %e, "listen events: cannot watch the trace pipe"))
                 .ok()
         }

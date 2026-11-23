@@ -135,7 +135,8 @@ pub(super) struct Reader {
 impl Reader {
     fn new(fd: OwnedFd, syscalls: &'static BatchSyscalls) -> io::Result<Self> {
         Ok(Self {
-            fd: AsyncFd::new(fd)?,
+            // SAFETY: the OwnedFd keeps the descriptor open and is never replaced.
+            fd: unsafe { AsyncFd::register(fd) }?,
             syscalls,
             buffers: (0..BATCH_SIZE)
                 .map(|_| BytesMut::zeroed(TUN_MTU as usize))
@@ -203,7 +204,8 @@ pub(super) struct Writer {
 impl Writer {
     fn new(fd: OwnedFd, syscalls: &'static BatchSyscalls) -> io::Result<Self> {
         Ok(Self {
-            fd: AsyncFd::new(fd)?,
+            // SAFETY: the OwnedFd keeps the descriptor open and is never replaced.
+            fd: unsafe { AsyncFd::register(fd) }?,
             syscalls,
         })
     }

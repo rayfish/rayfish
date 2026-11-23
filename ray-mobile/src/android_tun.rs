@@ -69,7 +69,8 @@ impl AndroidTunReader {
     pub fn new(fd: OwnedFd) -> Result<Self> {
         set_nonblocking(fd.as_raw_fd())?;
         Ok(Self {
-            fd: AsyncFd::new(fd)?,
+            // SAFETY: the OwnedFd keeps the descriptor open and is never replaced.
+            fd: unsafe { AsyncFd::register(fd) }.map_err(io::Error::from)?,
             buffer: BytesMut::with_capacity(RECEIVE_POOL_CHUNK),
         })
     }
@@ -123,8 +124,10 @@ pub struct AndroidTunWriter {
 
 impl AndroidTunWriter {
     pub fn new(fd: RawFd) -> Result<Self> {
+        let fd = dup_nonblocking(fd)?;
         Ok(Self {
-            fd: AsyncFd::new(dup_nonblocking(fd)?)?,
+            // SAFETY: the OwnedFd keeps the descriptor open and is never replaced.
+            fd: unsafe { AsyncFd::register(fd) }.map_err(io::Error::from)?,
         })
     }
 }
