@@ -257,6 +257,8 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [patch.crates-io]
+# Deliver the first refused Linux UDP GSO batch before using the live limit.
+noq-udp = { git = "https://github.com/rayfish/noq", rev = "e79859505f58628ce1e7d3403c264611dd0bccde" }
 # iroh 1.3 from the fork's `rayfish` branch, which merges these PR branches:
 # the fork's network monitor branch (replaces PR 4397, the direct address filter)
 # https://github.com/n0-computer/iroh/pull/4406 (socket configuration hook)
