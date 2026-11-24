@@ -34,6 +34,8 @@ enum Reply {
     /// Stored the offer and acked it.
     Stored,
     Refused(String),
+    /// No room for us in the recipient's inbox yet: retried by the sweep.
+    Deferred(String),
     /// Shares no ALPN with us: it predates invite delivery.
     TooOld,
 }
@@ -155,10 +157,12 @@ impl ConnectService {
             };
             let (mut send, mut recv) = conn.open_bi().await?;
             control::send_framed(&mut send, &offer).await?;
-            // A refusal is terminal; a missing acknowledgment can be retried.
+            // A refusal is terminal; a deferral or a missing acknowledgment
+            // is retried.
             match control::recv_framed::<control::ConnectMsg>(&mut recv).await? {
                 control::ConnectMsg::Pending => Ok(Reply::Stored),
                 control::ConnectMsg::Denied { reason } => Ok(Reply::Refused(reason)),
+                control::ConnectMsg::Deferred { reason } => Ok(Reply::Deferred(reason)),
                 _ => anyhow::bail!("recipient did not acknowledge"),
             }
         })
@@ -188,6 +192,13 @@ impl ConnectService {
                     "{} runs an older Rayfish that cannot receive invites; send them this code instead: {}",
                     recipient.fmt_short(),
                     delivery.code.as_str()
+                )));
+            }
+            Ok(Ok(Reply::Deferred(reason))) => {
+                return Ok(DeliveryOutcome::Queued(format!(
+                    "{} has not taken invite {} yet ({reason}); retried until it expires",
+                    recipient.fmt_short(),
+                    invite.id
                 )));
             }
             _ => {

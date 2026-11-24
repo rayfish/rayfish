@@ -713,7 +713,12 @@ impl ConnectService {
                         .await
                     {
                         Ok(()) => control::ConnectMsg::Pending,
-                        Err(reason) => control::ConnectMsg::Denied { reason },
+                        Err(super::invite_inbox::OfferRefusal::Later(reason)) => {
+                            control::ConnectMsg::Deferred { reason }
+                        }
+                        Err(super::invite_inbox::OfferRefusal::Denied(reason)) => {
+                            control::ConnectMsg::Denied { reason }
+                        }
                     };
                     if control::send_framed(&mut send, &reply).await.is_ok() {
                         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;

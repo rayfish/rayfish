@@ -1517,6 +1517,46 @@ async fn sweep_never_mints() {
     sender.close().await;
 }
 
+/// A stranger already holding its one pending offer is told to retry, not
+/// refused: the invite stays queued for the sweep.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_over_the_stranger_cap_is_deferred_not_refused() {
+    let env = TestConfigDir::new();
+    let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+    let (sender, connect, _) = delivering_service(env.dir.path(), lookup.clone()).await;
+    let (receiver, inbox) = receiving_service(env.dir.path()).await;
+    lookup.add_endpoint_info(receiver.addr());
+    // The sender's one stranger slot is already taken.
+    assert!(
+        inbox
+            .receive_offer(
+                sender.id(),
+                inbound::Inbound::Stranger,
+                sample_net(),
+                invite_from(sender.id())
+            )
+            .await
+    );
+    let server = tokio::spawn({
+        let inbox = Arc::clone(&inbox);
+        let receiver = receiver.clone();
+        async move {
+            let conn = receiver.accept().await.unwrap().await.unwrap();
+            inbox.accept_connect_request(conn).await;
+        }
+    });
+    let message = reply_text(connect.deliver_invite("sample-net", receiver.id()).await);
+    server.await.unwrap();
+    assert!(message.contains("has not taken"), "{message}");
+    assert!(message.contains("too many pending"), "{message}");
+    let store = crate::invite::InviteStore::load("sample-net").unwrap();
+    assert_eq!(store.pending_deliveries(), [receiver.id()]);
+    assert_eq!(invitations_of(&inbox).await.len(), 1);
+    sender.close().await;
+    receiver.close().await;
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_then_online_then_delivered_without_duplicates() {

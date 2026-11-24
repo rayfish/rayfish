@@ -166,13 +166,17 @@ pub enum ConnectMsg {
     Denied { reason: String },
     /// Private invitation from a network's coordinator. Receipt only stores it;
     /// joining needs the recipient's explicit accept. Acked with `Pending`;
-    /// a refused offer gets `Denied`. Sent only on `rayfish/invite/1`, which
+    /// a refused offer gets `Denied`, a postponed one `Deferred`. Sent only on `rayfish/invite/1`, which
     /// older peers lack, so they fail the handshake rather than the decode.
     InviteOffer {
         /// The sender's label for the network, display only.
         network: NetworkName,
         code: InviteCode,
     },
+    /// B -> A: offer not stored yet (no room for this sender), keep retrying.
+    /// Replies only to `InviteOffer`. An older sender cannot decode it, which
+    /// it already treats as a missing ack and retries the same way.
+    Deferred { reason: String },
 }
 
 /// Stable identity for one offered file, retained across delivery retries.
@@ -971,6 +975,33 @@ mod tests {
             rmp_serde::from_slice::<OldConnectMsg>(&pending).unwrap(),
             OldConnectMsg::Pending
         );
+        assert!(rmp_serde::from_slice::<OldConnectMsg>(&body).is_err());
+    }
+
+    /// An older sender cannot decode `Deferred`. Its delivery treats a reply
+    /// it cannot read as a missing ack and retries, never as a refusal.
+    #[test]
+    fn deferred_roundtrips_and_fails_to_decode_in_older_builds() {
+        let deferred = ConnectMsg::Deferred {
+            reason: "inbox is full".to_string(),
+        };
+        let body = rmp_serde::to_vec(&deferred).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<ConnectMsg>(&body).unwrap(),
+            deferred
+        );
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        enum OldConnectMsg {
+            Pending,
+            Denied {
+                reason: String,
+            },
+            InviteOffer {
+                network: NetworkName,
+                code: InviteCode,
+            },
+        }
         assert!(rmp_serde::from_slice::<OldConnectMsg>(&body).is_err());
     }
 

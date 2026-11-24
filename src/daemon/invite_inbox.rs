@@ -23,13 +23,37 @@ use ray_proto::ipc::{InvitationInfo, InvitationStatus, MachineHostname, NetworkN
 /// An entry ages out this long after it arrived, answered or not: as long as
 /// a delivered invite lives.
 const INBOX_TTL_SECS: u64 = crate::invite::DELIVERY_TTL.as_secs();
-/// Pending offers one known sender may hold.
-const MAX_PENDING_KNOWN: usize = 8;
-/// Pending offers one stranger may hold.
-const MAX_PENDING_STRANGER: usize = 2;
+/// Pending offers one known sender may hold: more networks than anyone runs,
+/// so it only stops one member of a shared network from flooding the inbox.
+const MAX_PENDING_KNOWN: usize = 64;
+/// Pending offers one stranger may hold. One is enough to make contact; the
+/// rest arrive on the sender's retries once the first is accepted.
+const MAX_PENDING_STRANGER: usize = 1;
 /// Pending offers all strangers may hold together. A stranger beyond it
 /// evicts the oldest pending stranger offer, never a known sender's.
 const MAX_PENDING_STRANGERS: usize = 16;
+/// Pending offers the inbox holds in all. A known sender beyond it evicts the
+/// oldest stranger offer; with none left, the offer waits for room.
+const MAX_PENDING: usize = 256;
+
+/// Why an offer was not stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OfferRefusal {
+    /// Not now: no room for this sender, or the inbox could not be saved.
+    /// The sender keeps retrying, so the offer lands once the recipient has
+    /// room or knows the sender.
+    Later(String),
+    /// Bad or unwanted. The sender stops offering it.
+    Denied(String),
+}
+
+impl std::fmt::Display for OfferRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Later(reason) | Self::Denied(reason) => f.write_str(reason),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct ReceivedInvitation {
@@ -119,12 +143,11 @@ impl Inbox {
     }
 
     /// Store an offer. `Ok(true)` stored, `Ok(false)` already held (a retry
-    /// after a lost ack), `Err` refused.
-    fn receive(&mut self, offer: ReceivedInvitation, now: u64) -> Result<bool> {
-        anyhow::ensure!(
-            crate::hostname::is_valid_hostname(offer.network.as_ref()),
-            "invalid network label"
-        );
+    /// after a lost ack).
+    fn receive(&mut self, offer: ReceivedInvitation, now: u64) -> Result<bool, OfferRefusal> {
+        if !crate::hostname::is_valid_hostname(offer.network.as_ref()) {
+            return Err(OfferRefusal::Denied("invalid network label".to_string()));
+        }
         self.prune(now);
         if self.invitations.iter().any(|i| i.id == offer.id) {
             return Ok(false);
@@ -139,26 +162,36 @@ impl Inbox {
         } else {
             MAX_PENDING_KNOWN
         };
-        anyhow::ensure!(
-            from_sender < cap,
-            "too many pending invitations from this sender"
-        );
-        if offer.stranger {
-            let strangers = self
+        if from_sender >= cap {
+            return Err(OfferRefusal::Later(
+                "too many pending invitations from this sender".to_string(),
+            ));
+        }
+        let pending = |inbox: &Self, strangers_only: bool| {
+            inbox
                 .invitations
                 .iter()
-                .filter(|i| i.is_pending() && i.stranger)
-                .count();
-            if strangers >= MAX_PENDING_STRANGERS
-                && let Some(oldest) = self
-                    .invitations
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, i)| i.is_pending() && i.stranger)
-                    .min_by_key(|(_, i)| i.received)
-                    .map(|(index, _)| index)
-            {
-                self.invitations.remove(oldest);
+                .filter(|i| i.is_pending() && (i.stranger || !strangers_only))
+                .count()
+        };
+        if (offer.stranger && pending(self, true) >= MAX_PENDING_STRANGERS)
+            || pending(self, false) >= MAX_PENDING
+        {
+            // Make room by dropping the oldest stranger offer. Only strangers
+            // are evicted, so a full inbox of known offers turns the newcomer
+            // away instead.
+            let oldest = self
+                .invitations
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.is_pending() && i.stranger)
+                .min_by_key(|(_, i)| i.received)
+                .map(|(index, _)| index);
+            match oldest {
+                Some(index) => {
+                    self.invitations.remove(index);
+                }
+                None => return Err(OfferRefusal::Later("invitation inbox is full".to_string())),
             }
         }
         self.invitations.push(offer);
@@ -222,17 +255,21 @@ impl ConnectService {
             .is_ok()
     }
 
-    /// Store an offer or return the reason the sender must stop offering it.
+    /// Store an offer, or say why not and whether the sender should retry.
     pub(super) async fn receive_offer_result(
         &self,
         remote: EndpointId,
         class: Inbound,
         network: NetworkName,
         code: InviteCode,
-    ) -> Result<(), String> {
+    ) -> Result<(), OfferRefusal> {
         match code.decode() {
             Ok(decoded) if decoded.coordinator == remote => {}
-            _ => return Err("invalid invitation or coordinator".to_string()),
+            _ => {
+                return Err(OfferRefusal::Denied(
+                    "invalid invitation or coordinator".to_string(),
+                ));
+            }
         }
         let offer = ReceivedInvitation::new(
             network,
@@ -241,18 +278,28 @@ impl ConnectService {
             now_secs(),
             class == Inbound::Stranger,
         );
-        self.edit_inbox(|inbox| {
-            if inbox
-                .invitations
-                .iter()
-                .any(|entry| entry.id == offer.id && entry.status == InvitationStatus::Declined)
-            {
-                anyhow::bail!("recipient declined the invitation");
-            }
-            inbox.receive(offer, now_secs()).map(|_| ())
-        })
-        .await
-        .map_err(|error| error.to_string())
+        let mut refusal = None;
+        let edited = self
+            .edit_inbox(|inbox| {
+                let declined = inbox.invitations.iter().any(|entry| {
+                    entry.id == offer.id && entry.status == InvitationStatus::Declined
+                });
+                let received = if declined {
+                    Err(OfferRefusal::Denied(
+                        "recipient declined the invitation".to_string(),
+                    ))
+                } else {
+                    inbox.receive(offer, now_secs())
+                };
+                // The refusal still lets the prune be saved.
+                refusal = received.err();
+                Ok(())
+            })
+            .await;
+        if let Err(error) = edited {
+            return Err(OfferRefusal::Later(error.to_string()));
+        }
+        refusal.map_or(Ok(()), Err)
     }
 
     pub(super) async fn list_invitations(&self) -> OpResult<Vec<InvitationInfo>> {
@@ -425,11 +472,17 @@ mod tests {
         for n in 0..MAX_PENDING_KNOWN as u8 {
             assert!(inbox.receive(offer_from(1, n, false, 1000), 1000).unwrap());
         }
-        assert!(inbox.receive(offer_from(1, 99, false, 1000), 1000).is_err());
+        assert!(matches!(
+            inbox.receive(offer_from(1, 99, false, 1000), 1000),
+            Err(OfferRefusal::Later(_))
+        ));
         for n in 0..MAX_PENDING_STRANGER as u8 {
             assert!(inbox.receive(offer_from(2, n, true, 1000), 1000).unwrap());
         }
-        assert!(inbox.receive(offer_from(2, 99, true, 1000), 1000).is_err());
+        assert!(matches!(
+            inbox.receive(offer_from(2, 99, true, 1000), 1000),
+            Err(OfferRefusal::Later(_))
+        ));
         // Fill the shared stranger slots, oldest first.
         for sender in 3..(3 + MAX_PENDING_STRANGERS as u8) {
             let received = 1000 + u64::from(sender);
@@ -446,6 +499,50 @@ mod tests {
             inbox.invitations.iter().filter(|i| !i.stranger).count(),
             MAX_PENDING_KNOWN
         );
+    }
+
+    /// The stranger cap counts the sender, not the flag on each entry: once
+    /// the sender is known, its next offer lands beside the stranger one.
+    #[test]
+    fn a_stranger_who_becomes_known_gets_the_known_cap() {
+        let mut inbox = Inbox::default();
+        assert!(inbox.receive(offer_from(1, 0, true, 1000), 1000).unwrap());
+        assert!(inbox.receive(offer_from(1, 1, true, 1000), 1000).is_err());
+        assert!(inbox.receive(offer_from(1, 1, false, 1001), 1001).unwrap());
+    }
+
+    /// A full inbox evicts strangers for a known sender, and turns the known
+    /// sender away for later only when no stranger is left.
+    #[test]
+    fn a_full_inbox_evicts_strangers_then_defers() {
+        let mut inbox = Inbox::default();
+        inbox.receive(offer_from(200, 0, true, 999), 999).unwrap();
+        let mut sender = 1u8;
+        while inbox.invitations.len() < MAX_PENDING {
+            for n in 0..MAX_PENDING_KNOWN as u8 {
+                if inbox.invitations.len() == MAX_PENDING {
+                    break;
+                }
+                inbox
+                    .receive(offer_from(sender, n, false, 1000), 1000)
+                    .unwrap();
+            }
+            sender += 1;
+        }
+        assert!(
+            inbox
+                .receive(offer_from(sender, 0, false, 1001), 1001)
+                .unwrap()
+        );
+        assert!(inbox.invitations.iter().all(|i| !i.stranger));
+        assert_eq!(
+            inbox.receive(offer_from(sender, 1, false, 1001), 1001),
+            Err(OfferRefusal::Later("invitation inbox is full".to_string()))
+        );
+        assert!(matches!(
+            inbox.receive(offer_from(201, 0, true, 1001), 1001),
+            Err(OfferRefusal::Later(_))
+        ));
     }
 
     #[test]
@@ -495,7 +592,10 @@ mod tests {
         let mut inbox = Inbox::default();
         let mut offer = offer_from(1, 1, false, 1000);
         offer.network = NetworkName::new("not a label!".into());
-        assert!(inbox.receive(offer, 1000).is_err());
+        assert!(matches!(
+            inbox.receive(offer, 1000),
+            Err(OfferRefusal::Denied(_))
+        ));
     }
 
     #[test]
