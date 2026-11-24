@@ -1518,7 +1518,8 @@ async fn sweep_never_mints() {
 }
 
 /// A stranger already holding its one pending offer is told to retry, not
-/// refused: the invite stays queued for the sweep.
+/// refused: the invite stays queued, and the sweep delivers it once the two
+/// share a network.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_offer_over_the_stranger_cap_is_deferred_not_refused() {
@@ -1553,6 +1554,28 @@ async fn an_offer_over_the_stranger_cap_is_deferred_not_refused() {
     let store = crate::invite::InviteStore::load("sample-net").unwrap();
     assert_eq!(store.pending_deliveries(), [receiver.id()]);
     assert_eq!(invitations_of(&inbox).await.len(), 1);
+    // Once the two share a network, the sweep delivers the deferred invite.
+    hold_network(
+        &inbox.registry,
+        "shared-net",
+        NetworkRole::Member,
+        vec![roster_member(sender.id(), None)],
+        vec![],
+    );
+    let server = tokio::spawn({
+        let inbox = Arc::clone(&inbox);
+        let receiver = receiver.clone();
+        async move {
+            let conn = receiver.accept().await.unwrap().await.unwrap();
+            inbox.accept_connect_request(conn).await;
+        }
+    });
+    connect.sweep_deliveries(&CancellationToken::new()).await;
+    server.await.unwrap();
+    let store = crate::invite::InviteStore::load("sample-net").unwrap();
+    assert!(store.pending_deliveries().is_empty());
+    assert_eq!(store.list().len(), 1);
+    assert_eq!(invitations_of(&inbox).await.len(), 2);
     sender.close().await;
     receiver.close().await;
 }
