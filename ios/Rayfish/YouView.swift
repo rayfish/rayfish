@@ -23,6 +23,7 @@ struct YouView: View {
                 pairingCard
                 settings
                 identity
+                firewallCard
                 about
             }
             .padding(20)
@@ -177,6 +178,26 @@ struct YouView: View {
                 }
             }
             .padding(.top, 8)
+        }
+    }
+
+    private var firewallCard: some View {
+        SectionCard {
+            SectionLabel("Firewall")
+            NavigationLink {
+                FirewallView()
+            } label: {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        RowTitle("Mesh firewall")
+                        RowSubtitle("Default posture, general rules, and per-network policies")
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.system(size: 13)).foregroundStyle(Rf.faint)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
     }
 

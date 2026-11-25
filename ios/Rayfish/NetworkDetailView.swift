@@ -10,6 +10,7 @@ struct NetworkDetailView: View {
     @State private var editingHostname = false
     @State private var hostnameInput = ""
     @State private var addingRule = false
+    @State private var prefillPeer: String?
     @State private var sending = false
 
     var body: some View {
@@ -22,9 +23,16 @@ struct NetworkDetailView: View {
         }
         .rayfishPage()
         .task(id: name) {
-            // Quietly absent while the node is off, as on Android.
-            firewall = try? await model.tunnel.send(.firewall).firewall
+            await loadFirewall()
         }
+        .onChange(of: model.snapshot) { _, _ in
+            Task { await loadFirewall() }
+        }
+    }
+
+    private func loadFirewall() async {
+        // Quietly absent while the node is off, as on Android.
+        firewall = try? await model.tunnel.send(.firewall).firewall
     }
 
     private func content(_ network: NetworkDetail) -> some View {
@@ -53,7 +61,13 @@ struct NetworkDetailView: View {
                 peers(network)
                 PillButton("Send files") { sending = true }
                     .disabled(!model.snapshot.controlPlane || network.peers.isEmpty)
-                if let firewall { firewallCard(firewall, network: network) }
+                if let firewall {
+                    let pendingRules = FirewallRules.pending(forNetwork: network.name, in: firewall)
+                    if !pendingRules.isEmpty || network.pendingSuggestions > 0 {
+                        suggestionsCard(pendingRules, network: network)
+                    }
+                    firewallCard(firewall, network: network)
+                }
             }
             .padding(20)
         }
@@ -91,7 +105,7 @@ struct NetworkDetailView: View {
         }
         .sheet(item: $invite) { CodeSheet(code: $0) }
         .sheet(isPresented: $addingRule) {
-            AllowInboundSheet(network: network) { firewall = $0 }
+            AddFirewallRuleSheet(initialNetwork: network.name, prefillPeer: prefillPeer) { firewall = $0 }
         }
         .sheet(isPresented: $sending) { SendFilesSheet(peers: network.peers) }
     }
@@ -105,7 +119,7 @@ struct NetworkDetailView: View {
             ForEach(network.peers) { peer in
                 let domain = peer.domain(in: network)
                 Button {
-                    if let domain { model.copy(domain) }
+                    model.copy(domain ?? peer.ipv6)
                 } label: {
                     HStack(spacing: 8) {
                         Dot(color: peer.state.color, size: 6)
@@ -117,111 +131,138 @@ struct NetworkDetailView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(domain == nil)
+                .contextMenu {
+                    Button("Copy address") {
+                        model.copy(domain ?? peer.ipv6, toast: "Address copied")
+                    }
+                    Button("Add firewall rule") {
+                        prefillPeer = peer.nodeId
+                        addingRule = true
+                    }
+                }
             }
+        }
+    }
+
+    private func suggestionsCard(_ pendingRules: [FirewallRuleInfo], network: NetworkDetail) -> some View {
+        let count = max(Int(network.pendingSuggestions), pendingRules.count)
+        return SectionCard {
+            HStack(spacing: 8) {
+                Dot(color: Rf.amber, size: 8)
+                SectionLabel("Coordinator suggestions · \(count)").padding(.bottom, -8)
+            }
+            .padding(.bottom, 8)
+            Text("Suggested firewall rules for \(network.name). Review before accepting.")
+                .font(Rf.text(13)).foregroundStyle(Rf.muted)
+            ForEach(Array(pendingRules.enumerated()), id: \.offset) { offset, rule in
+                FirewallRuleRow(
+                    item: IndexedFirewallRule(index: UInt32(offset), rule: rule),
+                    networks: model.snapshot.networks,
+                    scopedNetwork: network.name,
+                    onRemove: nil
+                )
+            }
+            HStack(spacing: 12) {
+                LinkButton("Accept all", color: Rf.emerald) {
+                    Task {
+                        if let updated = await model.perform(
+                            .acceptFirewallSuggestions(network: network.name),
+                            success: "Accepted rules for \(network.name)"
+                        )?.firewall {
+                            firewall = updated
+                        }
+                    }
+                }
+                LinkButton("Dismiss") {
+                    Task {
+                        if let updated = await model.perform(
+                            .denyFirewallSuggestions(network: network.name),
+                            success: "Dismissed rules for \(network.name)"
+                        )?.firewall {
+                            firewall = updated
+                        }
+                    }
+                }
+            }
+            .padding(.top, 8)
         }
     }
 
     private func firewallCard(_ firewall: FirewallStateInfo, network: NetworkDetail) -> some View {
-        SectionCard {
-            SectionLabel("Firewall")
-            HStack {
-                Text("Inbound default").font(Rf.text()).foregroundStyle(Rf.muted)
-                Spacer()
-                LinkButton("\(firewall.defaultInbound) ✎") {
-                    let next = firewall.defaultInbound == "deny" ? "allow" : "deny"
+        let scopedRules = FirewallRules.forNetwork(network.name, in: firewall)
+        let autoAccept = FirewallRules.autoAccept(
+            forNetwork: network.name,
+            in: firewall,
+            fallback: network.autoAcceptFirewall
+        )
+        return SectionCard {
+            SectionLabel("Firewall · \(network.name)")
+            if scopedRules.isEmpty {
+                Text("No rules specific to \(network.name).")
+                    .font(Rf.text(13)).foregroundStyle(Rf.faint).padding(.top, 2)
+            } else {
+                ForEach(scopedRules) { item in
+                    FirewallRuleRow(
+                        item: item,
+                        networks: model.snapshot.networks,
+                        scopedNetwork: network.name,
+                        onRemove: {
+                            Task {
+                                if let updated = await model.perform(
+                                    .removeFirewallRule(index: item.index),
+                                    success: "Rule removed"
+                                )?.firewall {
+                                    self.firewall = updated
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+
+            LinkButton("+ Add rule") {
+                prefillPeer = nil
+                addingRule = true
+            }
+            .padding(.top, 6)
+
+            Toggle(isOn: Binding(
+                get: { autoAccept },
+                set: { enabled in
                     Task {
-                        if let updated = await model.perform(.setDefaultInbound(next), success: "Inbound default: \(next)")?.firewall {
+                        if let updated = await model.perform(
+                            .setNetworkFirewallAutoAccept(network: network.name, enabled: enabled),
+                            success: enabled ? "Auto-accept enabled" : "Auto-accept disabled"
+                        )?.firewall {
                             self.firewall = updated
                         }
                     }
                 }
-                .font(Rf.mono(14))
-            }
-            KeyValueRow(key: "Outbound default", value: firewall.defaultOutbound)
-            // Removal takes a rule's position in the node's full list.
-            let inbound = firewall.rules.enumerated().filter { $0.element.direction == "in" }
-            if inbound.isEmpty {
-                Text("No inbound rules").font(Rf.text()).foregroundStyle(Rf.faint).padding(.top, 6)
-            }
-            ForEach(inbound, id: \.offset) { index, rule in
-                HStack {
-                    // `allow`, `deny` and the protocol stay in the node's own words,
-                    // the ones `ray firewall` prints.
-                    Text(rule.port == "*" ? "\(rule.action) \(rule.protocol)" : "\(rule.action) \(rule.protocol):\(rule.port)")
-                        .font(Rf.mono(14)).foregroundStyle(Rf.body)
-                    Spacer()
-                    Text(peerName(rule.peer, in: network)).font(Rf.text(13)).foregroundStyle(Rf.faint)
-                    LinkButton("Remove") {
-                        Task {
-                            if let updated = await model.perform(.removeFirewallRule(index: UInt32(index)), success: "Rule removed")?.firewall {
-                                self.firewall = updated
-                            }
-                        }
-                    }
-                    .font(Rf.mono(12))
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Auto-accept suggested rules").font(Rf.text()).foregroundStyle(Rf.body)
+                    Text("Apply rules published by \(network.name)'s coordinator automatically")
+                        .font(Rf.text(12)).foregroundStyle(Rf.faint)
                 }
-                .padding(.top, 8)
             }
-            LinkButton("+ Allow inbound") { addingRule = true }.padding(.top, 4)
+            .tint(Rf.rose500)
+            .padding(.top, 10)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("General rules also apply · inbound default \(firewall.defaultInbound)")
+                    .font(Rf.mono(12)).foregroundStyle(Rf.faint)
+                NavigationLink {
+                    FirewallView()
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("General firewall rules").font(Rf.semibold(13)).foregroundStyle(Rf.rose400)
+                        Image(systemName: "chevron.right").font(.system(size: 11)).foregroundStyle(Rf.rose400)
+                    }
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.top, 10)
         }
-    }
-
-    /// The node prints a rule's peer as a short id; name it when a peer matches.
-    private func peerName(_ id: String, in network: NetworkDetail) -> String {
-        if id == "any" { return "any peer" }
-        return network.peers.first { $0.nodeId.hasPrefix(id) && !$0.hostname.isEmpty }?.hostname ?? id
-    }
-}
-
-struct AllowInboundSheet: View {
-    @EnvironmentObject private var model: AppModel
-    @Environment(\.dismiss) private var dismiss
-    var network: NetworkDetail
-    var updated: (FirewallStateInfo) -> Void
-    @State private var peer: String?
-    @State private var protocolName = "tcp"
-    @State private var port = ""
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Picker("Peer", selection: $peer) {
-                    Text("any peer").tag(String?.none)
-                    ForEach(network.peers) { peer in
-                        Text("\(peer.displayName) · \(peer.nodeId.prefix(4))").tag(String?.some(peer.nodeId))
-                    }
-                }
-                Picker("Protocol", selection: $protocolName) {
-                    ForEach(["tcp", "udp", "icmp", "any"], id: \.self) { Text($0) }
-                }
-                TextField("Port (blank for any)", text: $port)
-                    .keyboardType(.numbersAndPunctuation)
-            }
-            .scrollContentBackground(.hidden)
-            .background(Rf.sheet)
-            .font(Rf.text())
-            .navigationTitle("Allow inbound")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Add rule") {
-                        let port = port.trimmingCharacters(in: .whitespaces)
-                        Task {
-                            let command = Command.allowInbound(network: network.name, protocolName: protocolName,
-                                                               port: port.isEmpty ? nil : port, peer: peer)
-                            if let firewall = await model.perform(command, success: "Rule added")?.firewall {
-                                updated(firewall)
-                                dismiss()
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .preferredColorScheme(.dark)
-        .tint(Rf.rose400)
-        .presentationDetents([.medium])
     }
 }

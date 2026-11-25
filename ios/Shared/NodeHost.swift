@@ -60,14 +60,36 @@ final class NodeHost: @unchecked Sendable {
             return Reply(firewall: try node.firewallShow())
         case .allowInbound(let network, let protocolName, let port, let peer):
             try node.firewallAdd(direction: "in", action: "allow", protocol: protocolName,
-                                 port: port, peer: peer, network: network)
-            return Reply(firewall: try node.firewallShow())
+                                 port: Self.nonEmpty(port), peer: Self.nonEmpty(peer), network: Self.nonEmpty(network))
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
+        case .addFirewallRule(let direction, let action, let protocolName, let port, let peer, let network):
+            try node.firewallAdd(direction: direction, action: action, protocol: protocolName,
+                                 port: Self.nonEmpty(port), peer: Self.nonEmpty(peer), network: Self.nonEmpty(network))
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
         case .removeFirewallRule(let index):
             try node.firewallRemove(index: index)
-            return Reply(firewall: try node.firewallShow())
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
         case .setDefaultInbound(let action):
             try node.firewallSetDefaultInbound(action: action)
-            return Reply(firewall: try node.firewallShow())
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
+        case .setDefaultOutbound(let action):
+            try node.firewallSetDefaultOutbound(action: action)
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
+        case .setFirewallEnabled(let enabled):
+            try node.firewallSetEnabled(enabled: enabled)
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
+        case .setFirewallReject(let reject):
+            try node.firewallSetReject(reject: reject)
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
+        case .acceptFirewallSuggestions(let network):
+            try node.firewallAcceptSuggestions(network: network)
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
+        case .denyFirewallSuggestions(let network):
+            try node.firewallDenySuggestions(network: network)
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
+        case .setNetworkFirewallAutoAccept(let network, let enabled):
+            try node.setNetworkFirewallAutoAccept(network: network, enabled: enabled)
+            return Reply(snapshot: snapshot(), firewall: try node.firewallShow())
         case .approveConnect(let id):
             try node.approveConnectRequest(shortId: id)
         case .rejectConnect(let id):
@@ -171,6 +193,14 @@ final class NodeHost: @unchecked Sendable {
             try manager.moveItem(at: file, to: target)
             return file.lastPathComponent
         }
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty, trimmed != "*", trimmed != "any" else {
+            return nil
+        }
+        return trimmed
     }
 }
 

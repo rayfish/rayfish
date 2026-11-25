@@ -3,16 +3,53 @@ import SwiftUI
 struct NetworksView: View {
     @EnvironmentObject private var model: AppModel
     @State private var adding = false
+    @State private var showingFirewall = false
+    @State private var searchQuery = ""
     @State private var invite: SharedCode?
 
     var body: some View {
         let networks = model.snapshot.networks
         let running = model.tunnelState == .on
+        let hasPendingSuggestions = networks.contains { $0.pendingSuggestions > 0 }
+        let showFilter = networks.count >= 3 || networks.reduce(0) { $0 + $1.peers.count } >= 8
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let filteredNetworks = query.isEmpty ? networks : networks.filter { network in
+            network.name.lowercased().contains(query)
+                || network.hostname.lowercased().contains(query)
+                || (network.domain?.lowercased().contains(query) ?? false)
+                || network.ipv6.lowercased().contains(query)
+                || network.peers.contains { peer in
+                    peer.hostname.lowercased().contains(query)
+                        || peer.ipv6.lowercased().contains(query)
+                        || peer.nodeId.lowercased().contains(query)
+                        || (peer.domain(in: network)?.lowercased().contains(query) ?? false)
+                }
+        }
         ScrollView {
             VStack(spacing: 12) {
                 BrandHeader(title: "Networks") {
-                    Button("Add") { adding = true }.buttonStyle(PillStyle()).font(Rf.semibold(14))
+                    HStack(spacing: 8) {
+                        Button {
+                            showingFirewall = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "shield.lefthalf.filled")
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text("Firewall")
+                                    .font(Rf.semibold(14))
+                                if hasPendingSuggestions {
+                                    Dot(color: Rf.amber, size: 6)
+                                }
+                            }
+                        }
+                        .buttonStyle(PillStyle(outline: true))
                         .frame(height: 34)
+                        Button("Add") { adding = true }.buttonStyle(PillStyle()).font(Rf.semibold(14))
+                            .frame(height: 34)
+                    }
+                }
+                if showFilter {
+                    RayfishField("Filter networks or peers", text: $searchQuery)
                 }
                 if networks.isEmpty {
                     SectionCard {
@@ -22,8 +59,13 @@ struct NetworksView: View {
                             PillButton("Join or create a network") { adding = true }.padding(.top, 10)
                         }
                     }
+                } else if filteredNetworks.isEmpty {
+                    SectionCard {
+                        Text("No networks or peers match \"\(searchQuery)\".")
+                            .font(Rf.text()).foregroundStyle(Rf.muted)
+                    }
                 }
-                ForEach(networks) { network in
+                ForEach(filteredNetworks) { network in
                     NavigationLink(value: network.name) {
                         NetworkRow(network: network, running: running)
                     }
@@ -32,6 +74,7 @@ struct NetworksView: View {
                         if let domain = network.domain { Text(domain) }
                         Button("Invite") { Task { invite = await model.invite(network.name) } }
                         Button("Copy address") { model.copy(network.domain ?? network.ipv6, toast: "Address copied") }
+                        Button("Firewall") { showingFirewall = true }
                     }
                 }
                 ForEach(model.snapshot.pendingNetworks, id: \.self) { name in
@@ -54,6 +97,9 @@ struct NetworksView: View {
         .navigationDestination(for: String.self) { name in
             NetworkDetailView(name: name)
         }
+        .navigationDestination(isPresented: $showingFirewall) {
+            FirewallView()
+        }
         .sheet(isPresented: $adding) { AddNetworkSheet() }
         .sheet(item: $invite) { CodeSheet(code: $0) }
     }
@@ -72,6 +118,18 @@ struct NetworkRow: View {
                     RowSubtitle("\(network.hostname.isEmpty ? "unknown" : network.hostname) · \(line)")
                 }
                 Spacer()
+                if network.pendingSuggestions > 0 {
+                    HStack(spacing: 4) {
+                        Dot(color: Rf.amber, size: 6)
+                        Text("\(network.pendingSuggestions) rule\(network.pendingSuggestions == 1 ? "" : "s")")
+                            .font(Rf.mono(11))
+                            .foregroundStyle(Rf.amber)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Rf.amber.opacity(0.12))
+                    .clipShape(Capsule())
+                }
                 Image(systemName: "chevron.right").font(.system(size: 13)).foregroundStyle(Rf.faint)
             }
         }

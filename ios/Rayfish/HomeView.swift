@@ -106,7 +106,8 @@ struct HomeView: View {
 
     @ViewBuilder
     private var requests: some View {
-        if !snapshot.connects.isEmpty || !snapshot.joins.isEmpty {
+        let suggested = snapshot.networks.filter { $0.pendingSuggestions > 0 }
+        if !snapshot.connects.isEmpty || !snapshot.joins.isEmpty || !suggested.isEmpty {
             SectionCard {
                 SectionLabel("Requests")
                 VStack(alignment: .leading, spacing: 12) {
@@ -126,6 +127,30 @@ struct HomeView: View {
                             accept: "Accept",
                             onAccept: { Task { await model.perform(.acceptJoin(network: request.network, id: request.shortId)) } },
                             onDecline: { Task { await model.perform(.denyJoin(network: request.network, id: request.shortId)) } }
+                        )
+                    }
+                    ForEach(suggested) { network in
+                        let count = network.pendingSuggestions
+                        RequestRow(
+                            title: "Suggested firewall rules for \(network.name)",
+                            subtitle: "\(count) rule\(count == 1 ? "" : "s") from coordinator",
+                            accept: "Accept",
+                            onAccept: {
+                                Task {
+                                    await model.perform(
+                                        .acceptFirewallSuggestions(network: network.name),
+                                        success: "Accepted rules for \(network.name)"
+                                    )
+                                }
+                            },
+                            onDecline: {
+                                Task {
+                                    await model.perform(
+                                        .denyFirewallSuggestions(network: network.name),
+                                        success: "Dismissed rules for \(network.name)"
+                                    )
+                                }
+                            }
                         )
                     }
                 }

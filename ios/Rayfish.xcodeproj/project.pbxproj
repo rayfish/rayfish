@@ -20,6 +20,7 @@
 		32A0405A0F9597DCDA37CEC8 /* Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8853920C086231394A47F4E /* Protocol.swift */; };
 		3B5AA30F5F29EED42895B875 /* RayfishApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54E836340C120035FAF31E2F /* RayfishApp.swift */; };
 		3C9A842C50BF760328E230D1 /* WalkthroughTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A2827ECD419E6C1E9EEE262 /* WalkthroughTests.swift */; };
+		3D8A41C29E50F716B4A8E912 /* FirewallView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C4E82A1D95B30F741E2C890 /* FirewallView.swift */; };
 		43EB544D4DC1881A4A7EE5A7 /* YouView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9212D100A3BD0C7D995655AC /* YouView.swift */; };
 		447896AC04BD5534B575D87C /* SendFilesSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC13CDAC751E2B306E7F1096 /* SendFilesSheet.swift */; };
 		4C62621009FB6E8BC6220E95 /* AppGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4697C6E505B5E6961EBCA597 /* AppGroup.swift */; };
@@ -120,6 +121,7 @@
 		54E836340C120035FAF31E2F /* RayfishApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RayfishApp.swift; sourceTree = "<group>"; };
 		5D7A33747419F246C460CE7F /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
 		67092EEC7F40EE61708C5A2F /* IBMPlexMono-OFL.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "IBMPlexMono-OFL.txt"; sourceTree = "<group>"; };
+		6C4E82A1D95B30F741E2C890 /* FirewallView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirewallView.swift; sourceTree = "<group>"; };
 		7DC01E13E3D1AC9318ED3ABA /* RayfishUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = RayfishUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		863C9008B6F7B930C149D543 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		86D9811626EAF807B442F325 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
@@ -235,6 +237,7 @@
 			children = (
 				EBE2041689161DB5B3D3D1C4 /* AppModel.swift */,
 				EA6E6748C8715BF45A6683B1 /* Assets.xcassets */,
+				6C4E82A1D95B30F741E2C890 /* FirewallView.swift */,
 				49545382A1AA860D33EC5B3D /* HomeView.swift */,
 				21E6F711DADDCC3A6868F0DD /* IdentityKeychain.swift */,
 				DF0CE67690A500D0A9F453EF /* NetworkDetailView.swift */,
@@ -526,6 +529,7 @@
 			files = (
 				7E98F5AD5043F7D2A49CEF19 /* AppGroup.swift in Sources */,
 				EFE12C5AF75AB24C22B24DA4 /* AppModel.swift in Sources */,
+				3D8A41C29E50F716B4A8E912 /* FirewallView.swift in Sources */,
 				A0DFB2C522D60FE3E44738DD /* HomeView.swift in Sources */,
 				080FD8A1A58C68F98B78E82F /* IdentityKeychain.swift in Sources */,
 				0EE4B483378FEA62BB06A41C /* NetworkDetailView.swift in Sources */,
