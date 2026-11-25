@@ -31,6 +31,20 @@ impl DisplayOut for FirewallStateOutput<'_> {
 }
 
 #[derive(serde::Serialize)]
+struct FirewallAutoAcceptOutput {
+    enabled: bool,
+}
+
+impl DisplayOut for FirewallAutoAcceptOutput {
+    fn print_human(&self) {
+        println!(
+            "auto-accept-firewall = {}",
+            if self.enabled { "on" } else { "off" }
+        );
+    }
+}
+
+#[derive(serde::Serialize)]
 struct SshNetworkOutput<'a> {
     network: &'a str,
     allow: &'a [ipc::SshAllowView],
@@ -229,6 +243,15 @@ pub(crate) async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     }
     match ipc_request(req).await? {
         ipc::IpcMessage::Ok { message } => print_message(&message)?,
+        ipc::IpcMessage::ConfigValues { rows } => {
+            let enabled = rows.first().is_some_and(|(_, v)| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "on" | "true" | "yes" | "1"
+                )
+            });
+            printout(&FirewallAutoAcceptOutput { enabled })?;
+        }
         ipc::IpcMessage::FirewallState {
             default_inbound,
             default_outbound,
@@ -385,7 +408,10 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
         },
         FirewallAction::Accept { network } => ipc::IpcMessage::FirewallAccept { network },
         FirewallAction::Deny { network } => ipc::IpcMessage::FirewallDeny { network },
-        FirewallAction::AutoAccept { network, state } => {
+        FirewallAction::AutoAccept {
+            network,
+            state: Some(state),
+        } => {
             parse_on_off(&state)?;
             ipc::IpcMessage::NetConfigSet {
                 network,
@@ -393,6 +419,13 @@ fn to_ipc(action: FirewallAction) -> Result<ipc::IpcMessage> {
                 value: state,
             }
         }
+        FirewallAction::AutoAccept {
+            network,
+            state: None,
+        } => ipc::IpcMessage::NetConfigGet {
+            network,
+            key: Some(NetworkKey::AutoAcceptFirewall),
+        },
         // Handled above by early return (need extra round trips / interaction).
         FirewallAction::Suggest { .. }
         | FirewallAction::Pending { .. }
@@ -1766,7 +1799,7 @@ networks:
         // Auto-accept is per-network, so it takes the network-scoped variant.
         match to_ipc(FirewallAction::AutoAccept {
             network: "gaming".into(),
-            state: "off".into(),
+            state: Some("off".into()),
         })
         .unwrap()
         {
@@ -1780,6 +1813,18 @@ networks:
                 assert_eq!(value, "off");
             }
             other => panic!("expected NetConfigSet, got {other:?}"),
+        }
+        match to_ipc(FirewallAction::AutoAccept {
+            network: "gaming".into(),
+            state: None,
+        })
+        .unwrap()
+        {
+            ipc::IpcMessage::NetConfigGet { network, key } => {
+                assert_eq!(network, "gaming");
+                assert_eq!(key, Some(NetworkKey::AutoAcceptFirewall));
+            }
+            other => panic!("expected NetConfigGet, got {other:?}"),
         }
     }
 
@@ -1796,7 +1841,7 @@ networks:
 
         let err = to_ipc(FirewallAction::AutoAccept {
             network: "gaming".into(),
-            state: "maybe".into(),
+            state: Some("maybe".into()),
         })
         .unwrap_err();
         assert_eq!(err.to_string(), "expected `on` or `off`, got 'maybe'");

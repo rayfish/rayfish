@@ -1107,9 +1107,9 @@ pub(crate) enum FirewallAction {
         /// Network name
         #[arg(add = complete::networks())]
         network: String,
-        /// `on` or `off`
+        /// `on` or `off` (omit to show current)
         #[arg(add = complete::words(&ON_OFF))]
-        state: String,
+        state: Option<String>,
     },
     /// Embedded mesh SSH server: SSH in by mesh identity
     ///

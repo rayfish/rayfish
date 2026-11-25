@@ -1114,13 +1114,17 @@
       lastFirewall = JSON.parse(res.stdout);
       if (firewallScope && lastData) {
         const net = (lastData.networks || []).find(n => n.name === firewallScope);
-        if (net && net.pending_suggestions > 0) {
-          const pRes = await call(["firewall", "pending", firewallScope], true);
-          if (pRes && pRes.success) {
-            pendingByNet[firewallScope] = JSON.parse(pRes.stdout).rules || [];
-          }
+        const [pRes, aaRes] = await Promise.all([
+          net && net.pending_suggestions > 0 ? call(["firewall", "pending", firewallScope], true) : Promise.resolve(null),
+          call(["firewall", "auto-accept", firewallScope], true),
+        ]);
+        if (pRes && pRes.success) {
+          pendingByNet[firewallScope] = JSON.parse(pRes.stdout).rules || [];
         } else {
           delete pendingByNet[firewallScope];
+        }
+        if (aaRes && aaRes.success) {
+          autoAcceptByNet[firewallScope] = !!JSON.parse(aaRes.stdout).enabled;
         }
       }
       renderFirewallView();
