@@ -178,7 +178,7 @@ impl FormKind {
                     direction: values[0].parse::<Direction>().map_err(anyhow::Error::msg)?,
                     action: values[1].parse::<Action>().map_err(anyhow::Error::msg)?,
                     protocol,
-                    port: if protocol == Protocol::Icmp {
+                    port: if matches!(protocol, Protocol::Icmp | Protocol::Any) {
                         None
                     } else {
                         value(3)
@@ -188,6 +188,48 @@ impl FormKind {
                 }
             }
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FirewallPreset {
+    AllowWeb,
+    AllowSsh,
+    AllowAllTcp,
+    BlockPeer,
+}
+
+impl FirewallPreset {
+    pub const ALL: [Self; 4] = [
+        Self::AllowWeb,
+        Self::AllowSsh,
+        Self::AllowAllTcp,
+        Self::BlockPeer,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllowWeb => "Allow web",
+            Self::AllowSsh => "Allow SSH",
+            Self::AllowAllTcp => "Allow all TCP",
+            Self::BlockPeer => "Block peer",
+        }
+    }
+
+    pub fn apply(self, values: &mut [String]) {
+        if values.len() < 4 {
+            return;
+        }
+        let (direction, action, protocol, port) = match self {
+            Self::AllowWeb => ("in", "allow", "tcp", "443"),
+            Self::AllowSsh => ("in", "allow", "tcp", "22"),
+            Self::AllowAllTcp => ("in", "allow", "tcp", ""),
+            Self::BlockPeer => ("in", "deny", "any", ""),
+        };
+        values[0] = direction.into();
+        values[1] = action.into();
+        values[2] = protocol.into();
+        values[3] = port.into();
     }
 }
 
@@ -472,6 +514,39 @@ mod tests {
                 ..
             }
         ));
+        values[2] = "any".into();
+        assert!(matches!(
+            FormKind::Firewall.command(&values, None).unwrap(),
+            IpcMessage::FirewallAdd {
+                protocol: Protocol::Any,
+                port: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn firewall_presets_fill_rule_fields_and_preserve_peer_and_network() {
+        let mut values = FormKind::Firewall.initial_values();
+        values[4] = "example-peer".into();
+        values[5] = "example".into();
+        FirewallPreset::AllowSsh.apply(&mut values);
+        assert_eq!(
+            values,
+            ["in", "allow", "tcp", "22", "example-peer", "example"]
+        );
+        FirewallPreset::AllowAllTcp.apply(&mut values);
+        assert_eq!(
+            values,
+            ["in", "allow", "tcp", "", "example-peer", "example"]
+        );
+        FirewallPreset::BlockPeer.apply(&mut values);
+        assert_eq!(values, ["in", "deny", "any", "", "example-peer", "example"]);
+        FirewallPreset::AllowWeb.apply(&mut values);
+        assert_eq!(
+            values,
+            ["in", "allow", "tcp", "443", "example-peer", "example"]
+        );
     }
 
     #[test]

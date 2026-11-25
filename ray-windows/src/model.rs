@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Result, bail};
-use ray_proto::Action;
 use ray_proto::ipc::{
     ConnectionErrorInfo, FirewallRuleView, InactiveNetwork, IpcMessage, ManagedMachineInfo,
     NetworkStatus, NodeStatus,
 };
+use ray_proto::{Action, NetworkKey};
 use serde_json::{Map, Value};
 
 #[derive(Debug)]
@@ -68,7 +70,11 @@ pub(crate) struct PendingCounts {
 pub(crate) struct Firewall {
     pub default_inbound: Action,
     pub default_outbound: Action,
+    pub reject: bool,
+    pub disabled: bool,
     pub rules: Vec<FirewallRuleView>,
+    pub pending_rules: BTreeMap<String, Vec<FirewallRuleView>>,
+    pub auto_accept_firewall: BTreeMap<String, bool>,
 }
 
 impl Firewall {
@@ -77,16 +83,43 @@ impl Firewall {
             IpcMessage::FirewallState {
                 default_inbound,
                 default_outbound,
+                reject,
+                disabled,
                 rules,
-                ..
             } => Ok(Self {
                 default_inbound,
                 default_outbound,
+                reject,
+                disabled,
                 rules,
+                pending_rules: BTreeMap::new(),
+                auto_accept_firewall: BTreeMap::new(),
             }),
             IpcMessage::Error { message } => bail!(message),
             _ => bail!("The daemon returned an unexpected firewall response."),
         }
+    }
+}
+
+pub(crate) fn pending_rules_from_response(response: IpcMessage) -> Result<Vec<FirewallRuleView>> {
+    match response {
+        IpcMessage::FirewallPendingResponse { rules, .. } => Ok(rules),
+        IpcMessage::Error { message } => bail!(message),
+        _ => bail!("The daemon returned an unexpected pending firewall rules response."),
+    }
+}
+
+pub(crate) fn auto_accept_firewall_from_response(response: IpcMessage) -> Result<bool> {
+    match response {
+        IpcMessage::ConfigValues { rows } => Ok(rows.iter().any(|(key, value)| {
+            (key == NetworkKey::AutoAcceptFirewall.name() || key == "auto-accept-firewall")
+                && matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "on" | "true" | "yes" | "1"
+                )
+        })),
+        IpcMessage::Error { message } => bail!(message),
+        _ => bail!("The daemon returned an unexpected network settings response."),
     }
 }
 
@@ -303,14 +336,34 @@ mod tests {
         let firewall = Firewall::from_response(IpcMessage::FirewallState {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
-            reject: false,
-            disabled: false,
+            reject: true,
+            disabled: true,
             rules: vec![rule.clone()],
         })
         .unwrap();
         assert_eq!(firewall.default_inbound, Action::Deny);
         assert_eq!(firewall.default_outbound, Action::Allow);
-        assert_eq!(firewall.rules, [rule]);
+        assert!(firewall.reject);
+        assert!(firewall.disabled);
+        assert_eq!(firewall.rules, std::slice::from_ref(&rule));
+        let pending = pending_rules_from_response(IpcMessage::FirewallPendingResponse {
+            network: "example".into(),
+            rules: vec![rule.clone()],
+        })
+        .unwrap();
+        assert_eq!(pending, [rule]);
+        assert!(
+            auto_accept_firewall_from_response(IpcMessage::ConfigValues {
+                rows: vec![(NetworkKey::AutoAcceptFirewall.name().into(), "on".into())],
+            })
+            .unwrap()
+        );
+        assert!(
+            !auto_accept_firewall_from_response(IpcMessage::ConfigValues {
+                rows: vec![(NetworkKey::AutoAcceptFirewall.name().into(), "off".into())],
+            })
+            .unwrap()
+        );
         let config = config_from_response(IpcMessage::ConfigValues {
             rows: vec![
                 ("dns".into(), "partial".into()),

@@ -8,10 +8,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use ray_proto::NetworkKey;
 use ray_proto::ipc::{IpcMessage, PendingRequestInfo};
 
 use crate::model::{
-    Firewall, PendingItem, PendingKind, Snapshot, SshState, Status, config_from_response, words,
+    Firewall, PendingItem, PendingKind, Snapshot, SshState, Status,
+    auto_accept_firewall_from_response, config_from_response, pending_rules_from_response, words,
 };
 
 mod rpc;
@@ -264,7 +266,7 @@ fn snapshot(client: &Client, cancelled: &AtomicBool, start_service: bool) -> Res
         .read(IpcMessage::ConfigGet { key: None }, cancelled)
         .and_then(config_from_response)
         .map_err(|error| format!("{error:#}"));
-    let firewall = client
+    let mut firewall = client
         .read(IpcMessage::FirewallShow, cancelled)
         .and_then(Firewall::from_response)
         .map_err(|error| format!("{error:#}"));
@@ -314,6 +316,35 @@ fn snapshot(client: &Client, cancelled: &AtomicBool, start_service: bool) -> Res
                     network: network.name.clone(),
                 },
             });
+            if let Ok(fw) = &mut firewall
+                && let Ok(rules) = client
+                    .read(
+                        IpcMessage::FirewallPending {
+                            network: network.name.clone(),
+                        },
+                        cancelled,
+                    )
+                    .and_then(pending_rules_from_response)
+            {
+                fw.pending_rules.insert(network.name.clone(), rules);
+            }
+        }
+    }
+    if let Ok(fw) = &mut firewall {
+        for network in status.visible_networks() {
+            if let Ok(auto_accept) = client
+                .read(
+                    IpcMessage::NetConfigGet {
+                        network: network.name.clone(),
+                        key: Some(NetworkKey::AutoAcceptFirewall),
+                    },
+                    cancelled,
+                )
+                .and_then(auto_accept_firewall_from_response)
+            {
+                fw.auto_accept_firewall
+                    .insert(network.name.clone(), auto_accept);
+            }
         }
     }
     if status.pending.connects > 0 {

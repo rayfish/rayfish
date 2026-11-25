@@ -188,6 +188,8 @@ pub(crate) fn fixture(populated: bool) -> Snapshot {
         firewall: Ok(Firewall {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
+            reject: false,
+            disabled: false,
             rules: if populated {
                 vec![
                     FirewallRuleView {
@@ -212,6 +214,8 @@ pub(crate) fn fixture(populated: bool) -> Snapshot {
             } else {
                 Vec::new()
             },
+            pending_rules: Default::default(),
+            auto_accept_firewall: Default::default(),
         }),
         ssh: Ok(SshState {
             enabled: true,

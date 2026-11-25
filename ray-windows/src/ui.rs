@@ -3,17 +3,19 @@
 #[path = "ui/ssh.rs"]
 mod ssh;
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use eframe::egui::{
     self, Align, Color32, Context, FontData, FontDefinitions, FontFamily, FontId, Frame, Layout,
     Margin, RichText, ScrollArea, Stroke, TextureHandle, Ui, Vec2,
 };
-use ray_proto::ipc::{FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
-use ray_proto::{Action as FirewallAction, FirewallKey, GlobalKey, NodeKey};
+use ray_proto::ipc::{
+    FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerState, PeerStatus,
+};
+use ray_proto::{Action as FirewallAction, FirewallKey, GlobalKey, NetworkKey, NodeKey};
 
-use crate::forms::{FormKind, SshEditor, console_args};
+use crate::forms::{FirewallPreset, FormKind, SshEditor, console_args};
 use crate::model::{PendingItem, PendingKind, Snapshot, SshRule};
 
 const BACKGROUND: Color32 = color(0x18181b);
@@ -161,6 +163,10 @@ pub(crate) struct Dashboard {
     output_kind: OutputKind,
     pub page: Page,
     pub firewall_scope: FirewallScope,
+    pub collapsed_networks: BTreeSet<String>,
+    pub network_filter: String,
+    pub device_filter: String,
+    pub active_devices_only: bool,
     pub submitted_form: bool,
     joining: Option<String>,
     dialog: Option<Dialog>,
@@ -274,6 +280,10 @@ impl Dashboard {
             output_kind: OutputKind::Command,
             page: Page::Networks,
             firewall_scope: FirewallScope::General,
+            collapsed_networks: BTreeSet::new(),
+            network_filter: String::new(),
+            device_filter: String::new(),
+            active_devices_only: false,
             submitted_form: false,
             joining: None,
             dialog: None,
@@ -641,6 +651,22 @@ impl Dashboard {
                 &mut dialog,
             );
         }
+        let visible_networks_count = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.status.visible_networks().count())
+            .unwrap_or(0);
+        let total_peers: usize = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .status
+                    .visible_networks()
+                    .map(|network| network.peers.len())
+                    .sum()
+            })
+            .unwrap_or(0);
         ui.horizontal(|ui| {
             ui.label(heading("Networks", 17.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -650,8 +676,42 @@ impl Dashboard {
                 if button(ui, "Join with a code", Kind::Secondary, !unavailable) {
                     dialog = Some(form(FormKind::Join, None, ""));
                 }
+                if visible_networks_count >= 2 {
+                    if !self.collapsed_networks.is_empty()
+                        && button(ui, "Expand all", Kind::Secondary, true)
+                    {
+                        self.collapsed_networks.clear();
+                    }
+                    if self.collapsed_networks.len() < visible_networks_count
+                        && button(ui, "Collapse all", Kind::Secondary, true)
+                        && let Some(snapshot) = &self.snapshot
+                    {
+                        self.collapsed_networks = snapshot
+                            .status
+                            .visible_networks()
+                            .map(|network| network.name.clone())
+                            .collect();
+                    }
+                }
             });
         });
+        if visible_networks_count >= 3 || total_peers >= 8 || !self.network_filter.is_empty() {
+            ui.horizontal(|ui| {
+                let clear_width = if self.network_filter.is_empty() {
+                    0.0
+                } else {
+                    76.0
+                };
+                ui.add_sized(
+                    [(ui.available_width() - clear_width).max(120.0), 32.0],
+                    egui::TextEdit::singleline(&mut self.network_filter)
+                        .hint_text("Filter networks, domains, or peers..."),
+                );
+                if !self.network_filter.is_empty() && button(ui, "Clear", Kind::Secondary, true) {
+                    self.network_filter.clear();
+                }
+            });
+        }
         ui.add_space(4.0);
         let networks = self
             .snapshot
@@ -694,6 +754,8 @@ impl Dashboard {
                 "Create a private network or join one with an invite code.",
             );
         }
+        let filter_query = self.network_filter.trim().to_ascii_lowercase();
+        let mut shown_networks = 0usize;
         for (network, restoring) in
             networks
                 .iter()
@@ -702,6 +764,24 @@ impl Dashboard {
                     inactive.saved.as_ref().map(|saved| (saved, Some(inactive)))
                 }))
         {
+            let network_matches =
+                filter_query.is_empty() || network_matches_filter(network, &filter_query);
+            let matching_peers: Vec<&PeerStatus> = network
+                .peers
+                .iter()
+                .filter(|peer| peer_matches_filter(peer, &network.name, &filter_query))
+                .collect();
+            if !filter_query.is_empty() && !network_matches && matching_peers.is_empty() {
+                continue;
+            }
+            shown_networks += 1;
+            let collapsed = self.collapsed_networks.contains(&network.name);
+            let peers_to_show: Vec<&PeerStatus> =
+                if filter_query.is_empty() || (network_matches && matching_peers.is_empty()) {
+                    network.peers.iter().collect()
+                } else {
+                    matching_peers
+                };
             ui.push_id(&network.name, |ui| {
                 card().inner_margin(0).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
@@ -731,6 +811,12 @@ impl Dashboard {
                                                     ),
                                             );
                                         });
+                                    if collapsed {
+                                        ui.label(
+                                            mono(format!("{} peers", network.peers.len()), 11.0)
+                                                .color(MUTED),
+                                        );
+                                    }
                                 });
                                 let domain = format!(
                                     "{}.{}.ray",
@@ -790,6 +876,20 @@ impl Dashboard {
                                     self.page = Page::Firewall;
                                     self.notice = None;
                                 }
+                                if (visible_networks_count >= 2 || collapsed)
+                                    && button(
+                                        ui,
+                                        if collapsed { "Expand" } else { "Collapse" },
+                                        Kind::Secondary,
+                                        true,
+                                    )
+                                {
+                                    if collapsed {
+                                        self.collapsed_networks.remove(&network.name);
+                                    } else {
+                                        self.collapsed_networks.insert(network.name.clone());
+                                    }
+                                }
                             });
                         });
                         if let Some(inactive) = restoring {
@@ -805,24 +905,35 @@ impl Dashboard {
                             );
                         }
                     });
-                    for peer in &network.peers {
-                        ui.add(egui::Separator::default().spacing(1.0));
-                        peer_entry(
-                            ui,
-                            peer,
-                            network,
-                            restoring.is_some() || self.status_error.is_some(),
-                        );
-                    }
-                    if network.peers.is_empty() {
-                        rule(ui);
-                        Frame::new().inner_margin(18).show(ui, |ui| {
-                            ui.label(mono("Waiting for peers...", 12.0).color(FAINT));
-                        });
+                    if !collapsed {
+                        for peer in peers_to_show {
+                            ui.add(egui::Separator::default().spacing(1.0));
+                            peer_entry(
+                                ui,
+                                peer,
+                                network,
+                                restoring.is_some() || self.status_error.is_some(),
+                                &mut dialog,
+                                !unavailable,
+                            );
+                        }
+                        if network.peers.is_empty() {
+                            rule(ui);
+                            Frame::new().inner_margin(18).show(ui, |ui| {
+                                ui.label(mono("Waiting for peers...", 12.0).color(FAINT));
+                            });
+                        }
                     }
                 });
             });
             ui.add_space(4.0);
+        }
+        if !filter_query.is_empty() && shown_networks == 0 && visible_networks_count > 0 {
+            empty(
+                ui,
+                "No matching networks or peers.",
+                "Try a different search filter.",
+            );
         }
         for inactive in inactive.iter().filter(|inactive| inactive.saved.is_none()) {
             card().show(ui, |ui| {
@@ -968,28 +1079,75 @@ impl Dashboard {
             }
             ui.add_space(14.0);
             ui.label(heading("Network peers", 17.0));
-            if snapshot
-                .status
-                .networks
-                .iter()
-                .all(|network| network.peers.is_empty())
-            {
+            let mut all_peers = Vec::new();
+            let mut seen = HashSet::new();
+            for network in &snapshot.status.networks {
+                for peer in &network.peers {
+                    if seen.insert(peer.endpoint_id) {
+                        all_peers.push((peer, network));
+                    }
+                }
+            }
+            if all_peers.is_empty() {
                 empty(
                     ui,
                     "No devices to show.",
                     "Devices appear here once this PC joins a network.",
                 );
             } else {
-                card().show(ui, |ui| {
-                    let mut seen = HashSet::new();
-                    for network in &snapshot.status.networks {
-                        for peer in &network.peers {
-                            if seen.insert(peer.endpoint_id) {
-                                peer_row(ui, peer, network);
-                            }
+                if all_peers.len() >= 5
+                    || !self.device_filter.is_empty()
+                    || self.active_devices_only
+                {
+                    ui.horizontal(|ui| {
+                        let active_kind = if self.active_devices_only {
+                            Kind::Primary
+                        } else {
+                            Kind::Secondary
+                        };
+                        let right_controls = if self.device_filter.is_empty() {
+                            110.0
+                        } else {
+                            186.0
+                        };
+                        ui.add_sized(
+                            [(ui.available_width() - right_controls).max(120.0), 32.0],
+                            egui::TextEdit::singleline(&mut self.device_filter)
+                                .hint_text("Filter peers by name, network, or IPv6..."),
+                        );
+                        if button(ui, "Active only", active_kind, true) {
+                            self.active_devices_only = !self.active_devices_only;
                         }
-                    }
-                });
+                        if !self.device_filter.is_empty()
+                            && button(ui, "Clear", Kind::Secondary, true)
+                        {
+                            self.device_filter.clear();
+                        }
+                    });
+                }
+                let query = self.device_filter.trim().to_ascii_lowercase();
+                let filtered_peers: Vec<_> = all_peers
+                    .into_iter()
+                    .filter(|(peer, network)| {
+                        (!self.active_devices_only || peer_is_active(peer))
+                            && (query.is_empty()
+                                || peer_matches_filter(peer, &network.name, &query))
+                    })
+                    .collect();
+                if filtered_peers.is_empty() {
+                    empty(
+                        ui,
+                        "No matching devices.",
+                        "Try clearing the search filter or active-only toggle.",
+                    );
+                } else {
+                    let peer_actions_enabled = !self.busy && self.status_error.is_none();
+                    card().show(ui, |ui| {
+                        for (peer, network) in filtered_peers {
+                            peer_row(ui, peer, network, &mut dialog, peer_actions_enabled);
+                        }
+                    });
+                }
             }
         } else {
             empty(
@@ -1140,28 +1298,24 @@ impl Dashboard {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let pending = snapshot
-            .pending
-            .iter()
-            .filter(|item| match (&self.firewall_scope, &item.kind) {
-                (FirewallScope::Network(selected), PendingKind::Firewall { network }) => {
-                    network == selected
-                }
-                (_, PendingKind::Firewall { .. }) => true,
-                _ => false,
-            })
-            .collect::<Vec<_>>();
-        let mut dialog = None;
-        pending_section(
-            ui,
-            "Suggested rules",
-            &pending,
-            !enabled,
-            actions,
-            &mut dialog,
-        );
-        if let Some(dialog) = dialog {
-            self.dialog = Some(dialog);
+        if !matches!(self.firewall_scope, FirewallScope::Network(_)) {
+            let pending = snapshot
+                .pending
+                .iter()
+                .filter(|item| matches!(item.kind, PendingKind::Firewall { .. }))
+                .collect::<Vec<_>>();
+            let mut dialog = None;
+            pending_section(
+                ui,
+                "Suggested rules",
+                &pending,
+                !enabled,
+                actions,
+                &mut dialog,
+            );
+            if let Some(dialog) = dialog {
+                self.dialog = Some(dialog);
+            }
         }
         let firewall = match &snapshot.firewall {
             Ok(firewall) => firewall,
@@ -1181,16 +1335,87 @@ impl Dashboard {
                 return;
             }
         };
+        let active_set: HashSet<&str> = active_networks.iter().map(String::as_str).collect();
+        let general_count = firewall
+            .rules
+            .iter()
+            .filter(|item| {
+                scope_label(&item.network) == "Any" || !active_set.contains(item.network.as_str())
+            })
+            .count();
         if let FirewallScope::Network(net_name) = &self.firewall_scope {
             let net_name = net_name.clone();
+            let net_pending_count = snapshot
+                .status
+                .visible_networks()
+                .find(|network| network.name == net_name)
+                .map(|network| network.pending_suggestions)
+                .unwrap_or(0);
+            let net_pending_rules = firewall
+                .pending_rules
+                .get(&net_name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let has_pending_item = snapshot.pending.iter().any(|item| {
+                matches!(&item.kind, PendingKind::Firewall { network } if *network == net_name)
+            });
+            if net_pending_count > 0 || !net_pending_rules.is_empty() || has_pending_item {
+                card().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                heading(format!("Suggested rules for {net_name}"), 15.0)
+                                    .color(AMBER),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "The network coordinator suggested firewall rules for this network.",
+                                )
+                                .color(MUTED),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if button(ui, "Dismiss suggestions", Kind::Danger, enabled) {
+                                actions.push(Action::Run(IpcMessage::FirewallDeny {
+                                    network: net_name.clone(),
+                                }));
+                            }
+                            if button(ui, "Accept suggestions", Kind::Primary, enabled) {
+                                actions.push(Action::Run(IpcMessage::FirewallAccept {
+                                    network: net_name.clone(),
+                                }));
+                            }
+                        });
+                    });
+                    for rule_item in net_pending_rules {
+                        ui.label(
+                            mono(
+                                format!(
+                                    "{} {} {} {} (peer: {})",
+                                    rule_item.direction.to_string().to_uppercase(),
+                                    rule_item.action.to_string().to_uppercase(),
+                                    rule_item.protocol.to_string().to_uppercase(),
+                                    scope_label(&rule_item.port),
+                                    resolve_rule_peer(snapshot, rule_item)
+                                ),
+                                11.0,
+                            )
+                            .color(BODY),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+            }
             card().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(heading(format!("Rules for {net_name}"), 15.0));
                         ui.label(
                             RichText::new(format!(
-                                "General cross-network rules and defaults (inbound {}, outbound {}) also apply.",
-                                firewall.default_inbound, firewall.default_outbound
+                                "{general_count} general cross-network {} and defaults (inbound {}, outbound {}) also apply.",
+                                if general_count == 1 { "rule" } else { "rules" },
+                                firewall.default_inbound,
+                                firewall.default_outbound
                             ))
                             .color(MUTED),
                         );
@@ -1201,10 +1426,70 @@ impl Dashboard {
                         }
                     });
                 });
+                rule(ui);
+                let mut auto_accept = firewall
+                    .auto_accept_firewall
+                    .get(&net_name)
+                    .copied()
+                    .unwrap_or(false);
+                if setting(
+                    ui,
+                    "Auto-accept suggestions",
+                    "Install coordinator-suggested firewall rules on this network without manual review.",
+                    &mut auto_accept,
+                    enabled,
+                ) {
+                    actions.push(Action::Run(IpcMessage::NetConfigSet {
+                        network: net_name.clone(),
+                        key: NetworkKey::AutoAcceptFirewall,
+                        value: if auto_accept { "on" } else { "off" }.into(),
+                    }));
+                }
             });
         } else {
             card().show(ui, |ui| {
-                ui.label(heading("Default policies", 15.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(heading("Default policies", 15.0));
+                    let (status_label, status_color) = if firewall.disabled {
+                        ("Paused", AMBER)
+                    } else {
+                        ("Enforcing", GREEN)
+                    };
+                    dot(ui, status_color);
+                    ui.label(mono(status_label, 11.0).color(status_color));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let toggle_label = if firewall.disabled {
+                            "Resume firewall"
+                        } else {
+                            "Pause firewall"
+                        };
+                        if button(ui, toggle_label, Kind::Secondary, enabled) {
+                            actions.push(Action::Run(IpcMessage::ConfigSet {
+                                key: NodeKey::Firewall(FirewallKey::Enabled),
+                                value: if firewall.disabled { "on" } else { "off" }.into(),
+                                replace: false,
+                            }));
+                        }
+                        let reject_kind = if firewall.reject {
+                            Kind::Primary
+                        } else {
+                            Kind::Secondary
+                        };
+                        if button(ui, "Reject blocked traffic", reject_kind, enabled) {
+                            actions.push(Action::Run(IpcMessage::ConfigSet {
+                                key: NodeKey::Firewall(FirewallKey::Reject),
+                                value: if firewall.reject { "off" } else { "on" }.into(),
+                                replace: false,
+                            }));
+                        }
+                    });
+                });
+                if firewall.disabled {
+                    ui.colored_label(
+                        AMBER,
+                        "Firewall is paused. All mesh traffic is allowed regardless of rules or default policies.",
+                    );
+                }
                 for (title, current, key) in [
                     ("Inbound", firewall.default_inbound, FirewallKey::DefaultIn),
                     ("Outbound", firewall.default_outbound, FirewallKey::DefaultOut),
@@ -1229,7 +1514,6 @@ impl Dashboard {
             });
         }
         ui.add_space(10.0);
-        let active_set: HashSet<&str> = active_networks.iter().map(String::as_str).collect();
         let scoped_rules: Vec<(usize, &FirewallRuleView)> = firewall
             .rules
             .iter()
@@ -1302,21 +1586,32 @@ impl Dashboard {
                                         .color(MUTED),
                                 );
                                 ui.label(mono(scope_label(&item.port), 11.0));
+                                let peer_display = resolve_rule_peer(snapshot, item);
                                 ui.add_sized(
                                     [150.0, 22.0],
-                                    egui::Label::new(mono(scope_label(&item.peer), 11.0))
+                                    egui::Label::new(mono(&peer_display, 11.0))
                                         .truncate()
                                         .halign(Align::LEFT),
                                 )
-                                .on_hover_text(&item.peer);
-                                ui.add_sized(
-                                    [115.0, 22.0],
-                                    egui::Label::new(mono(scope_label(&item.network), 11.0))
-                                        .truncate()
-                                        .halign(Align::LEFT),
-                                )
-                                .on_hover_text(&item.network);
-                                if button(ui, "Remove", Kind::Danger, enabled) {
+                                .on_hover_text(&peer_display);
+                                if item.suggested_by.as_deref().is_some_and(|by| by != "ssh") {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui.label(mono(scope_label(&item.network), 11.0));
+                                        ui.label(mono("Suggested", 9.0).color(AMBER));
+                                    });
+                                } else {
+                                    ui.add_sized(
+                                        [115.0, 22.0],
+                                        egui::Label::new(mono(scope_label(&item.network), 11.0))
+                                            .truncate()
+                                            .halign(Align::LEFT),
+                                    )
+                                    .on_hover_text(&item.network);
+                                }
+                                if item.suggested_by.as_deref() == Some("ssh") {
+                                    ui.label(mono("Managed by SSH", 10.0).color(FAINT));
+                                } else if button(ui, "Remove", Kind::Danger, enabled) {
                                     self.dialog = Some(Dialog::FirewallRemove {
                                         index,
                                         rule: Box::new(item.clone()),
@@ -1535,13 +1830,29 @@ impl Dashboard {
                             .id_salt("form-fields")
                             .max_height((ctx.content_rect().height() - 160.0).max(80.0))
                             .show(ui, |ui| {
+                                if *kind == FormKind::Firewall {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        for preset in FirewallPreset::ALL {
+                                            if button(ui, preset.label(), Kind::Secondary, true) {
+                                                preset.apply(values);
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                }
                                 for (index, field) in kind.fields().iter().enumerate() {
                                     ui.label(RichText::new(field.label).size(13.0).color(MUTED));
                                     if *kind == FormKind::Firewall
                                         && index == 3
-                                        && values[2] == "icmp"
+                                        && matches!(values[2].as_str(), "icmp" | "any")
                                     {
-                                        ui.label(RichText::new("Not used for ICMP.").color(FAINT));
+                                        let reason = if values[2] == "icmp" {
+                                            "Not used for ICMP."
+                                        } else {
+                                            "Not used when protocol is Any."
+                                        };
+                                        ui.label(RichText::new(reason).color(FAINT));
                                         ui.add_space(4.0);
                                         continue;
                                     }
@@ -1859,18 +2170,120 @@ fn empty(ui: &mut Ui, title: &str, detail: &str) {
         });
 }
 
-fn peer_entry(ui: &mut Ui, peer: &PeerStatus, network: &NetworkStatus, restoring: bool) {
+fn network_matches_filter(network: &NetworkStatus, query: &str) -> bool {
+    let domain = format!(
+        "{}.{}.ray",
+        network.my_hostname.as_deref().unwrap_or("hostname"),
+        network.name
+    );
+    network.name.to_ascii_lowercase().contains(query) || domain.to_ascii_lowercase().contains(query)
+}
+
+fn peer_matches_filter(peer: &PeerStatus, network_name: &str, query: &str) -> bool {
+    let hostname = peer.hostname.as_deref().unwrap_or("Unnamed peer");
+    let domain = format!("{hostname}.{network_name}.ray");
+    hostname.to_ascii_lowercase().contains(query)
+        || domain.to_ascii_lowercase().contains(query)
+        || network_name.to_ascii_lowercase().contains(query)
+        || peer.ipv6.to_string().to_ascii_lowercase().contains(query)
+        || peer
+            .endpoint_id
+            .to_string()
+            .to_ascii_lowercase()
+            .contains(query)
+}
+
+fn peer_is_active(peer: &PeerStatus) -> bool {
+    peer.connection.is_some() || peer.state == PeerState::Active
+}
+
+fn resolve_rule_peer(snapshot: &Snapshot, rule: &FirewallRuleView) -> String {
+    let raw = scope_label(&rule.peer);
+    if raw == "Any" {
+        return "Any".into();
+    }
+    let find_in = |network: &NetworkStatus| -> Option<String> {
+        for peer in &network.peers {
+            let ep_full = peer.endpoint_id.to_string();
+            let ep_short = &ep_full[..10.min(ep_full.len())];
+            let user_full = peer.user_identity.map(|id| id.to_string());
+            let user_short = user_full.as_deref().map(|s| &s[..10.min(s.len())]);
+            let matches_user = user_full.as_deref() == Some(rule.peer.as_str())
+                || user_short == Some(rule.peer.as_str());
+            let matches_ep = rule.peer == ep_full || rule.peer == ep_short;
+            let matches_host = peer.hostname.as_deref() == Some(rule.peer.as_str());
+            let matches_ip = peer.ipv6.to_string() == rule.peer;
+            if (matches_user || matches_ep || matches_host || matches_ip)
+                && let Some(hostname) = &peer.hostname
+            {
+                let short_id = if matches_user {
+                    user_short.unwrap_or(ep_short)
+                } else {
+                    ep_short
+                };
+                return Some(format!("{hostname} ({short_id})"));
+            }
+        }
+        None
+    };
+    if scope_label(&rule.network) != "Any"
+        && let Some(network) = snapshot
+            .status
+            .visible_networks()
+            .find(|network| network.name == rule.network)
+        && let Some(resolved) = find_in(network)
+    {
+        return resolved;
+    }
+    for network in snapshot.status.visible_networks() {
+        if let Some(resolved) = find_in(network) {
+            return resolved;
+        }
+    }
+    raw.to_owned()
+}
+
+fn compact_button(ui: &mut Ui, title: &str, enabled: bool) -> bool {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::new(6.0, 1.0);
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(RichText::new(title).font(font("heading", 11.0)).color(BODY))
+                .fill(PANEL)
+                .stroke(Stroke::new(1.0_f32, BORDER))
+                .corner_radius(5)
+                .min_size(Vec2::new(0.0, 18.0)),
+        )
+        .clicked()
+    })
+    .inner
+}
+
+fn peer_entry(
+    ui: &mut Ui,
+    peer: &PeerStatus,
+    network: &NetworkStatus,
+    restoring: bool,
+    dialog: &mut Option<Dialog>,
+    enabled: bool,
+) {
     Frame::new()
         .inner_margin(Margin::symmetric(14, 8))
         .show(ui, |ui| {
             if restoring {
                 ui.multiply_opacity(0.5);
             }
-            peer_row(ui, peer, network);
+            peer_row(ui, peer, network, dialog, enabled && !restoring);
         });
 }
 
-fn peer_row(ui: &mut Ui, peer: &PeerStatus, network: &NetworkStatus) {
+fn peer_row(
+    ui: &mut Ui,
+    peer: &PeerStatus,
+    network: &NetworkStatus,
+    dialog: &mut Option<Dialog>,
+    enabled: bool,
+) {
     ui.spacing_mut().interact_size.y = 18.0;
     let state = peer
         .connection
@@ -1900,6 +2313,20 @@ fn peer_row(ui: &mut Ui, peer: &PeerStatus, network: &NetworkStatus) {
         }
         ui.label(mono(peer.ipv6.to_string(), 12.0).color(MUTED));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if compact_button(ui, "+ Rule", enabled) {
+                let mut values = FormKind::Firewall.initial_values();
+                values[4] = peer
+                    .hostname
+                    .clone()
+                    .unwrap_or_else(|| peer.endpoint_id.to_string());
+                values[5] = network.name.clone();
+                *dialog = Some(Dialog::Form {
+                    kind: FormKind::Firewall,
+                    network: Some(network.name.clone()),
+                    values,
+                    focus: true,
+                });
+            }
             if let Some(latency) = peer
                 .connection
                 .as_ref()
@@ -1950,7 +2377,15 @@ fn setting(ui: &mut Ui, title: &str, detail: &str, value: &mut bool, enabled: bo
         let detail_width = (ui.available_width() - 56.0).max(80.0);
         ui.vertical(|ui| {
             ui.set_max_width(detail_width);
-            ui.label(title);
+            let title_response = ui.add(egui::Label::new(title).sense(if enabled {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            }));
+            if enabled && title_response.clicked() {
+                *value = !*value;
+                changed = true;
+            }
             ui.add(
                 egui::Label::new(RichText::new(detail).font(font("body", 14.0)).color(MUTED))
                     .wrap(),
@@ -2751,5 +3186,240 @@ mod tests {
             });
             assert!(!output.shapes.is_empty());
         }
+    }
+
+    #[test]
+    fn scoped_network_firewall_removal_preserves_global_rule_indices() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        let mut snapshot = crate::preview::fixture(true);
+        let fw = snapshot.firewall.as_mut().unwrap();
+        fw.rules = vec![
+            FirewallRuleView {
+                direction: ray_proto::Direction::Out,
+                action: FirewallAction::Deny,
+                protocol: ray_proto::Protocol::Udp,
+                port: "8000-9000".into(),
+                peer: "any".into(),
+                network: "any".into(),
+                suggested_by: None,
+            },
+            FirewallRuleView {
+                direction: ray_proto::Direction::In,
+                action: FirewallAction::Allow,
+                protocol: ray_proto::Protocol::Tcp,
+                port: "443".into(),
+                peer: "5866666666".into(),
+                network: "example".into(),
+                suggested_by: Some("example".into()),
+            },
+            FirewallRuleView {
+                direction: ray_proto::Direction::In,
+                action: FirewallAction::Allow,
+                protocol: ray_proto::Protocol::Tcp,
+                port: "22".into(),
+                peer: "any".into(),
+                network: "example".into(),
+                suggested_by: Some("ssh".into()),
+            },
+        ];
+        app.snapshot = Some(Box::new(snapshot));
+        app.page = Page::Firewall;
+        app.firewall_scope = FirewallScope::Network("example".into());
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "workstation-1 (5866666666)")
+        );
+        assert!(labels.iter().any(|(text, _)| text == "Suggested"));
+        assert!(labels.iter().any(|(text, _)| text == "Managed by SSH"));
+        assert_eq!(
+            labels.iter().filter(|(text, _)| text == "Remove").count(),
+            1
+        );
+        assert!(click(&mut app, &ctx, "Remove").is_empty());
+        let actions = click(&mut app, &ctx, "Confirm");
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Run(IpcMessage::FirewallRemove { index: 1 })
+            ))
+        );
+    }
+
+    #[test]
+    fn firewall_posture_controls_presets_and_network_suggestions_emit_typed_requests() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        let mut snapshot = crate::preview::fixture(true);
+        snapshot.status.networks[0].pending_suggestions = 1;
+        snapshot.firewall.as_mut().unwrap().pending_rules.insert(
+            "example".into(),
+            vec![FirewallRuleView {
+                direction: ray_proto::Direction::In,
+                action: FirewallAction::Allow,
+                protocol: ray_proto::Protocol::Tcp,
+                port: "8443".into(),
+                peer: "any".into(),
+                network: "example".into(),
+                suggested_by: Some("example".into()),
+            }],
+        );
+        app.snapshot = Some(Box::new(snapshot));
+        app.page = Page::Firewall;
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "Enforcing"));
+        let pause_actions = click(&mut app, &ctx, "Pause firewall");
+        assert!(pause_actions.iter().any(|action| matches!(
+            action,
+            Action::Run(IpcMessage::ConfigSet {
+                key: NodeKey::Firewall(FirewallKey::Enabled),
+                value,
+                replace: false,
+            }) if value == "off"
+        )));
+        let reject_actions = click(&mut app, &ctx, "Reject blocked traffic");
+        assert!(reject_actions.iter().any(|action| matches!(
+            action,
+            Action::Run(IpcMessage::ConfigSet {
+                key: NodeKey::Firewall(FirewallKey::Reject),
+                value,
+                replace: false,
+            }) if value == "on"
+        )));
+        app.snapshot
+            .as_mut()
+            .unwrap()
+            .firewall
+            .as_mut()
+            .unwrap()
+            .disabled = true;
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "Paused"));
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text.contains("Firewall is paused."))
+        );
+        let resume_actions = click(&mut app, &ctx, "Resume firewall");
+        assert!(resume_actions.iter().any(|action| matches!(
+            action,
+            Action::Run(IpcMessage::ConfigSet {
+                key: NodeKey::Firewall(FirewallKey::Enabled),
+                value,
+                replace: false,
+            }) if value == "on"
+        )));
+
+        assert!(click(&mut app, &ctx, "Add rule").is_empty());
+        assert!(click(&mut app, &ctx, "Block peer").is_empty());
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "Not used when protocol is Any.")
+        );
+        assert!(click(&mut app, &ctx, "Allow SSH").is_empty());
+        let add_actions = click(&mut app, &ctx, "Add rule");
+        assert!(add_actions.iter().any(|action| matches!(
+            action,
+            Action::Run(IpcMessage::FirewallAdd {
+                direction: ray_proto::Direction::In,
+                action: FirewallAction::Allow,
+                protocol: ray_proto::Protocol::Tcp,
+                port: Some(port),
+                ..
+            }) if port == "22"
+        )));
+        app.dialog = None;
+
+        app.firewall_scope = FirewallScope::Network("example".into());
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "Suggested rules for example")
+        );
+        let accept_actions = click(&mut app, &ctx, "Accept suggestions");
+        assert!(accept_actions.iter().any(|action| matches!(
+            action,
+            Action::Run(IpcMessage::FirewallAccept { network }) if network == "example"
+        )));
+        let dismiss_actions = click(&mut app, &ctx, "Dismiss suggestions");
+        assert!(dismiss_actions.iter().any(|action| matches!(
+            action,
+            Action::Run(IpcMessage::FirewallDeny { network }) if network == "example"
+        )));
+        let auto_actions = click(&mut app, &ctx, "Auto-accept suggestions");
+        assert!(auto_actions.iter().any(|action| matches!(
+            action,
+            Action::Run(IpcMessage::NetConfigSet {
+                network,
+                key: NetworkKey::AutoAcceptFirewall,
+                value,
+            }) if network == "example" && value == "on"
+        )));
+    }
+
+    #[test]
+    fn large_mesh_networks_and_devices_support_filtering_collapsing_and_quick_peer_rules() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        let mut snapshot = crate::preview::fixture(true);
+        let mut second = snapshot.status.networks[0].clone();
+        second.name = "second-example".into();
+        for (idx, peer) in second.peers.iter_mut().enumerate() {
+            peer.hostname = Some(format!("second-host-{}", idx + 1));
+        }
+        snapshot.status.networks.push(second);
+        app.snapshot = Some(Box::new(snapshot));
+
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "Collapse all"));
+        assert!(labels.iter().any(|(text, _)| text == "workstation-1"));
+
+        assert!(click(&mut app, &ctx, "Collapse all").is_empty());
+        let labels = render(&mut app, &ctx);
+        assert!(!labels.iter().any(|(text, _)| text == "workstation-1"));
+        assert!(!labels.iter().any(|(text, _)| text == "second-host-1"));
+        assert!(labels.iter().any(|(text, _)| text == "second-example"));
+        assert!(labels.iter().any(|(text, _)| text == "Expand all"));
+
+        assert!(click(&mut app, &ctx, "Expand all").is_empty());
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "workstation-1"));
+
+        app.network_filter = "second-host-2".into();
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "second-example"));
+        assert!(labels.iter().any(|(text, _)| text == "second-host-2"));
+        assert!(!labels.iter().any(|(text, _)| text == "workstation-1"));
+
+        assert!(click(&mut app, &ctx, "+ Rule").is_empty());
+        let add_actions = click(&mut app, &ctx, "Add rule");
+        assert!(add_actions.iter().any(|action| matches!(
+            action,
+            Action::Run(IpcMessage::FirewallAdd {
+                peer: Some(peer),
+                network: Some(network),
+                ..
+            }) if peer == "second-host-2" && network == "second-example"
+        )));
+        app.dialog = None;
+        app.network_filter.clear();
+
+        app.page = Page::Devices;
+        app.device_filter = "workstation-3".into();
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "workstation-3"));
+        assert!(!labels.iter().any(|(text, _)| text == "workstation-1"));
+        assert!(click(&mut app, &ctx, "Active only").is_empty());
+        let labels = render(&mut app, &ctx);
+        assert!(
+            labels
+                .iter()
+                .any(|(text, _)| text == "No matching devices.")
+        );
     }
 }
