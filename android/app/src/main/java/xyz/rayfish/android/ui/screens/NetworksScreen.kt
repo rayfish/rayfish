@@ -39,10 +39,12 @@ import xyz.rayfish.android.ui.userMessage
 fun NetworksScreen(
     status: Status?, starting: Boolean, onToast: (String) -> Unit,
     onChanged: () -> Unit, onOpen: (NetworkDetail) -> Unit,
+    onOpenFirewall: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var showAdd by rememberSaveable { mutableStateOf(false) }
+    var filterQuery by rememberSaveable { mutableStateOf("") }
     var inviteCode by remember { mutableStateOf<String?>(null) }   // non-null -> show invite sheet
 
     fun <T> run(block: suspend () -> T, ok: (T) -> Unit, errRes: Int) {
@@ -54,10 +56,38 @@ fun NetworksScreen(
 
     val nets = status?.networks ?: emptyList()
     val running = status?.running == true
+    val showFilter = nets.size >= 3 || nets.sumOf { it.peers.size } >= 8 || filterQuery.isNotEmpty()
+    val filteredNets = remember(nets, filterQuery) {
+        val q = filterQuery.trim()
+        if (q.isEmpty()) {
+            nets
+        } else {
+            nets.filter { net ->
+                net.name.contains(q, ignoreCase = true) ||
+                    net.hostname.contains(q, ignoreCase = true) ||
+                    net.ipv6.contains(q, ignoreCase = true) ||
+                    "${net.hostname}.${net.name}.ray".contains(q, ignoreCase = true) ||
+                    net.peers.any { p ->
+                        p.hostname.contains(q, ignoreCase = true) ||
+                            p.nodeId.contains(q, ignoreCase = true) ||
+                            p.ipv6.contains(q, ignoreCase = true)
+                    }
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         BrandHeader(title = stringResource(R.string.tab_networks)) {
+            OutlinePillButton(stringResource(R.string.label_firewall), onClick = onOpenFirewall)
+            Spacer(Modifier.width(8.dp))
             PillButton(stringResource(R.string.action_add), onClick = { showAdd = true })
+        }
+        if (showFilter) {
+            RayfishTextField(
+                value = filterQuery,
+                onValueChange = { filterQuery = it },
+                label = stringResource(R.string.hint_filter_networks),
+            )
         }
         if (nets.isEmpty()) {
             SectionCard { Text(if (starting) stringResource(R.string.status_starting_ellipsis) else stringResource(R.string.networks_empty),
@@ -65,7 +95,7 @@ fun NetworksScreen(
                 if (!starting) PillButton(stringResource(R.string.home_join_network), onClick = { showAdd = true })
             }
         }
-        nets.forEach { net ->
+        filteredNets.forEach { net ->
             SectionCard {
                 Row(Modifier.fillMaxWidth().clickable { onOpen(net) }, verticalAlignment = Alignment.CenterVertically) {
                     // Amber while a saved network is still being restored, red
@@ -97,6 +127,17 @@ fun NetworksScreen(
                         Text(stringResource(R.string.network_row_subtitle, net.hostname.ifEmpty { stringResource(R.string.peer_unknown) }, line),
                             fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Muted)
                     }
+                    if (net.pendingSuggestions > 0u) {
+                        Text(
+                            pluralStringResource(R.plurals.fw_pending_badge, net.pendingSuggestions.toInt(), net.pendingSuggestions.toInt()),
+                            fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Amber,
+                            modifier = Modifier
+                                .padding(end = 4.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Rf.Amber.copy(alpha = 0.14f))
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                    }
                     // The device's stable .ray DNS name in this network. Prefer
                     // it over the IP for "copy address": the hostname is what
                     // peers use and it does not change if the IP is reassigned.
@@ -111,6 +152,9 @@ fun NetworksScreen(
                                 val address = dns ?: net.ipv6
                                 copyToClipboard(context, context.getString(R.string.clipboard_address), address)
                                 onToast(context.getString(R.string.toast_address_copied))
+                            },
+                            MenuItem(stringResource(R.string.label_firewall)) {
+                                onOpenFirewall()
                             },
                         ),
                     )

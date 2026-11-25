@@ -142,7 +142,8 @@ fun HomeScreen(snapshot: AppSnapshot, starting: Boolean, onToast: (String) -> Un
         }
     }
 
-    val hasRequests = connects.isNotEmpty() || joins.isNotEmpty() || invitations.isNotEmpty()
+    val suggestedNets = nets.filter { it.pendingSuggestions > 0u }
+    val hasRequests = connects.isNotEmpty() || joins.isNotEmpty() || invitations.isNotEmpty() || suggestedNets.isNotEmpty()
     val hasFiles = files.isNotEmpty() || accepting.isNotEmpty() || queued.isNotEmpty() || transfers.isNotEmpty()
 
     Column(
@@ -231,6 +232,15 @@ fun HomeScreen(snapshot: AppSnapshot, starting: Boolean, onToast: (String) -> Un
                             subtitle = stringResource(R.string.home_join_request, net, j.shortId),
                             acceptLabel = stringResource(R.string.action_accept), onAccept = { act { NodeHolder.get(context).acceptJoinRequest(net, j.shortId) } },
                             onReject = { act { NodeHolder.get(context).denyJoinRequest(net, j.shortId) } },
+                        )
+                    }
+                    suggestedNets.forEach { net ->
+                        NotifRow(
+                            title = stringResource(R.string.home_fw_suggestion_title, net.name),
+                            subtitle = pluralStringResource(R.plurals.fw_pending_badge, net.pendingSuggestions.toInt(), net.pendingSuggestions.toInt()),
+                            acceptLabel = stringResource(R.string.action_accept),
+                            onAccept = { act { NodeHolder.get(context).firewallAcceptSuggestions(net.name) } },
+                            onReject = { act { NodeHolder.get(context).firewallDenySuggestions(net.name) } },
                         )
                     }
                 }

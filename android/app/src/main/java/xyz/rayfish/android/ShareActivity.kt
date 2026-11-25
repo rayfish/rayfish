@@ -47,7 +47,7 @@ private data class Target(
  * Share-sheet target for "Share with Rayfish". Receives ACTION_SEND /
  * ACTION_SEND_MULTIPLE, shows a picker of peers, and hands the chosen peer +
  * the shared URIs to [SendService] for background delivery. The activity finishes
- * as soon as the user picks (or cancels) — the actual send happens in the service.
+ * as soon as the user picks (or cancels), and the actual send happens in the service.
  *
  * The picker lists idle and offline peers, not just connected ones. Mobile runs
  * the core in on-demand mode, so every mesh link self-closes after the idle

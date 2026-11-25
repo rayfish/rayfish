@@ -49,7 +49,19 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
     val screenState = rememberSaveableStateHolder()
     var tab by rememberSaveable { mutableStateOf(Tab.HOME) }
     var detailName by rememberSaveable { mutableStateOf<String?>(null) }
-    BackHandler(enabled = detailName != null) { detailName = null }
+    var showGeneralFirewall by rememberSaveable { mutableStateOf(false) }
+    var returnNetworkAfterFirewall by rememberSaveable { mutableStateOf<String?>(null) }
+    BackHandler(enabled = showGeneralFirewall || detailName != null) {
+        if (showGeneralFirewall) {
+            showGeneralFirewall = false
+            if (returnNetworkAfterFirewall != null) {
+                detailName = returnNetworkAfterFirewall
+                returnNetworkAfterFirewall = null
+            }
+        } else {
+            detailName = null
+        }
+    }
     var restoringTunnel by remember { mutableStateOf(true) }
 
     // Null until the check completes, and everything below is composed only once
@@ -136,7 +148,7 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
         containerColor = Rf.Bg,
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
-            if (detailName == null) {
+            if (detailName == null && !showGeneralFirewall) {
                 NavigationBar(containerColor = Rf.Bg) {
                     Tab.entries.forEach { t ->
                         val label = stringResource(t.labelRes)
@@ -165,19 +177,49 @@ fun RayfishApp(initialLinkUri: String?, alreadyHandled: (String) -> Boolean, mar
             }
             Box(Modifier.weight(1f)) {
                 val d = status?.networks?.firstOrNull { it.name == detailName }
-                screenState.SaveableStateProvider(detailName?.let { "network:$it" } ?: "tab:${tab.name}") {
+                val stateKey = when {
+                    showGeneralFirewall -> "firewall"
+                    detailName != null -> "network:$detailName"
+                    else -> "tab:${tab.name}"
+                }
+                screenState.SaveableStateProvider(stateKey) {
                     when {
+                        showGeneralFirewall -> FirewallScreen(
+                            status = status,
+                            onBack = {
+                                showGeneralFirewall = false
+                                if (returnNetworkAfterFirewall != null) {
+                                    detailName = returnNetworkAfterFirewall
+                                    returnNetworkAfterFirewall = null
+                                }
+                            },
+                            onToast = ::toast,
+                            onChanged = model::refresh,
+                            onOpenNetwork = { netName ->
+                                showGeneralFirewall = false
+                                returnNetworkAfterFirewall = null
+                                detailName = netName
+                            },
+                        )
                         d != null -> NetworkDetailScreen(
                             detail = d,
                             onBack = { detailName = null }, onToast = ::toast, onChanged = model::refresh,
                             onLeft = { screenState.removeState("network:${d.name}"); detailName = null; model.refresh() },
+                            onOpenGeneralFirewall = {
+                                returnNetworkAfterFirewall = d.name
+                                showGeneralFirewall = true
+                            },
                         )
                         tab == Tab.HOME -> HomeScreen(snapshot = snapshot, starting = starting, onToast = ::toast, onOpenNetworks = { tab = Tab.NETWORKS }, onRefresh = model::refresh)
                         tab == Tab.NETWORKS -> NetworksScreen(
                             status = status, starting = starting, onToast = ::toast,
                             onChanged = model::refresh, onOpen = { detailName = it.name },
+                            onOpenFirewall = { returnNetworkAfterFirewall = null; showGeneralFirewall = true },
                         )
-                        tab == Tab.YOU -> YouScreen(status = status, onToast = ::toast, onChanged = model::refresh)
+                        tab == Tab.YOU -> YouScreen(
+                            status = status, onToast = ::toast, onChanged = model::refresh,
+                            onOpenFirewall = { returnNetworkAfterFirewall = null; showGeneralFirewall = true },
+                        )
                     }
                 }
             }

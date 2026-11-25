@@ -29,7 +29,12 @@ import xyz.rayfish.android.ui.theme.*
 import xyz.rayfish.android.ui.userMessage
 
 @Composable
-fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit) {
+fun YouScreen(
+    status: Status?,
+    onToast: (String) -> Unit,
+    onChanged: () -> Unit,
+    onOpenFirewall: () -> Unit = {},
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var editing by rememberSaveable { mutableStateOf(false) }
@@ -105,6 +110,12 @@ fun YouScreen(status: Status?, onToast: (String) -> Unit, onChanged: () -> Unit)
             }
         }
         InboundCard(running = status?.running == true, onToast = onToast)
+        SectionCard {
+            SectionLabel(stringResource(R.string.label_firewall))
+            Text(stringResource(R.string.fw_you_card_body), fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
+            Spacer(Modifier.height(10.dp))
+            OutlinePillButton(stringResource(R.string.fw_open_general), onClick = onOpenFirewall, modifier = Modifier.fillMaxWidth())
+        }
         QuicEngineCard(onToast = onToast, onChanged = onChanged)
         IdentityBackupCard(status = status, onToast = onToast, onChanged = onChanged)
         // Default off: standby is the normal behavior now, so disabling Rayfish

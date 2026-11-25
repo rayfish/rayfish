@@ -14,6 +14,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
@@ -36,6 +37,7 @@ import xyz.rayfish.android.ui.userMessage
 fun NetworkDetailScreen(
     detail: NetworkDetail, onBack: () -> Unit, onToast: (String) -> Unit,
     onChanged: () -> Unit, onLeft: () -> Unit,
+    onOpenGeneralFirewall: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -46,6 +48,7 @@ fun NetworkDetailScreen(
     var hostnameInput by rememberSaveable { mutableStateOf("") }
     var firewall by remember { mutableStateOf<uniffi.ray_mobile.FirewallStateInfo?>(null) }
     var showAddRule by rememberSaveable { mutableStateOf(false) }
+    var addRulePeerId by rememberSaveable { mutableStateOf<String?>(null) }
     suspend fun reloadFirewall() {
         firewall = try { withContext(Dispatchers.IO) { NodeHolder.get(context).firewallShow() } } catch (t: Throwable) { firewall }
     }
@@ -108,69 +111,131 @@ fun NetworkDetailScreen(
                     Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(if (p.isActive) Rf.Emerald else Rf.Faint))
                     Spacer(Modifier.width(8.dp))
                     Text(p.hostname.ifEmpty { p.nodeId.take(8) }, fontFamily = Chakra, fontSize = 16.sp, color = Rf.Body, modifier = Modifier.weight(1f))
-                    Spacer(Modifier.weight(1f))
                     Text(p.nodeId.take(8),
                         fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Faint)
+                    Spacer(Modifier.width(4.dp))
+                    TextButton(
+                        onClick = { addRulePeerId = p.nodeId; showAddRule = true },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    ) {
+                        Text(stringResource(R.string.fw_peer_add_rule), fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Rose400)
+                    }
                 }
             }
         }
         SendFilesButton(enabled = detail.peers.isNotEmpty(), onToast = onToast, modifier = Modifier.fillMaxWidth())
         firewall?.let { fw ->
+            val netFw = fw.networks.firstOrNull { it.network == detail.name }
+            val pendingRules = netFw?.pendingRules.orEmpty()
+            val pendingCount = if (pendingRules.isNotEmpty()) pendingRules.size.toUInt() else detail.pendingSuggestions
+            val autoAccept = netFw?.autoAccept ?: detail.autoAcceptFirewall
+            val networkRules = fw.rules.withIndex().filter { (_, r) -> r.network == detail.name }
+
             SectionCard {
                 SectionLabel(stringResource(R.string.label_firewall))
-                Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(stringResource(R.string.label_inbound_default), fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
-                    Spacer(Modifier.weight(1f))
-                    TextButton(
-                        onClick = {
-                            val next = if (fw.defaultInbound == "deny") "allow" else "deny"
+                if (fw.disabled) {
+                    Text(
+                        stringResource(R.string.fw_paused_title),
+                        fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Amber,
+                        modifier = Modifier.padding(bottom = 4.dp),
+                    )
+                }
+                if (pendingRules.isNotEmpty() || pendingCount > 0u) {
+                    PendingSuggestionsBlock(
+                        pendingRules = pendingRules,
+                        pendingCount = pendingCount,
+                        peers = detail.peers,
+                        onAccept = {
                             scope.launch {
                                 try {
-                                    withContext(Dispatchers.IO) { NodeHolder.get(context).firewallSetDefaultInbound(next) }
-                                    reloadFirewall(); onToast(context.getString(R.string.toast_inbound_default, next))
+                                    withContext(Dispatchers.IO) { NodeHolder.get(context).firewallAcceptSuggestions(detail.name) }
+                                    reloadFirewall(); onChanged(); onToast(context.getString(R.string.toast_suggestions_accepted))
                                 } catch (t: Throwable) { onToast(context.getString(R.string.error_failed, t.userMessage)) }
                             }
                         },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                    ) { Text(stringResource(R.string.fw_toggle_edit, fw.defaultInbound), fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Rose400) }
+                        onDismiss = {
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) { NodeHolder.get(context).firewallDenySuggestions(detail.name) }
+                                    reloadFirewall(); onChanged(); onToast(context.getString(R.string.toast_suggestions_dismissed))
+                                } catch (t: Throwable) { onToast(context.getString(R.string.error_failed, t.userMessage)) }
+                            }
+                        },
+                    )
                 }
-                KeyValueRow(stringResource(R.string.label_outbound_default), fw.defaultOutbound)
-                if (fw.rules.none { it.direction == "in" }) {
-                    Text(stringResource(R.string.no_inbound_rules), fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Faint,
-                        modifier = Modifier.padding(top = 6.dp))
+                if (networkRules.isEmpty()) {
+                    Text(
+                        stringResource(R.string.no_inbound_rules),
+                        fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Faint,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
                 }
-                fw.rules.forEachIndexed { globalIndex, r ->
-                    if (r.direction != "in") return@forEachIndexed
-                    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        // `allow`/`deny` and the protocol stay in the daemon's
-                        // own vocabulary, in every language: they are the words
-                        // `ray firewall` prints and the ones written back over
-                        // IPC, so translating half of a rule row would leave it
-                        // matching neither.
-                        Text(
-                            if (r.port != "*") stringResource(R.string.fw_rule_with_port, r.action, r.protocol, r.port)
-                            else stringResource(R.string.fw_rule_any_port, r.action, r.protocol),
-                            fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Body)
-                        Spacer(Modifier.weight(1f))
-                        // The daemon renders a rule's peer as a short id; name it
-                        // when one of this network's peers carries that prefix.
-                        val named = detail.peers.firstOrNull { it.nodeId.startsWith(r.peer) }
-                            ?.hostname?.takeIf { it.isNotEmpty() }
-                        val peerName = if (r.peer == "any") stringResource(R.string.fw_any_peer) else named ?: r.peer
-                        Text(peerName, fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Faint)
-                        Spacer(Modifier.width(8.dp))
-                        TextButton(onClick = {
+                networkRules.forEach { (globalIndex, r) ->
+                    FirewallRuleRow(
+                        rule = r,
+                        peers = detail.peers,
+                        onRemove = {
                             scope.launch {
                                 try {
                                     withContext(Dispatchers.IO) { NodeHolder.get(context).firewallRemove(globalIndex.toUInt()) }
                                     reloadFirewall(); onToast(context.getString(R.string.toast_rule_removed))
                                 } catch (t: Throwable) { onToast(context.getString(R.string.error_remove_failed, t.userMessage)) }
                             }
-                        }) { Text(stringResource(R.string.action_remove), fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Rose400) }
-                    }
+                        },
+                    )
                 }
-                TextButton(onClick = { showAddRule = true }) {
+                TextButton(onClick = { addRulePeerId = null; showAddRule = true }) {
                     Text(stringResource(R.string.allow_inbound_add), fontFamily = PlexMono, fontSize = 14.sp, color = Rf.Rose400)
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            stringResource(R.string.fw_auto_accept_title),
+                            fontFamily = Chakra, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = Rf.Heading,
+                        )
+                        Text(
+                            stringResource(R.string.fw_auto_accept_subtitle),
+                            fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Muted,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
+                    Switch(
+                        checked = autoAccept,
+                        onCheckedChange = { enabled ->
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) { NodeHolder.get(context).setNetworkFirewallAutoAccept(detail.name, enabled) }
+                                    reloadFirewall(); onChanged()
+                                } catch (t: Throwable) { onToast(context.getString(R.string.error_failed, t.userMessage)) }
+                            }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White, checkedTrackColor = Rf.Emerald,
+                            uncheckedThumbColor = Color.White, uncheckedTrackColor = Rf.Faint,
+                            checkedBorderColor = Color.Transparent, uncheckedBorderColor = Color.Transparent,
+                        ),
+                    )
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        stringResource(R.string.fw_general_summary, fw.defaultInbound, fw.defaultOutbound),
+                        fontFamily = PlexMono, fontSize = 11.sp, color = Rf.Faint,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = onOpenGeneralFirewall,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) {
+                        Text(stringResource(R.string.fw_open_general), fontFamily = PlexMono, fontSize = 12.sp, color = Rf.Rose400)
+                    }
                 }
             }
         }
@@ -216,49 +281,17 @@ fun NetworkDetailScreen(
         )
     }
     if (showAddRule) {
-        var proto by rememberSaveable { mutableStateOf("tcp") }
-        var port by rememberSaveable { mutableStateOf("") }
-        var peerId by rememberSaveable { mutableStateOf<String?>(null) }
-        // Label shown in the dropdown -> what firewallAdd matches on. The node id
-        // is the unambiguous form: a peer may have no hostname set, and the
-        // daemon resolves a full endpoint id for offline members too.
-        val anyPeer = stringResource(R.string.fw_any_peer)
-        val peerChoices = remember(detail.peers, anyPeer) {
-            listOf(anyPeer to null as String?) + detail.peers.map { p ->
-                "${p.hostname.ifEmpty { p.nodeId.take(8) }} · ${p.nodeId.take(4)}" to p.nodeId
-            }
-        }
-        val peerLabel = peerChoices.firstOrNull { it.second == peerId }?.first ?: peerId ?: anyPeer
-        AlertDialog(
-            onDismissRequest = { showAddRule = false },
-            containerColor = Rf.Sheet,
-            title = { Text(stringResource(R.string.allow_inbound), fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RayfishDropdown(peerLabel, peerChoices.map { it.first }, { label ->
-                        peerId = peerChoices.firstOrNull { it.first == label }?.second
-                    }, stringResource(R.string.fw_peer))
-                    RayfishDropdown(proto, listOf("tcp", "udp", "icmp", "any"), { proto = it }, stringResource(R.string.fw_protocol))
-                    RayfishTextField(port, { port = it.trim() }, stringResource(R.string.hint_port))
-                }
+        AddFirewallRuleDialog(
+            networks = listOf(detail),
+            lockedNetwork = detail.name,
+            initialNetwork = detail.name,
+            initialPeerId = addRulePeerId,
+            onDismiss = { showAddRule = false },
+            onAdded = {
+                showAddRule = false
+                scope.launch { reloadFirewall() }
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    val peer = peerId
-                    scope.launch {
-                        try {
-                            withContext(Dispatchers.IO) {
-                                NodeHolder.get(context).firewallAdd(
-                                    "in", "allow", proto,
-                                    port.ifBlank { null }, peer, detail.name,
-                                )
-                            }
-                            reloadFirewall(); onToast(context.getString(R.string.toast_rule_added)); showAddRule = false
-                        } catch (t: Throwable) { onToast(context.getString(R.string.error_add_failed, t.userMessage)) }
-                    }
-                }) { Text(stringResource(R.string.action_add_rule), color = Rf.Rose400, fontFamily = Chakra, fontWeight = FontWeight.SemiBold) }
-            },
-            dismissButton = { TextButton(onClick = { showAddRule = false }) { Text(stringResource(R.string.action_cancel), color = Rf.Body, fontFamily = Chakra) } },
+            onToast = onToast,
         )
     }
     if (sendingInvite) {
