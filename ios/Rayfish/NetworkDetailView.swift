@@ -1,6 +1,11 @@
 import SwiftUI
 
 struct NetworkDetailView: View {
+    private struct RuleSheetContext: Identifiable {
+        let id = UUID()
+        let peer: String?
+    }
+
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     var name: String
@@ -9,8 +14,7 @@ struct NetworkDetailView: View {
     @State private var confirmLeave = false
     @State private var editingHostname = false
     @State private var hostnameInput = ""
-    @State private var addingRule = false
-    @State private var prefillPeer: String?
+    @State private var ruleSheet: RuleSheetContext?
     @State private var sending = false
 
     var body: some View {
@@ -104,8 +108,8 @@ struct NetworkDetailView: View {
             Button("Cancel", role: .cancel) {}
         }
         .sheet(item: $invite) { CodeSheet(code: $0) }
-        .sheet(isPresented: $addingRule) {
-            AddFirewallRuleSheet(initialNetwork: network.name, prefillPeer: prefillPeer) { firewall = $0 }
+        .sheet(item: $ruleSheet) { context in
+            AddFirewallRuleSheet(initialNetwork: network.name, prefillPeer: context.peer) { firewall = $0 }
         }
         .sheet(isPresented: $sending) { SendFilesSheet(peers: network.peers) }
     }
@@ -136,8 +140,7 @@ struct NetworkDetailView: View {
                         model.copy(domain ?? peer.ipv6, toast: "Address copied")
                     }
                     Button("Add firewall rule") {
-                        prefillPeer = peer.nodeId
-                        addingRule = true
+                        ruleSheet = RuleSheetContext(peer: peer.nodeId)
                     }
                 }
             }
@@ -221,8 +224,7 @@ struct NetworkDetailView: View {
             }
 
             LinkButton("+ Add rule") {
-                prefillPeer = nil
-                addingRule = true
+                ruleSheet = RuleSheetContext(peer: nil)
             }
             .padding(.top, 6)
 

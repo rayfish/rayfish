@@ -347,6 +347,8 @@
     <string name="toast_suggestions_accepted">提案ルールを承認しました</string>
     <string name="toast_suggestions_dismissed">提案ルールを却下しました</string>
     <string name="hint_filter_networks">ネットワークまたはピアを絞り込む</string>
+    <string name="networks_no_matches">一致するネットワークまたはピアはありません。</string>
+    <string name="fw_add_rule_title">ファイアウォールルールを追加</string>
     <string name="home_fw_suggestion_title">%1$s のファイアウォール提案ルール</string>
     <plurals name="fw_network_rule_count">
         <item quantity="other">%d 件のルール</item>

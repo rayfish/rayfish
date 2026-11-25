@@ -369,6 +369,8 @@
     <string name="toast_suggestions_accepted">Accepted suggested rules</string>
     <string name="toast_suggestions_dismissed">Dismissed suggested rules</string>
     <string name="hint_filter_networks">Filter networks or peers</string>
+    <string name="networks_no_matches">No matching networks or peers.</string>
+    <string name="fw_add_rule_title">Add firewall rule</string>
     <string name="home_fw_suggestion_title">Suggested firewall rules for %1$s</string>
     <plurals name="fw_network_rule_count">
         <item quantity="one">%d rule</item>

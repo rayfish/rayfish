@@ -634,8 +634,13 @@ fun AddFirewallRuleDialog(
         onDismissRequest = onDismiss,
         containerColor = Rf.Sheet,
         title = {
+            val titleRes = if (direction == "in" && action == "allow" && lockedNetwork != null) {
+                R.string.allow_inbound
+            } else {
+                R.string.fw_add_rule_title
+            }
             Text(
-                stringResource(R.string.allow_inbound),
+                stringResource(titleRes),
                 fontFamily = Chakra, fontWeight = FontWeight.Bold, color = Rf.Heading,
             )
         },

@@ -94,6 +94,10 @@ fun NetworksScreen(
                 fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
                 if (!starting) PillButton(stringResource(R.string.home_join_network), onClick = { showAdd = true })
             }
+        } else if (filteredNets.isEmpty()) {
+            SectionCard {
+                Text(stringResource(R.string.networks_no_matches), fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted)
+            }
         }
         filteredNets.forEach { net ->
             SectionCard {

@@ -347,6 +347,8 @@
     <string name="toast_suggestions_accepted">已接受建议规则</string>
     <string name="toast_suggestions_dismissed">已忽略建议规则</string>
     <string name="hint_filter_networks">筛选网络或节点</string>
+    <string name="networks_no_matches">没有匹配的网络或节点。</string>
+    <string name="fw_add_rule_title">添加防火墙规则</string>
     <string name="home_fw_suggestion_title">%1$s 的建议防火墙规则</string>
     <plurals name="fw_network_rule_count">
         <item quantity="other">%d 条规则</item>
