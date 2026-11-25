@@ -18,7 +18,6 @@ cargo -q build          # --features tor, otel
 cargo -q check --workspace --all-targets
 cargo -q clippy --workspace --all-targets -- -D warnings
 cargo -q test --workspace
-cargo bench             # per-packet data path (benches/forward.rs)
 just cross              # x86_64 Linux;  just deploy <ip> = build + install + start
 just apk                # ray-mobile + Kotlin bindings + debug APK (cargo-ndk, JDK 17)
 just android-check      # compile the Android target in a container, no NDK
@@ -28,6 +27,8 @@ just macos-test        # legacy daemon detection and migration
 just macos-ipc-test    # provider message concurrency, send failures, and timeouts
 just macos-ui-test     # live menu updates and hide-on-close behavior, no VPN
 ```
+
+Benchmarks live in [rayfish/benchmarks](https://github.com/rayfish/benchmarks).
 
 - For Rust changes, run `cargo fmt --all -- --check`, workspace Clippy with `--all-targets`, and tests for the affected crates before committing. Test the whole workspace when shared types or core behavior change.
 - Always use `--workspace --all-targets` for `cargo check` and Clippy. A root-only check misses platform bridges and their tests.

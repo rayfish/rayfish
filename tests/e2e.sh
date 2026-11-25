@@ -32,7 +32,7 @@
 #                 coordinators, renewal, kicks, restarts, files (tests/e2e/mixed-version).
 #                 Needs OLD_RAY_BIN, so not part of `all`
 #   rootless      local ordinary-user mesh proxies, no TUN (tests/e2e/rootless)
-#   bench         throughput / latency benchmark        (tests/bench)
+#   bench         throughput / latency benchmark        (rayfish/benchmarks)
 #   all           every scenario above except bench and mixed-version: provision,
 #                 run, then tear each fleet down before the next (one live at a time)
 #
@@ -154,7 +154,8 @@ scenario_meta(){
     exit-node)   DIR="$ROOT/tests/e2e/exit-node"
                  NAMES=(rayfish-exit-a rayfish-exit-b rayfish-exit-c)
                  LABELS=(srv-a srv-b srv-c) ;;
-    bench)       DIR="$ROOT/tests/bench"
+    bench)       DIR="${RAYFISH_BENCHMARKS:-$ROOT/../benchmarks}/cloud"
+                 export RAYFISH_SOURCE="$ROOT"
                  NAMES=(rayfish-bench-a rayfish-bench-b)
                  LABELS=(srv-a srv-b) ;;
     *)           return 1 ;;
@@ -203,6 +204,16 @@ if ! docker_supports "$scenario"; then
 fi
 
 SERVERS="$DIR/.servers"
+if [[ "$scenario" == bench ]]; then
+  # Existing fleets keep their inventory through the repository move.
+  if [[ -f "$ROOT/tests/bench/.servers" ]]; then SERVERS="$ROOT/tests/bench/.servers"; fi
+  export RAY_BENCH_SERVERS="${RAY_BENCH_SERVERS:-$SERVERS}"
+  SERVERS="$RAY_BENCH_SERVERS"
+  if [[ "$action" != teardown && ! -f "$DIR/run.sh" ]]; then
+    echo "Set RAYFISH_BENCHMARKS to a checkout of https://github.com/rayfish/benchmarks." >&2
+    exit 2
+  fi
+fi
 NEXT="$0 $scenario run"   # printed by the backend's do_provision
 
 # provision <how> : run the active backend's provisioner. The docker backend

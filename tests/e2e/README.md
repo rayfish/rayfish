@@ -49,8 +49,7 @@ where `<scenario>` is `rootless`, `device-cert`, `connect`, `firewall`, `closed-
 (still runnable directly once `.servers` exists); the fleet definitions and the
 provision/teardown/assert bodies are shared in [`../lib/`](../lib).
 
-The throughput/latency benchmark (`tests/e2e.sh bench`) is a sibling suite
-under [`../bench/`](../bench) (same shared `tests/lib/`).
+The throughput/latency benchmark (`tests/e2e.sh bench`) lives in [rayfish/benchmarks](https://github.com/rayfish/benchmarks). Set `RAYFISH_BENCHMARKS` to its checkout, or clone it next to Rayfish as `benchmarks`.
 
 Run `bash tests/test-e2e-harness.sh` to check daemon activation, listener readiness,
 probe errors, bounded diagnostics, cleanup retries, and unknown-peer failures

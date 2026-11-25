@@ -42,3 +42,4 @@ android/.idea/
 
 # proptest failure seeds: generated locally, none are tracked here
 *.proptest-regressions
+/tests/bench/

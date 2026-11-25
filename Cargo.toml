@@ -182,20 +182,8 @@ socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-criterion = "0.5"
 tempfile = "3"
 proptest = "1"
-
-# Microbenchmarks for the per-packet data path (firewall eval + the zero-copy
-# Bytes hand-off). Run with `cargo bench`. `harness = false` lets Criterion own
-# `fn main`.
-[[bench]]
-name = "forward"
-harness = false
-
-[[bench]]
-name = "apple_bridge"
-harness = false
 
 # The `tun` crate wraps the OS TUN device and is inherently desktop: on Android
 # the packet interface is a `VpnService` fd handed in from Kotlin, not an OS
