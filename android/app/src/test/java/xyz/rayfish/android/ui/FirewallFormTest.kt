@@ -189,4 +189,19 @@ class FirewallFormTest {
         compose.waitUntil { acceptedSuggestionsFor != null }
         assertEquals("example", acceptedSuggestionsFor)
     }
+
+    @Test fun firewallScreenShowsOrphanedNetworkRulesWhenNoNetworksRemain() {
+        firewallState = FirewallStateInfo(
+            defaultInbound = "deny",
+            defaultOutbound = "allow",
+            disabled = false,
+            rules = listOf(
+                FirewallRuleInfo("in", "allow", "tcp", "9090", "any", "removed-net"),
+            ),
+        )
+        val status = Status(true, "node", "200::1", emptyList(), emptyList(), emptyList(), null)
+        compose.setContent { RayfishTheme { FirewallScreen(status = status, onBack = {}, onToast = {}) } }
+        compose.waitForIdle()
+        compose.onNodeWithText("allow tcp:9090").assertExists()
+    }
 }

@@ -37,10 +37,9 @@ import xyz.rayfish.android.ui.components.*
 import xyz.rayfish.android.ui.theme.*
 import xyz.rayfish.android.ui.userMessage
 
-/** True when a firewall rule applies across all networks rather than a single named network. */
+/** True when a firewall rule applies across all networks or to an inactive/removed network. */
 internal fun FirewallRuleInfo.isGeneralRule(knownNetworks: Set<String>): Boolean =
-    network.isEmpty() || network == "*" || network == "any" ||
-        (knownNetworks.isNotEmpty() && network !in knownNetworks)
+    network.isEmpty() || network == "*" || network == "any" || network !in knownNetworks
 
 /** Resolve a rule's peer identifier against known network peers for display. */
 @Composable
@@ -76,7 +75,7 @@ fun FirewallScreen(
         }
     }
 
-    LaunchedEffect(status?.networks) {
+    LaunchedEffect(status?.running, status?.networks) {
         reloadFirewall()
     }
 
@@ -384,6 +383,13 @@ fun FirewallScreen(
                     }
                 }
             }
+        } ?: SectionCard {
+            Text(
+                stringResource(
+                    if (status?.running == true) R.string.status_starting_ellipsis else R.string.need_running,
+                ),
+                fontFamily = Chakra, fontSize = 14.sp, color = Rf.Muted,
+            )
         }
     }
 
