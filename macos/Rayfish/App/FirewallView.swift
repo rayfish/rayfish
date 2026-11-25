@@ -816,13 +816,17 @@ struct AddFirewallRuleSheet: View {
     }
 
     private var peerOptions: [PeerOption] {
+        peerOptions(forNetwork: network)
+    }
+
+    private func peerOptions(forNetwork selectedNetwork: String) -> [PeerOption] {
         var labelsByIdentity: [String: Set<String>] = [:]
         for net in controller.status?.networks ?? [] {
-            if !network.isEmpty && net.name != network { continue }
+            if !selectedNetwork.isEmpty && net.name != selectedNetwork { continue }
             for item in net.peers where !item.isOwnDevice {
                 let identity = item.identity ?? item.ipv6
                 let name = item.hostname.isEmpty ? item.ipv6 : item.hostname
-                let label = network.isEmpty ? "\(name) · \(net.name)" : name
+                let label = selectedNetwork.isEmpty ? "\(name) · \(net.name)" : name
                 labelsByIdentity[identity, default: []].insert(label)
             }
         }
@@ -880,7 +884,15 @@ struct AddFirewallRuleSheet: View {
 
             if !draft.lockNetwork {
                 fieldRow("Scope") {
-                    Picker("Scope", selection: $network) {
+                    Picker("Scope", selection: Binding(
+                        get: { network },
+                        set: { next in
+                            network = next
+                            if !peerOptions(forNetwork: next).contains(where: { $0.id == peer }) {
+                                peer = ""
+                            }
+                        }
+                    )) {
                         ForEach(networkOptions) { option in Text(option.label).tag(option.id) }
                     }
                     .labelsHidden()
@@ -974,9 +986,6 @@ struct AddFirewallRuleSheet: View {
         }
         .rayfishSheet()
         .frame(width: 540)
-        .onChange(of: network) { _ in
-            if !peerOptions.contains(where: { $0.id == peer }) { peer = "" }
-        }
     }
 
     private func presetButton(_ label: String, apply: @escaping () -> Void) -> some View {
