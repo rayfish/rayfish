@@ -748,9 +748,19 @@ public protocol NodeProtocol: AnyObject, Sendable {
     func down() throws
 
     /**
+     * Accept pending coordinator-suggested firewall rules for `network`.
+     */
+    func firewallAcceptSuggestions(network: String) throws
+
+    /**
      * Add a firewall rule. `port`/`peer`/`network` are optional.
      */
     func firewallAdd(direction: String, action: String, `protocol`: String, port: String?, peer: String?, network: String?) throws
+
+    /**
+     * Dismiss pending coordinator-suggested firewall rules for `network`.
+     */
+    func firewallDenySuggestions(network: String) throws
 
     /**
      * Remove the rule at the given index (as shown by firewall_show).
@@ -758,10 +768,25 @@ public protocol NodeProtocol: AnyObject, Sendable {
     func firewallRemove(index: UInt32) throws
 
     /**
-     * Set the inbound default action ("allow" or "deny"). The outbound default
-     * stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
+     * Set the inbound default action ("allow" or "deny"). Inbound ICMP-allow
+     * is a separate built-in and is unaffected.
      */
     func firewallSetDefaultInbound(action: String) throws
+
+    /**
+     * Set the outbound default action ("allow" or "deny").
+     */
+    func firewallSetDefaultOutbound(action: String) throws
+
+    /**
+     * Enable or pause packet-firewall enforcement while keeping stored rules.
+     */
+    func firewallSetEnabled(enabled: Bool) throws
+
+    /**
+     * Send TCP RST / ICMPv6 admin-prohibited instead of silently dropping blocked packets.
+     */
+    func firewallSetReject(reject: Bool) throws
 
     /**
      * Current firewall posture and rules.
@@ -963,6 +988,11 @@ public protocol NodeProtocol: AnyObject, Sendable {
     func setHostname(network: String, hostname: String) throws
 
     func setInboundPolicy(policy: InboundPolicy) throws
+
+    /**
+     * Automatically apply coordinator-suggested firewall rules for `network`.
+     */
+    func setNetworkFirewallAutoAccept(network: String, enabled: Bool) throws
 
     /**
      * Save the engine selection. Restart the node to apply it.
@@ -1293,6 +1323,16 @@ open func down()throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
 }
 
     /**
+     * Accept pending coordinator-suggested firewall rules for `network`.
+     */
+open func firewallAcceptSuggestions(network: String)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
+    uniffi_ray_mobile_fn_method_node_firewall_accept_suggestions(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),$0
+    )
+}
+}
+
+    /**
      * Add a firewall rule. `port`/`peer`/`network` are optional.
      */
 open func firewallAdd(direction: String, action: String, `protocol`: String, port: String?, peer: String?, network: String?)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
@@ -1308,6 +1348,16 @@ open func firewallAdd(direction: String, action: String, `protocol`: String, por
 }
 
     /**
+     * Dismiss pending coordinator-suggested firewall rules for `network`.
+     */
+open func firewallDenySuggestions(network: String)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
+    uniffi_ray_mobile_fn_method_node_firewall_deny_suggestions(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),$0
+    )
+}
+}
+
+    /**
      * Remove the rule at the given index (as shown by firewall_show).
      */
 open func firewallRemove(index: UInt32)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
@@ -1318,12 +1368,42 @@ open func firewallRemove(index: UInt32)throws   {try rustCallWithError(FfiConver
 }
 
     /**
-     * Set the inbound default action ("allow" or "deny"). The outbound default
-     * stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
+     * Set the inbound default action ("allow" or "deny"). Inbound ICMP-allow
+     * is a separate built-in and is unaffected.
      */
 open func firewallSetDefaultInbound(action: String)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
     uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(self.uniffiClonePointer(),
         FfiConverterString.lower(action),$0
+    )
+}
+}
+
+    /**
+     * Set the outbound default action ("allow" or "deny").
+     */
+open func firewallSetDefaultOutbound(action: String)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
+    uniffi_ray_mobile_fn_method_node_firewall_set_default_outbound(self.uniffiClonePointer(),
+        FfiConverterString.lower(action),$0
+    )
+}
+}
+
+    /**
+     * Enable or pause packet-firewall enforcement while keeping stored rules.
+     */
+open func firewallSetEnabled(enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
+    uniffi_ray_mobile_fn_method_node_firewall_set_enabled(self.uniffiClonePointer(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+
+    /**
+     * Send TCP RST / ICMPv6 admin-prohibited instead of silently dropping blocked packets.
+     */
+open func firewallSetReject(reject: Bool)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
+    uniffi_ray_mobile_fn_method_node_firewall_set_reject(self.uniffiClonePointer(),
+        FfiConverterBool.lower(reject),$0
     )
 }
 }
@@ -1685,6 +1765,17 @@ open func setInboundPolicy(policy: InboundPolicy)throws   {try rustCallWithError
 }
 
     /**
+     * Automatically apply coordinator-suggested firewall rules for `network`.
+     */
+open func setNetworkFirewallAutoAccept(network: String, enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
+    uniffi_ray_mobile_fn_method_node_set_network_firewall_auto_accept(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+
+    /**
      * Save the engine selection. Restart the node to apply it.
      */
 open func setQuicEngine(engine: QuicEngine)throws   {try rustCallWithError(FfiConverterTypeRayError_lift) {
@@ -2015,16 +2106,18 @@ public struct FirewallRuleInfo {
     public var port: String
     public var peer: String
     public var network: String
+    public var suggestedBy: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(direction: String, action: String, `protocol`: String, port: String, peer: String, network: String) {
+    public init(direction: String, action: String, `protocol`: String, port: String, peer: String, network: String, suggestedBy: String? = nil) {
         self.direction = direction
         self.action = action
         self.`protocol` = `protocol`
         self.port = port
         self.peer = peer
         self.network = network
+        self.suggestedBy = suggestedBy
     }
 }
 
@@ -2053,6 +2146,9 @@ extension FirewallRuleInfo: Equatable, Hashable {
         if lhs.network != rhs.network {
             return false
         }
+        if lhs.suggestedBy != rhs.suggestedBy {
+            return false
+        }
         return true
     }
 
@@ -2063,6 +2159,7 @@ extension FirewallRuleInfo: Equatable, Hashable {
         hasher.combine(port)
         hasher.combine(peer)
         hasher.combine(network)
+        hasher.combine(suggestedBy)
     }
 }
 
@@ -2082,7 +2179,8 @@ public struct FfiConverterTypeFirewallRuleInfo: FfiConverterRustBuffer {
                 protocol: FfiConverterString.read(from: &buf),
                 port: FfiConverterString.read(from: &buf),
                 peer: FfiConverterString.read(from: &buf),
-                network: FfiConverterString.read(from: &buf)
+                network: FfiConverterString.read(from: &buf),
+                suggestedBy: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -2093,6 +2191,7 @@ public struct FfiConverterTypeFirewallRuleInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.port, into: &buf)
         FfiConverterString.write(value.peer, into: &buf)
         FfiConverterString.write(value.network, into: &buf)
+        FfiConverterOptionString.write(value.suggestedBy, into: &buf)
     }
 }
 
@@ -2120,14 +2219,18 @@ public struct FirewallStateInfo {
     public var defaultOutbound: String
     public var disabled: Bool
     public var rules: [FirewallRuleInfo]
+    public var reject: Bool
+    public var networks: [NetworkFirewallInfo]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(defaultInbound: String, defaultOutbound: String, disabled: Bool, rules: [FirewallRuleInfo]) {
+    public init(defaultInbound: String, defaultOutbound: String, disabled: Bool, rules: [FirewallRuleInfo], reject: Bool = false, networks: [NetworkFirewallInfo] = []) {
         self.defaultInbound = defaultInbound
         self.defaultOutbound = defaultOutbound
         self.disabled = disabled
         self.rules = rules
+        self.reject = reject
+        self.networks = networks
     }
 }
 
@@ -2150,6 +2253,12 @@ extension FirewallStateInfo: Equatable, Hashable {
         if lhs.rules != rhs.rules {
             return false
         }
+        if lhs.reject != rhs.reject {
+            return false
+        }
+        if lhs.networks != rhs.networks {
+            return false
+        }
         return true
     }
 
@@ -2158,6 +2267,8 @@ extension FirewallStateInfo: Equatable, Hashable {
         hasher.combine(defaultOutbound)
         hasher.combine(disabled)
         hasher.combine(rules)
+        hasher.combine(reject)
+        hasher.combine(networks)
     }
 }
 
@@ -2175,7 +2286,9 @@ public struct FfiConverterTypeFirewallStateInfo: FfiConverterRustBuffer {
                 defaultInbound: FfiConverterString.read(from: &buf),
                 defaultOutbound: FfiConverterString.read(from: &buf),
                 disabled: FfiConverterBool.read(from: &buf),
-                rules: FfiConverterSequenceTypeFirewallRuleInfo.read(from: &buf)
+                rules: FfiConverterSequenceTypeFirewallRuleInfo.read(from: &buf),
+                reject: FfiConverterBool.read(from: &buf),
+                networks: FfiConverterSequenceTypeNetworkFirewallInfo.read(from: &buf)
         )
     }
 
@@ -2184,6 +2297,8 @@ public struct FfiConverterTypeFirewallStateInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.defaultOutbound, into: &buf)
         FfiConverterBool.write(value.disabled, into: &buf)
         FfiConverterSequenceTypeFirewallRuleInfo.write(value.rules, into: &buf)
+        FfiConverterBool.write(value.reject, into: &buf)
+        FfiConverterSequenceTypeNetworkFirewallInfo.write(value.networks, into: &buf)
     }
 }
 
@@ -2626,6 +2741,8 @@ public struct NetworkDetail {
      * [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
      */
     public var reason: String?
+    public var pendingSuggestions: UInt32
+    public var autoAcceptFirewall: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2633,7 +2750,7 @@ public struct NetworkDetail {
         /**
          * The daemon's one-line reason for the last failed restore, when `state` is
          * [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
-         */reason: String?) {
+         */reason: String?, pendingSuggestions: UInt32 = UInt32(0), autoAcceptFirewall: Bool = false) {
         self.name = name
         self.ipv6 = ipv6
         self.hostname = hostname
@@ -2641,6 +2758,8 @@ public struct NetworkDetail {
         self.peers = peers
         self.state = state
         self.reason = reason
+        self.pendingSuggestions = pendingSuggestions
+        self.autoAcceptFirewall = autoAcceptFirewall
     }
 }
 
@@ -2672,6 +2791,12 @@ extension NetworkDetail: Equatable, Hashable {
         if lhs.reason != rhs.reason {
             return false
         }
+        if lhs.pendingSuggestions != rhs.pendingSuggestions {
+            return false
+        }
+        if lhs.autoAcceptFirewall != rhs.autoAcceptFirewall {
+            return false
+        }
         return true
     }
 
@@ -2683,6 +2808,8 @@ extension NetworkDetail: Equatable, Hashable {
         hasher.combine(peers)
         hasher.combine(state)
         hasher.combine(reason)
+        hasher.combine(pendingSuggestions)
+        hasher.combine(autoAcceptFirewall)
     }
 }
 
@@ -2703,7 +2830,9 @@ public struct FfiConverterTypeNetworkDetail: FfiConverterRustBuffer {
                 isCoordinator: FfiConverterBool.read(from: &buf),
                 peers: FfiConverterSequenceTypePeerInfo.read(from: &buf),
                 state: FfiConverterTypeNetworkConnState.read(from: &buf),
-                reason: FfiConverterOptionString.read(from: &buf)
+                reason: FfiConverterOptionString.read(from: &buf),
+                pendingSuggestions: FfiConverterUInt32.read(from: &buf),
+                autoAcceptFirewall: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2715,6 +2844,8 @@ public struct FfiConverterTypeNetworkDetail: FfiConverterRustBuffer {
         FfiConverterSequenceTypePeerInfo.write(value.peers, into: &buf)
         FfiConverterTypeNetworkConnState.write(value.state, into: &buf)
         FfiConverterOptionString.write(value.reason, into: &buf)
+        FfiConverterUInt32.write(value.pendingSuggestions, into: &buf)
+        FfiConverterBool.write(value.autoAcceptFirewall, into: &buf)
     }
 }
 
@@ -2731,6 +2862,89 @@ public func FfiConverterTypeNetworkDetail_lift(_ buf: RustBuffer) throws -> Netw
 #endif
 public func FfiConverterTypeNetworkDetail_lower(_ value: NetworkDetail) -> RustBuffer {
     return FfiConverterTypeNetworkDetail.lower(value)
+}
+
+
+/**
+ * Per-network firewall settings and pending coordinator suggestions.
+ */
+public struct NetworkFirewallInfo {
+    public var network: String
+    public var autoAccept: Bool
+    public var pendingRules: [FirewallRuleInfo]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(network: String, autoAccept: Bool, pendingRules: [FirewallRuleInfo]) {
+        self.network = network
+        self.autoAccept = autoAccept
+        self.pendingRules = pendingRules
+    }
+}
+
+#if compiler(>=6)
+extension NetworkFirewallInfo: Sendable {}
+#endif
+
+
+extension NetworkFirewallInfo: Equatable, Hashable {
+    public static func ==(lhs: NetworkFirewallInfo, rhs: NetworkFirewallInfo) -> Bool {
+        if lhs.network != rhs.network {
+            return false
+        }
+        if lhs.autoAccept != rhs.autoAccept {
+            return false
+        }
+        if lhs.pendingRules != rhs.pendingRules {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(network)
+        hasher.combine(autoAccept)
+        hasher.combine(pendingRules)
+    }
+}
+
+extension NetworkFirewallInfo: Codable {}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNetworkFirewallInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NetworkFirewallInfo {
+        return
+            try NetworkFirewallInfo(
+                network: FfiConverterString.read(from: &buf),
+                autoAccept: FfiConverterBool.read(from: &buf),
+                pendingRules: FfiConverterSequenceTypeFirewallRuleInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NetworkFirewallInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.network, into: &buf)
+        FfiConverterBool.write(value.autoAccept, into: &buf)
+        FfiConverterSequenceTypeFirewallRuleInfo.write(value.pendingRules, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNetworkFirewallInfo_lift(_ buf: RustBuffer) throws -> NetworkFirewallInfo {
+    return try FfiConverterTypeNetworkFirewallInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNetworkFirewallInfo_lower(_ value: NetworkFirewallInfo) -> RustBuffer {
+    return FfiConverterTypeNetworkFirewallInfo.lower(value)
 }
 
 
@@ -4455,6 +4669,31 @@ fileprivate struct FfiConverterSequenceTypeNetworkDetail: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeNetworkFirewallInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [NetworkFirewallInfo]
+
+    public static func write(_ value: [NetworkFirewallInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeNetworkFirewallInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [NetworkFirewallInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [NetworkFirewallInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeNetworkFirewallInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeNetworkHealth: FfiConverterRustBuffer {
     typealias SwiftType = [NetworkHealth]
 
@@ -4655,13 +4894,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ray_mobile_checksum_method_node_down() != 54510) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ray_mobile_checksum_method_node_firewall_accept_suggestions() != 36700) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ray_mobile_checksum_method_node_firewall_add() != 24154) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_mobile_checksum_method_node_firewall_deny_suggestions() != 35812) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_mobile_checksum_method_node_firewall_remove() != 54283) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound() != 39478) {
+    if (uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound() != 915) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_mobile_checksum_method_node_firewall_set_default_outbound() != 64509) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_mobile_checksum_method_node_firewall_set_enabled() != 39558) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_mobile_checksum_method_node_firewall_set_reject() != 14504) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_mobile_checksum_method_node_firewall_show() != 46519) {
@@ -4749,6 +5003,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_mobile_checksum_method_node_set_inbound_policy() != 2409) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ray_mobile_checksum_method_node_set_network_firewall_auto_accept() != 20565) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ray_mobile_checksum_method_node_set_quic_engine() != 39138) {

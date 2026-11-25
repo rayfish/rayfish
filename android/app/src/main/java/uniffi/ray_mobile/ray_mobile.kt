@@ -825,11 +825,21 @@ internal interface IntegrityCheckingUniffiLib : Library {
 
     fun uniffi_ray_mobile_checksum_method_node_down(): Short
 
+    fun uniffi_ray_mobile_checksum_method_node_firewall_accept_suggestions(): Short
+
     fun uniffi_ray_mobile_checksum_method_node_firewall_add(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_firewall_deny_suggestions(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_firewall_remove(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_firewall_set_default_outbound(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_firewall_set_enabled(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_firewall_set_reject(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_firewall_show(): Short
 
@@ -888,6 +898,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
     fun uniffi_ray_mobile_checksum_method_node_set_hostname(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_set_inbound_policy(): Short
+
+    fun uniffi_ray_mobile_checksum_method_node_set_network_firewall_auto_accept(): Short
 
     fun uniffi_ray_mobile_checksum_method_node_set_quic_engine(): Short
 
@@ -1087,6 +1099,12 @@ internal interface UniffiLib : Library {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    fun uniffi_ray_mobile_fn_method_node_firewall_accept_suggestions(
+        `ptr`: Pointer,
+        `network`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     fun uniffi_ray_mobile_fn_method_node_firewall_add(
         `ptr`: Pointer,
         `direction`: RustBuffer.ByValue,
@@ -1094,6 +1112,12 @@ internal interface UniffiLib : Library {
         `protocol`: RustBuffer.ByValue,
         `port`: RustBuffer.ByValue,
         `peer`: RustBuffer.ByValue,
+        `network`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_firewall_deny_suggestions(
+        `ptr`: Pointer,
         `network`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
@@ -1107,6 +1131,24 @@ internal interface UniffiLib : Library {
     fun uniffi_ray_mobile_fn_method_node_firewall_set_default_inbound(
         `ptr`: Pointer,
         `action`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_firewall_set_default_outbound(
+        `ptr`: Pointer,
+        `action`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_firewall_set_enabled(
+        `ptr`: Pointer,
+        `enabled`: Byte,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_firewall_set_reject(
+        `ptr`: Pointer,
+        `reject`: Byte,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1273,6 +1315,13 @@ internal interface UniffiLib : Library {
     fun uniffi_ray_mobile_fn_method_node_set_inbound_policy(
         `ptr`: Pointer,
         `policy`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun uniffi_ray_mobile_fn_method_node_set_network_firewall_auto_accept(
+        `ptr`: Pointer,
+        `network`: RustBuffer.ByValue,
+        `enabled`: Byte,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1629,13 +1678,28 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_ray_mobile_checksum_method_node_down() != 54510.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_accept_suggestions() != 36700.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ray_mobile_checksum_method_node_firewall_add() != 24154.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_deny_suggestions() != 35812.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_firewall_remove() != 54283.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound() != 39478.toShort()) {
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_set_default_inbound() != 915.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_set_default_outbound() != 64509.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_set_enabled() != 39558.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_firewall_set_reject() != 14504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_firewall_show() != 46519.toShort()) {
@@ -1723,6 +1787,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_inbound_policy() != 2409.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ray_mobile_checksum_method_node_set_network_firewall_auto_accept() != 20565.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ray_mobile_checksum_method_node_set_quic_engine() != 39138.toShort()) {
@@ -2539,6 +2606,11 @@ public interface NodeInterface {
     fun `down`()
 
     /**
+     * Accept pending coordinator-suggested firewall rules for `network`.
+     */
+    fun `firewallAcceptSuggestions`(`network`: kotlin.String)
+
+    /**
      * Add a firewall rule. `port`/`peer`/`network` are optional.
      */
     fun `firewallAdd`(
@@ -2551,15 +2623,35 @@ public interface NodeInterface {
     )
 
     /**
+     * Dismiss pending coordinator-suggested firewall rules for `network`.
+     */
+    fun `firewallDenySuggestions`(`network`: kotlin.String)
+
+    /**
      * Remove the rule at the given index (as shown by firewall_show).
      */
     fun `firewallRemove`(`index`: kotlin.UInt)
 
     /**
-     * Set the inbound default action ("allow" or "deny"). The outbound default
-     * stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
+     * Set the inbound default action ("allow" or "deny"). Inbound ICMP-allow
+     * is a separate built-in and is unaffected.
      */
     fun `firewallSetDefaultInbound`(`action`: kotlin.String)
+
+    /**
+     * Set the outbound default action ("allow" or "deny").
+     */
+    fun `firewallSetDefaultOutbound`(`action`: kotlin.String)
+
+    /**
+     * Enable or pause packet-firewall enforcement while keeping stored rules.
+     */
+    fun `firewallSetEnabled`(`enabled`: kotlin.Boolean)
+
+    /**
+     * Send TCP RST / ICMPv6 admin-prohibited instead of silently dropping blocked packets.
+     */
+    fun `firewallSetReject`(`reject`: kotlin.Boolean)
 
     /**
      * Current firewall posture and rules.
@@ -2774,6 +2866,14 @@ public interface NodeInterface {
     )
 
     fun `setInboundPolicy`(`policy`: InboundPolicy)
+
+    /**
+     * Automatically apply coordinator-suggested firewall rules for `network`.
+     */
+    fun `setNetworkFirewallAutoAccept`(
+        `network`: kotlin.String,
+        `enabled`: kotlin.Boolean,
+    )
 
     /**
      * Save the engine selection. Restart the node to apply it.
@@ -3186,6 +3286,21 @@ open class Node :
         }
 
     /**
+     * Accept pending coordinator-suggested firewall rules for `network`.
+     */
+    @Throws(RayException::class)
+    override fun `firewallAcceptSuggestions`(`network`: kotlin.String) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_accept_suggestions(
+                    it,
+                    FfiConverterString.lower(`network`),
+                    _status,
+                )
+            }
+        }
+
+    /**
      * Add a firewall rule. `port`/`peer`/`network` are optional.
      */
     @Throws(RayException::class)
@@ -3212,6 +3327,21 @@ open class Node :
     }
 
     /**
+     * Dismiss pending coordinator-suggested firewall rules for `network`.
+     */
+    @Throws(RayException::class)
+    override fun `firewallDenySuggestions`(`network`: kotlin.String) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_deny_suggestions(
+                    it,
+                    FfiConverterString.lower(`network`),
+                    _status,
+                )
+            }
+        }
+
+    /**
      * Remove the rule at the given index (as shown by firewall_show).
      */
     @Throws(RayException::class)
@@ -3223,8 +3353,8 @@ open class Node :
         }
 
     /**
-     * Set the inbound default action ("allow" or "deny"). The outbound default
-     * stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
+     * Set the inbound default action ("allow" or "deny"). Inbound ICMP-allow
+     * is a separate built-in and is unaffected.
      */
     @Throws(RayException::class)
     override fun `firewallSetDefaultInbound`(`action`: kotlin.String) =
@@ -3235,6 +3365,43 @@ open class Node :
                     FfiConverterString.lower(`action`),
                     _status,
                 )
+            }
+        }
+
+    /**
+     * Set the outbound default action ("allow" or "deny").
+     */
+    @Throws(RayException::class)
+    override fun `firewallSetDefaultOutbound`(`action`: kotlin.String) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_set_default_outbound(
+                    it,
+                    FfiConverterString.lower(`action`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Enable or pause packet-firewall enforcement while keeping stored rules.
+     */
+    @Throws(RayException::class)
+    override fun `firewallSetEnabled`(`enabled`: kotlin.Boolean) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_set_enabled(it, FfiConverterBoolean.lower(`enabled`), _status)
+            }
+        }
+
+    /**
+     * Send TCP RST / ICMPv6 admin-prohibited instead of silently dropping blocked packets.
+     */
+    @Throws(RayException::class)
+    override fun `firewallSetReject`(`reject`: kotlin.Boolean) =
+        callWithPointer {
+            uniffiRustCallWithError(RayException) { _status ->
+                UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_firewall_set_reject(it, FfiConverterBoolean.lower(`reject`), _status)
             }
         }
 
@@ -3685,6 +3852,24 @@ open class Node :
         }
 
     /**
+     * Automatically apply coordinator-suggested firewall rules for `network`.
+     */
+    @Throws(RayException::class)
+    override fun `setNetworkFirewallAutoAccept`(
+        `network`: kotlin.String,
+        `enabled`: kotlin.Boolean,
+    ) = callWithPointer {
+        uniffiRustCallWithError(RayException) { _status ->
+            UniffiLib.INSTANCE.uniffi_ray_mobile_fn_method_node_set_network_firewall_auto_accept(
+                it,
+                FfiConverterString.lower(`network`),
+                FfiConverterBoolean.lower(`enabled`),
+                _status,
+            )
+        }
+    }
+
+    /**
      * Save the engine selection. Restart the node to apply it.
      */
     @Throws(RayException::class)
@@ -3952,6 +4137,7 @@ data class FirewallRuleInfo(
     var `port`: kotlin.String,
     var `peer`: kotlin.String,
     var `network`: kotlin.String,
+    var `suggestedBy`: kotlin.String? = null,
 ) {
     companion object
 }
@@ -3968,6 +4154,7 @@ public object FfiConverterTypeFirewallRuleInfo : FfiConverterRustBuffer<Firewall
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
 
     override fun allocationSize(value: FirewallRuleInfo) =
@@ -3977,7 +4164,8 @@ public object FfiConverterTypeFirewallRuleInfo : FfiConverterRustBuffer<Firewall
                 FfiConverterString.allocationSize(value.`protocol`) +
                 FfiConverterString.allocationSize(value.`port`) +
                 FfiConverterString.allocationSize(value.`peer`) +
-                FfiConverterString.allocationSize(value.`network`)
+                FfiConverterString.allocationSize(value.`network`) +
+                FfiConverterOptionalString.allocationSize(value.`suggestedBy`)
         )
 
     override fun write(
@@ -3990,6 +4178,7 @@ public object FfiConverterTypeFirewallRuleInfo : FfiConverterRustBuffer<Firewall
         FfiConverterString.write(value.`port`, buf)
         FfiConverterString.write(value.`peer`, buf)
         FfiConverterString.write(value.`network`, buf)
+        FfiConverterOptionalString.write(value.`suggestedBy`, buf)
     }
 }
 
@@ -4001,6 +4190,8 @@ data class FirewallStateInfo(
     var `defaultOutbound`: kotlin.String,
     var `disabled`: kotlin.Boolean,
     var `rules`: List<FirewallRuleInfo>,
+    var `reject`: kotlin.Boolean = false,
+    var `networks`: List<NetworkFirewallInfo> = listOf(),
 ) {
     companion object
 }
@@ -4015,6 +4206,8 @@ public object FfiConverterTypeFirewallStateInfo : FfiConverterRustBuffer<Firewal
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypeFirewallRuleInfo.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceTypeNetworkFirewallInfo.read(buf),
         )
 
     override fun allocationSize(value: FirewallStateInfo) =
@@ -4022,7 +4215,9 @@ public object FfiConverterTypeFirewallStateInfo : FfiConverterRustBuffer<Firewal
             FfiConverterString.allocationSize(value.`defaultInbound`) +
                 FfiConverterString.allocationSize(value.`defaultOutbound`) +
                 FfiConverterBoolean.allocationSize(value.`disabled`) +
-                FfiConverterSequenceTypeFirewallRuleInfo.allocationSize(value.`rules`)
+                FfiConverterSequenceTypeFirewallRuleInfo.allocationSize(value.`rules`) +
+                FfiConverterBoolean.allocationSize(value.`reject`) +
+                FfiConverterSequenceTypeNetworkFirewallInfo.allocationSize(value.`networks`)
         )
 
     override fun write(
@@ -4033,6 +4228,8 @@ public object FfiConverterTypeFirewallStateInfo : FfiConverterRustBuffer<Firewal
         FfiConverterString.write(value.`defaultOutbound`, buf)
         FfiConverterBoolean.write(value.`disabled`, buf)
         FfiConverterSequenceTypeFirewallRuleInfo.write(value.`rules`, buf)
+        FfiConverterBoolean.write(value.`reject`, buf)
+        FfiConverterSequenceTypeNetworkFirewallInfo.write(value.`networks`, buf)
     }
 }
 
@@ -4246,6 +4443,8 @@ data class NetworkDetail(
      * [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
      */
     var `reason`: kotlin.String?,
+    var `pendingSuggestions`: kotlin.UInt = 0u,
+    var `autoAcceptFirewall`: kotlin.Boolean = false,
 ) {
     companion object
 }
@@ -4263,6 +4462,8 @@ public object FfiConverterTypeNetworkDetail : FfiConverterRustBuffer<NetworkDeta
             FfiConverterSequenceTypePeerInfo.read(buf),
             FfiConverterTypeNetworkConnState.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: NetworkDetail) =
@@ -4273,7 +4474,9 @@ public object FfiConverterTypeNetworkDetail : FfiConverterRustBuffer<NetworkDeta
                 FfiConverterBoolean.allocationSize(value.`isCoordinator`) +
                 FfiConverterSequenceTypePeerInfo.allocationSize(value.`peers`) +
                 FfiConverterTypeNetworkConnState.allocationSize(value.`state`) +
-                FfiConverterOptionalString.allocationSize(value.`reason`)
+                FfiConverterOptionalString.allocationSize(value.`reason`) +
+                FfiConverterUInt.allocationSize(value.`pendingSuggestions`) +
+                FfiConverterBoolean.allocationSize(value.`autoAcceptFirewall`)
         )
 
     override fun write(
@@ -4287,6 +4490,47 @@ public object FfiConverterTypeNetworkDetail : FfiConverterRustBuffer<NetworkDeta
         FfiConverterSequenceTypePeerInfo.write(value.`peers`, buf)
         FfiConverterTypeNetworkConnState.write(value.`state`, buf)
         FfiConverterOptionalString.write(value.`reason`, buf)
+        FfiConverterUInt.write(value.`pendingSuggestions`, buf)
+        FfiConverterBoolean.write(value.`autoAcceptFirewall`, buf)
+    }
+}
+
+/**
+ * Per-network firewall settings and pending coordinator suggestions.
+ */
+data class NetworkFirewallInfo(
+    var `network`: kotlin.String,
+    var `autoAccept`: kotlin.Boolean,
+    var `pendingRules`: List<FirewallRuleInfo>,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNetworkFirewallInfo : FfiConverterRustBuffer<NetworkFirewallInfo> {
+    override fun read(buf: ByteBuffer): NetworkFirewallInfo =
+        NetworkFirewallInfo(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceTypeFirewallRuleInfo.read(buf),
+        )
+
+    override fun allocationSize(value: NetworkFirewallInfo) =
+        (
+            FfiConverterString.allocationSize(value.`network`) +
+                FfiConverterBoolean.allocationSize(value.`autoAccept`) +
+                FfiConverterSequenceTypeFirewallRuleInfo.allocationSize(value.`pendingRules`)
+        )
+
+    override fun write(
+        value: NetworkFirewallInfo,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`network`, buf)
+        FfiConverterBoolean.write(value.`autoAccept`, buf)
+        FfiConverterSequenceTypeFirewallRuleInfo.write(value.`pendingRules`, buf)
     }
 }
 
@@ -5383,6 +5627,34 @@ public object FfiConverterSequenceTypeNetworkDetail : FfiConverterRustBuffer<Lis
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNetworkDetail.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeNetworkFirewallInfo : FfiConverterRustBuffer<List<NetworkFirewallInfo>> {
+    override fun read(buf: ByteBuffer): List<NetworkFirewallInfo> {
+        val len = buf.getInt()
+        return List<NetworkFirewallInfo>(len) {
+            FfiConverterTypeNetworkFirewallInfo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<NetworkFirewallInfo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeNetworkFirewallInfo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<NetworkFirewallInfo>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeNetworkFirewallInfo.write(it, buf)
         }
     }
 }

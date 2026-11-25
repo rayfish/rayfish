@@ -77,7 +77,7 @@ use android_tun::{AndroidTunReader, AndroidTunWriter};
 use iroh::EndpointId;
 use rayfish::config;
 use rayfish::config::QuicEngine as CoreQuicEngine;
-use rayfish::config::settings::GlobalKey;
+use rayfish::config::settings::{GlobalKey, NetworkKey};
 use rayfish::control;
 use rayfish::daemon::transfers;
 use rayfish::daemon::{DaemonState, Done, FirewallView, JoinOutcome, OpError, build_headless};
@@ -250,6 +250,10 @@ pub struct NetworkDetail {
     /// The daemon's one-line reason for the last failed restore, when `state` is
     /// [`NetworkConnState::NotConnected`] because of one. `None` otherwise.
     pub reason: Option<String>,
+    #[uniffi(default = 0)]
+    pub pending_suggestions: u32,
+    #[uniffi(default = false)]
+    pub auto_accept_firewall: bool,
 }
 
 /// Packet forwarding engine, applied when the node next starts.
@@ -399,6 +403,16 @@ pub struct FirewallRuleInfo {
     pub port: String,
     pub peer: String,
     pub network: String,
+    #[uniffi(default = None)]
+    pub suggested_by: Option<String>,
+}
+
+/// Per-network firewall settings and pending coordinator suggestions.
+#[derive(uniffi::Record)]
+pub struct NetworkFirewallInfo {
+    pub network: String,
+    pub auto_accept: bool,
+    pub pending_rules: Vec<FirewallRuleInfo>,
 }
 
 /// Current firewall posture and rules, for the UI.
@@ -408,6 +422,10 @@ pub struct FirewallStateInfo {
     pub default_outbound: String,
     pub disabled: bool,
     pub rules: Vec<FirewallRuleInfo>,
+    #[uniffi(default = false)]
+    pub reject: bool,
+    #[uniffi(default = [])]
+    pub networks: Vec<NetworkFirewallInfo>,
 }
 
 /// A pending incoming file offer, for the notifications UI.
@@ -546,6 +564,24 @@ fn peer_info(p: &ipc::PeerStatus) -> PeerInfo {
     }
 }
 
+fn firewall_rule_info(v: ipc::FirewallRuleView) -> FirewallRuleInfo {
+    FirewallRuleInfo {
+        direction: v.direction.to_string(),
+        action: v.action.to_string(),
+        protocol: v.protocol.to_string(),
+        port: v.port,
+        peer: v.peer,
+        network: v.network,
+        suggested_by: v.suggested_by,
+    }
+}
+
+fn network_auto_accept_firewall(settings: Option<&config::AppConfig>, name: &str) -> bool {
+    settings
+        .and_then(|cfg| cfg.networks.iter().find(|saved| saved.name == name))
+        .is_some_and(|saved| saved.auto_accept_firewall)
+}
+
 /// Project a saved network the daemon has not registered into a [`NetworkDetail`].
 ///
 /// `reason` is the daemon's record of the last restore failure and is `None`
@@ -555,7 +591,11 @@ fn peer_info(p: &ipc::PeerStatus) -> PeerInfo {
 ///
 /// `fallback_ipv6` is this device's own mesh address, used for the name-only row
 /// a daemon predating the `saved` projection produces.
-fn inactive_network_detail(net: &ipc::InactiveNetwork, fallback_ipv6: &str) -> NetworkDetail {
+fn inactive_network_detail(
+    net: &ipc::InactiveNetwork,
+    fallback_ipv6: &str,
+    auto_accept_firewall: bool,
+) -> NetworkDetail {
     let state = match net.reason {
         None => NetworkConnState::Connecting,
         Some(_) => NetworkConnState::NotConnected,
@@ -569,6 +609,8 @@ fn inactive_network_detail(net: &ipc::InactiveNetwork, fallback_ipv6: &str) -> N
             peers: Vec::new(),
             state,
             reason: net.reason.clone(),
+            pending_suggestions: 0,
+            auto_accept_firewall,
         };
     };
     NetworkDetail {
@@ -579,6 +621,8 @@ fn inactive_network_detail(net: &ipc::InactiveNetwork, fallback_ipv6: &str) -> N
         peers: saved.peers.iter().map(peer_info).collect(),
         state,
         reason: net.reason.clone(),
+        pending_suggestions: u32::try_from(saved.pending_suggestions).unwrap_or(u32::MAX),
+        auto_accept_firewall,
     }
 }
 
@@ -589,12 +633,16 @@ fn merge_networks(
     mut live: Vec<NetworkDetail>,
     inactive: &[ipc::InactiveNetwork],
     fallback_ipv6: &str,
+    settings: Option<&config::AppConfig>,
 ) -> Vec<NetworkDetail> {
-    live.extend(
-        inactive
-            .iter()
-            .map(|n| inactive_network_detail(n, fallback_ipv6)),
-    );
+    live.extend(inactive.iter().map(|n| {
+        let name = n.saved.as_ref().map(|s| s.name.as_str()).unwrap_or(&n.name);
+        inactive_network_detail(
+            n,
+            fallback_ipv6,
+            network_auto_accept_firewall(settings, name),
+        )
+    }));
     // Stable alphabetical order so the list does not shuffle between status
     // refreshes with the core's iteration order.
     live.sort_by_key(|n| n.name.to_lowercase());
@@ -663,6 +711,8 @@ fn saved_networks_status() -> Status {
                 // failure to explain.
                 state: NetworkConnState::NotConnected,
                 reason: None,
+                pending_suggestions: 0,
+                auto_accept_firewall: net.auto_accept_firewall,
             }
         })
         .collect();
@@ -910,25 +960,38 @@ impl Node {
         let FirewallView {
             default_inbound,
             default_outbound,
+            reject,
             disabled,
             rules,
-            ..
         } = state.firewall_show();
+        let settings = config::load().ok();
+        let mut networks: Vec<NetworkFirewallInfo> = state
+            .status()
+            .networks
+            .into_iter()
+            .map(|network| {
+                let auto_accept = network_auto_accept_firewall(settings.as_ref(), &network.name);
+                let pending_rules = state
+                    .firewall_pending_rules(&network.name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(firewall_rule_info)
+                    .collect();
+                NetworkFirewallInfo {
+                    network: network.name,
+                    auto_accept,
+                    pending_rules,
+                }
+            })
+            .collect();
+        networks.sort_by_key(|n| n.network.to_lowercase());
         Ok(FirewallStateInfo {
             default_inbound: default_inbound.to_string(),
             default_outbound: default_outbound.to_string(),
             disabled,
-            rules: rules
-                .into_iter()
-                .map(|v| FirewallRuleInfo {
-                    direction: v.direction.to_string(),
-                    action: v.action.to_string(),
-                    protocol: v.protocol.to_string(),
-                    port: v.port,
-                    peer: v.peer,
-                    network: v.network,
-                })
-                .collect(),
+            rules: rules.into_iter().map(firewall_rule_info).collect(),
+            reject,
+            networks,
         })
     }
 
@@ -965,12 +1028,64 @@ impl Node {
         Ok(())
     }
 
-    /// Set the inbound default action ("allow" or "deny"). The outbound default
-    /// stays "allow"; inbound ICMP-allow is a separate built-in and is unaffected.
+    /// Set the inbound default action ("allow" or "deny"). Inbound ICMP-allow
+    /// is a separate built-in and is unaffected.
     pub fn firewall_set_default_inbound(&self, action: String) -> Result<(), RayError> {
         let state = self.state()?;
         let action: Action = action.parse().map_err(RayError::Network)?;
         state.firewall_default(action)?;
+        Ok(())
+    }
+
+    /// Set the outbound default action ("allow" or "deny").
+    pub fn firewall_set_default_outbound(&self, action: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        let action: Action = action.parse().map_err(RayError::Network)?;
+        state.firewall_default_outbound(action)?;
+        Ok(())
+    }
+
+    /// Enable or pause packet-firewall enforcement while keeping stored rules.
+    pub fn firewall_set_enabled(&self, enabled: bool) -> Result<(), RayError> {
+        let state = self.state()?;
+        state.firewall_set_enabled(enabled)?;
+        Ok(())
+    }
+
+    /// Send TCP RST / ICMPv6 admin-prohibited instead of silently dropping blocked packets.
+    pub fn firewall_set_reject(&self, reject: bool) -> Result<(), RayError> {
+        let state = self.state()?;
+        state.firewall_set_reject(reject)?;
+        Ok(())
+    }
+
+    /// Accept pending coordinator-suggested firewall rules for `network`.
+    pub fn firewall_accept_suggestions(&self, network: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        state.firewall_accept_suggestions(&network)?;
+        Ok(())
+    }
+
+    /// Dismiss pending coordinator-suggested firewall rules for `network`.
+    pub fn firewall_deny_suggestions(&self, network: String) -> Result<(), RayError> {
+        let state = self.state()?;
+        state.firewall_deny_suggestions(&network)?;
+        Ok(())
+    }
+
+    /// Automatically apply coordinator-suggested firewall rules for `network`.
+    pub fn set_network_firewall_auto_accept(
+        &self,
+        network: String,
+        enabled: bool,
+    ) -> Result<(), RayError> {
+        let state = self.state()?;
+        let value = if enabled { "on" } else { "off" };
+        self.runtime.block_on(state.net_config_set(
+            &network,
+            NetworkKey::AutoAcceptFirewall,
+            value,
+        ))?;
         Ok(())
     }
 
@@ -1559,6 +1674,7 @@ impl Node {
             ..
         } = state.status();
 
+        let settings = config::load().ok();
         let mut detail = Vec::with_capacity(networks.len() + inactive_networks.len());
         let mut flat_peers = Vec::new();
         for n in &networks {
@@ -1577,6 +1693,8 @@ impl Node {
                 peers,
                 state: NetworkConnState::Connected,
                 reason: None,
+                pending_suggestions: u32::try_from(n.pending_suggestions).unwrap_or(u32::MAX),
+                auto_accept_firewall: network_auto_accept_firewall(settings.as_ref(), &n.name),
             });
         }
         // The node's own mesh address derives from its identity, so it needs no
@@ -1584,7 +1702,7 @@ impl Node {
         let ipv6 = rayfish::membership::derive_ipv6(&endpoint_id).to_string();
         // `flat_peers` stays live-only on purpose: it is the set of peers we
         // hold connection state for, and an unregistered network has none.
-        let detail = merge_networks(detail, &inactive_networks, &ipv6);
+        let detail = merge_networks(detail, &inactive_networks, &ipv6, settings.as_ref());
 
         Status {
             running: active,
@@ -1879,11 +1997,13 @@ mod network_state_tests {
             peers: Vec::new(),
             state: NetworkConnState::Connected,
             reason: None,
+            pending_suggestions: 0,
+            auto_accept_firewall: false,
         }
     }
 
     /// A cold start has every saved network unregistered for the seconds its
-    /// restore takes. Nothing has failed yet, so the row reads as in progress —
+    /// restore takes. Nothing has failed yet, so the row reads as in progress,
     /// not as an error, and above all not as absent.
     #[test]
     fn a_restore_that_has_not_failed_yet_reads_as_connecting() {
@@ -1892,7 +2012,7 @@ mod network_state_tests {
             reason: None,
             saved: Some(saved("field", vec![])),
         };
-        let detail = inactive_network_detail(&net, "200::9");
+        let detail = inactive_network_detail(&net, "200::9", false);
         assert_eq!(detail.state, NetworkConnState::Connecting);
         assert_eq!(detail.reason, None);
     }
@@ -1907,8 +2027,9 @@ mod network_state_tests {
             reason: Some("could not fetch group blob from any peer".to_string()),
             saved: Some(saved("dgrr-peer", vec![])),
         };
-        let detail = inactive_network_detail(&net, "200::9");
+        let detail = inactive_network_detail(&net, "200::9", true);
         assert_eq!(detail.state, NetworkConnState::NotConnected);
+        assert!(detail.auto_accept_firewall);
         assert_eq!(
             detail.reason.as_deref(),
             Some("could not fetch group blob from any peer")
@@ -1925,7 +2046,7 @@ mod network_state_tests {
             reason: None,
             saved: Some(saved("field", vec![peer("laptop"), peer("desktop")])),
         };
-        let detail = inactive_network_detail(&net, "200::9");
+        let detail = inactive_network_detail(&net, "200::9", false);
         assert_eq!(detail.hostname, "phone");
         assert_eq!(detail.ipv6, Ipv6Addr::LOCALHOST.to_string());
         assert_eq!(detail.peers.len(), 2);
@@ -1947,7 +2068,7 @@ mod network_state_tests {
             reason: Some("runs mesh protocol v2".to_string()),
             saved: None,
         };
-        let detail = inactive_network_detail(&net, "200::9");
+        let detail = inactive_network_detail(&net, "200::9", false);
         assert_eq!(detail.name, "homelab");
         assert_eq!(detail.ipv6, "200::9");
         assert!(detail.peers.is_empty());
@@ -1970,10 +2091,64 @@ mod network_state_tests {
                 saved: Some(saved("zulu", vec![])),
             },
         ];
-        let merged = merge_networks(vec![live("Mike"), live("bravo")], &inactive, "200::9");
+        let merged = merge_networks(vec![live("Mike"), live("bravo")], &inactive, "200::9", None);
         let names: Vec<&str> = merged.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, ["alpha", "bravo", "Mike", "zulu"]);
         assert_eq!(merged[1].state, NetworkConnState::Connected);
         assert_eq!(merged[3].state, NetworkConnState::Connecting);
+    }
+
+    #[test]
+    fn firewall_methods_require_started_node_and_map_rule_views() {
+        let _dir_lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("rayfish-fw-mobile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = Node::new(dir.to_string_lossy().to_string());
+
+        assert!(matches!(node.firewall_show(), Err(RayError::NotStarted)));
+        assert!(matches!(
+            node.firewall_set_default_outbound("deny".into()),
+            Err(RayError::NotStarted)
+        ));
+        assert!(matches!(
+            node.firewall_set_enabled(false),
+            Err(RayError::NotStarted)
+        ));
+        assert!(matches!(
+            node.firewall_set_reject(true),
+            Err(RayError::NotStarted)
+        ));
+        assert!(matches!(
+            node.firewall_accept_suggestions("alpha".into()),
+            Err(RayError::NotStarted)
+        ));
+        assert!(matches!(
+            node.firewall_deny_suggestions("alpha".into()),
+            Err(RayError::NotStarted)
+        ));
+        assert!(matches!(
+            node.set_network_firewall_auto_accept("alpha".into(), true),
+            Err(RayError::NotStarted)
+        ));
+
+        let mapped = firewall_rule_info(ipc::FirewallRuleView {
+            direction: Direction::In,
+            action: Action::Allow,
+            protocol: Protocol::Tcp,
+            port: "443".into(),
+            peer: "build-box".into(),
+            network: "alpha".into(),
+            suggested_by: Some("coord-1".into()),
+        });
+        assert_eq!(mapped.direction, "in");
+        assert_eq!(mapped.action, "allow");
+        assert_eq!(mapped.protocol, "tcp");
+        assert_eq!(mapped.port, "443");
+        assert_eq!(mapped.peer, "build-box");
+        assert_eq!(mapped.network, "alpha");
+        assert_eq!(mapped.suggested_by.as_deref(), Some("coord-1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
