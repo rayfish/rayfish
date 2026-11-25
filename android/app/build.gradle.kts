@@ -160,6 +160,9 @@ android {
 
     testOptions {
         unitTests.isIncludeAndroidResources = true
+        providers.environmentVariable("ROBOLECTRIC_MAVEN_URL").orNull?.let { mirror ->
+            unitTests.all { it.systemProperty("robolectric.dependency.repo.url", mirror) }
+        }
     }
 
     // The JNA aar and the generated .so both land under jniLibs; keep them.

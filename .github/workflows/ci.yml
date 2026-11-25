@@ -310,6 +310,8 @@ jobs:
       # into anything here, and the step above already compiled that code.
       - name: Compile and test the app
         working-directory: android
+        env:
+          ROBOLECTRIC_MAVEN_URL: https://maven-central.storage-download.googleapis.com/maven2
         run: ./gradlew :app:compileDebugKotlin :app:testDebugUnitTest -x cargoNdkBuild
 
   # Same gap the macOS and Android jobs close, for the third platform whose code

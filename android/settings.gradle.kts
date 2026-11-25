@@ -13,6 +13,12 @@ dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
+        providers.environmentVariable("ROBOLECTRIC_MAVEN_URL").orNull?.let { mirror ->
+            maven {
+                url = uri(mirror)
+                content { includeGroup("org.robolectric") }
+            }
+        }
         mavenCentral()
         // On-disk Maven repo bundled inside the rustls-platform-verifier-android
         // crate. It ships the Kotlin AAR that rustls-platform-verifier calls over
