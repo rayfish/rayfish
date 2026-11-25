@@ -885,6 +885,11 @@ private struct PeerRow: View {
                     .foregroundColor(RayfishTheme.faint)
                     .help("Copy \(domain)")
             }
+            if isHovered, let onAddFirewallRule {
+                Button("+ Rule", action: onAddFirewallRule)
+                    .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
+                    .help("Add a firewall rule for \(peer.hostname.isEmpty ? peer.ipv6 : peer.hostname)")
+            }
             Text(peer.state).foregroundColor(color)
             if let latency = peer.latencyMs {
                 Text("\(latency) ms")

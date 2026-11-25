@@ -163,11 +163,38 @@
       border-radius: 10px;
       overflow: hidden;
     }
-    .net-card { margin-bottom: 12px; }
+    .net-card { margin-bottom: 12px; overflow: visible; }
+    .net-card > .peer-row:last-child { border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; }
     .net-head {
       display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
       padding: 13px 16px;
     }
+    .net-menu { position: relative; }
+    .net-menu > summary {
+      list-style: none;
+      display: inline-flex; align-items: center; justify-content: center;
+      min-height: 28px; padding: 0 10px; font-size: 12.5px; font-weight: 600;
+      border: 1px solid var(--line-2); border-radius: 7px;
+      color: var(--body); cursor: pointer; user-select: none;
+      transition: background .12s ease, border-color .12s ease, color .12s ease;
+    }
+    .net-menu > summary::-webkit-details-marker { display: none; }
+    .net-menu > summary:hover, .net-menu[open] > summary {
+      border-color: var(--muted); color: var(--ink); background: rgba(255,255,255,.035);
+    }
+    .net-menu-panel {
+      position: absolute; right: 0; top: calc(100% + 6px); z-index: 30;
+      min-width: 196px; padding: 5px;
+      background: var(--deep); border: 1px solid var(--line-2);
+      border-radius: 9px; box-shadow: 0 10px 28px rgba(0,0,0,.45);
+      display: grid; gap: 2px;
+    }
+    .net-menu-panel button {
+      width: 100%; text-align: left; border: 0; border-radius: 6px;
+      padding: 6px 10px; min-height: 30px; font-size: 12.5px; font-weight: 500;
+    }
+    .net-menu-panel button:hover { background: rgba(255,255,255,.06); }
+    .net-menu-panel .menu-sep { height: 1px; background: var(--line); margin: 3px 4px; }
     .net-toggle {
       min-height: auto; padding: 0; border: 0; background: transparent;
       display: inline-flex; align-items: center; gap: 8px;
@@ -213,6 +240,18 @@
     .peer-row .conn { color: var(--faint); }
     .peer-row .conn.direct { color: var(--green); }
     .peer-row .conn.relay { color: var(--amber); }
+    .peer-rule-btn {
+      min-height: 22px !important; padding: 0 8px !important;
+      font-family: var(--robot); font-size: 11.5px !important;
+      opacity: 0; pointer-events: none;
+    }
+    .peer-row:hover .peer-rule-btn,
+    .peer-row:focus-within .peer-rule-btn {
+      opacity: 1; pointer-events: auto;
+    }
+    @media (hover: none) {
+      .peer-rule-btn { opacity: 1; pointer-events: auto; }
+    }
     .empty { padding: 32px 16px; text-align: center; color: var(--faint); }
     .empty .big { color: var(--body); font-weight: 600; margin-bottom: 6px; }
 
@@ -433,7 +472,12 @@
         <div id="managedMachines" class="card"></div>
       </section>
       <section>
-        <div class="sec-head"><h2>Network peers</h2></div>
+        <div class="sec-head">
+          <h2>Network peers</h2>
+          <span id="peerCountBadge" class="net-meta"></span>
+          <span class="spacer"></span>
+          <button id="peerActiveOnlyBtn" class="small" type="button" hidden>Active only</button>
+        </div>
         <div id="peerFilterWrap" class="filter-bar" hidden>
           <input id="peerFilter" placeholder="Filter peers by name, domain, or IPv6..." autocomplete="off">
         </div>
@@ -580,6 +624,8 @@
     <div class="code-block" id="inviteCode"></div>
     <p class="dlg-note" id="inviteNote">Single use. The holder runs <b>ray join &lt;code&gt;</b> or pastes it in their dashboard.</p>
     <div class="dlg-actions">
+      <button type="button" class="small" id="inviteReusableBtn">Mint reusable code</button>
+      <span class="spacer"></span>
       <button type="button" data-close>Close</button>
       <button class="primary" id="inviteCopy" type="button">Copy code</button>
     </div>
@@ -894,15 +940,18 @@
           const conn = p.connection;
           const domain = p.hostname ? `${p.hostname}.${n.name}.ray` : "";
           const connText = conn ? kind : "idle";
+          const rulePeer = p.hostname || p.ipv6 || "";
           return `<div class="peer-row" ${domain ? `data-copy="${esc(domain)}" title="Click to copy ${esc(domain)}"` : ""}>
             <span class="dot ${kind}"></span>
             <span class="host">${esc(p.hostname || "?")}${p.is_own_device ? `<span class="tag">YOU</span>` : ""}</span>
             <span class="ip">${esc(p.ipv6 || "")}</span>
             <span class="spacer"></span>
+            ${!p.is_own_device && rulePeer ? `<button type="button" class="small subtle peer-rule-btn" data-open-rule-dlg="${esc(n.name)}" data-rule-peer="${esc(rulePeer)}" title="Add firewall rule for ${esc(rulePeer)}">+ Rule</button>` : ""}
             <span class="conn ${kind}">${esc(connText)}</span>
             ${conn && conn.rtt_ms != null ? `<span class="conn">${Math.round(conn.rtt_ms)} ms</span>` : ""}
           </div>`;
         }).join("");
+        const myDomain = `${n.my_hostname || "?"}.${n.name}.ray`;
         return `<div class="card net-card">
           <div class="net-head">
             <div>
@@ -914,13 +963,21 @@
                 <span class="role ${isCoord ? "coordinator" : ""}">${esc(role.toUpperCase())}</span>
                 <span class="net-meta">${esc(peerSummary)}</span>
               </div>
-              <div class="self"><span class="copyable" data-copy="${esc((n.my_hostname || "") + "." + n.name + ".ray")}" title="Copy domain">${esc(n.my_hostname || "?")}.${esc(n.name)}.ray</span></div>
+              <div class="self"><span class="copyable" data-copy="${esc((n.my_hostname || "") + "." + n.name + ".ray")}" title="Copy domain">${esc(myDomain)}</span></div>
             </div>
             <span class="net-actions">
               <button class="small" data-open-fw="${esc(n.name)}">Firewall${netRuleCount ? ` · ${netRuleCount}` : ""}${pendingFw ? " *" : ""}</button>
               ${isCoord ? `<button class="small" data-invite="${esc(n.name)}">Invite</button>` : ""}
-              <button class="small" data-rename="${esc(n.name)}" data-host="${esc(n.my_hostname || "")}">Rename</button>
-              <button class="small danger" data-leave="${esc(n.name)}">Leave</button>
+              <details class="net-menu">
+                <summary class="small" aria-label="More actions">•••</summary>
+                <div class="net-menu-panel">
+                  <button type="button" data-rename="${esc(n.name)}" data-host="${esc(n.my_hostname || "")}">Rename this machine...</button>
+                  <button type="button" data-copy="${esc((n.my_hostname || "") + "." + n.name + ".ray")}">Copy ${esc(myDomain)}</button>
+                  ${n.my_ipv6 ? `<button type="button" data-copy="${esc(n.my_ipv6)}">Copy IPv6 address</button>` : ""}
+                  <div class="menu-sep"></div>
+                  <button type="button" class="danger" data-leave="${esc(n.name)}">Leave network...</button>
+                </div>
+              </details>
             </span>
           </div>
           ${collapsed ? "" : (peerHtml || `<div class="peer-row"><span class="conn">Waiting for peers...</span></div>`)}
@@ -981,17 +1038,25 @@
       }).join("") : `<div class="empty"><div class="big">No enrolled machines.</div><div>Use ray machines enroll to add a machine you control.</div></div>`;
 
       const peers = uniquePeers(data);
+      $("peerCountBadge").textContent = peers.length ? String(peers.length) : "";
       $("peerFilterWrap").hidden = peers.length < 5;
+      const activeBtn = $("peerActiveOnlyBtn");
+      activeBtn.hidden = peers.length < 5;
+      activeBtn.textContent = peerActiveOnly ? "Showing active" : "Active only";
+      activeBtn.className = "small" + (peerActiveOnly ? " on" : "");
+      activeBtn.setAttribute("aria-pressed", String(peerActiveOnly));
       const query = $("peerFilter").value.trim().toLowerCase();
-      const shownPeers = query ? peers.filter(p =>
-        String(p.hostname || "").toLowerCase().includes(query) ||
-        String(p.ipv6 || "").toLowerCase().includes(query) ||
-        String(p.domain || "").toLowerCase().includes(query)
-      ) : peers;
+      const shownPeers = peers.filter(p => {
+        if (peerActiveOnly && peerKind(p) === "idle") return false;
+        if (!query) return true;
+        return String(p.hostname || "").toLowerCase().includes(query) ||
+          String(p.ipv6 || "").toLowerCase().includes(query) ||
+          String(p.domain || "").toLowerCase().includes(query);
+      });
       $("networkPeers").innerHTML = !peers.length
         ? `<div class="card"><div class="empty"><div class="big">No devices to show.</div><div>Devices appear here once this machine joins a network.</div></div></div>`
         : (!shownPeers.length
-          ? `<div class="card"><div class="empty"><div class="big">No matching peers.</div><div>Clear the filter to see all devices.</div></div></div>`
+          ? `<div class="card"><div class="empty"><div class="big">No matching peers.</div><div>Clear the search or active filter to see all devices.</div></div></div>`
           : `<div class="card">${shownPeers.map(renderPeer).join("")}</div>`);
     }
 
@@ -1036,6 +1101,9 @@
     }
 
     let pendingByNet = {};
+    let autoAcceptByNet = {};
+    let peerActiveOnly = false;
+    let currentInviteNet = "";
     async function refreshFirewall() {
       const res = await call(["firewall", "show"], true);
       if (!res || !res.success) {
@@ -1182,6 +1250,9 @@
           </div>
           ${pendRules.map((rule, idx) => renderRuleRow({ index: idx, rule, readonly: true }, firewallScope)).join("")}
         </div>` : "";
+        const autoAccept = autoAcceptByNet[firewallScope] != null
+          ? !!autoAcceptByNet[firewallScope]
+          : !!net?.auto_accept_firewall;
         $("fwDetail").innerHTML = `
           <div class="card summary-card">
             <div>
@@ -1198,13 +1269,24 @@
             </div>
             ${scopedRules.length ? scopedRules.map(it => renderRuleRow(it, firewallScope)).join("") : `<div class="empty"><div class="big">No rules specific to ${esc(firewallScope)}.</div><div>Traffic with peers on ${esc(firewallScope)} follows your general rules and ${esc(state.default_inbound)} inbound default.</div></div>`}
           </div>
-          <div class="card summary-card">
-            <div>
-              <div class="setting-title">General rules also apply</div>
-              <div class="net-meta">${generalRules.length} cross-network rule${generalRules.length === 1 ? "" : "s"} · inbound default ${esc(state.default_inbound)} · outbound default ${esc(state.default_outbound)}</div>
+          <div class="card settings-card">
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">Auto-accept suggested rules</div>
+                <div class="setting-description">Automatically install firewall rules published by ${esc(firewallScope)}'s coordinator without manual review.</div>
+              </div>
+              <span class="spacer"></span>
+              <button type="button" class="switch${autoAccept ? " on" : ""}" aria-label="Auto-accept suggested rules" aria-pressed="${autoAccept}" data-auto-accept-net="${esc(firewallScope)}" data-auto-accept-next="${autoAccept ? "off" : "on"}"></button>
             </div>
-            <span class="spacer"></span>
-            <button class="small" data-fw-scope="">View general rules</button>
+            <div class="setting-divider"></div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-title">General rules also apply</div>
+                <div class="net-meta">${generalRules.length} cross-network rule${generalRules.length === 1 ? "" : "s"} · inbound default ${esc(state.default_inbound)} · outbound default ${esc(state.default_outbound)}</div>
+              </div>
+              <span class="spacer"></span>
+              <button class="small" data-fw-scope="">View general rules</button>
+            </div>
           </div>`;
       }
     }
@@ -1215,7 +1297,7 @@
       showPage("firewall");
     }
 
-    function openRuleDialog(netName) {
+    function openRuleDialog(netName, peerName) {
       const nets = Array.isArray(lastData?.networks) ? lastData.networks : [];
       $("ruleNetwork").innerHTML = `<option value="">All networks (general rule)</option>` +
         nets.map(n => `<option value="${esc(n.name)}">${esc(n.name)}</option>`).join("");
@@ -1224,7 +1306,7 @@
       $("ruleAction").value = "allow";
       $("ruleProtocol").value = "tcp";
       $("rulePort").value = "";
-      $("rulePeer").value = "";
+      $("rulePeer").value = peerName || "";
       syncRuleDialogState();
       $("firewallRuleDlg").showModal();
     }
@@ -1306,9 +1388,11 @@
       $("connectionRequests").innerHTML = connectionRows.join("");
     }
 
-    async function mintInvite(net) {
-      toast("minting invite...");
-      const res = await call(["invite", net], false);
+    async function mintInvite(net, reusable) {
+      currentInviteNet = net;
+      toast(reusable ? "minting reusable invite..." : "minting invite...");
+      const args = reusable ? ["invite", net, "create", "--reusable"] : ["invite", net];
+      const res = await call(args, false);
       if (!res || !res.success) {
         toast((res && (res.stderr || res.stdout) || "invite failed").trim().split("\n")[0], true);
         return;
@@ -1318,14 +1402,24 @@
       $("inviteNetName").textContent = net;
       $("inviteCode").textContent = code || res.stdout.trim();
       const expiry = lines.find(l => /expires/.test(l));
-      if (expiry) $("inviteNote").textContent = expiry + ". The holder runs `ray join <code>` or pastes it in their dashboard.";
-      $("inviteDlg").showModal();
+      $("inviteNote").textContent = (expiry ? expiry + ". " : (reusable ? "Reusable key. " : "Single use. ")) +
+        "The holder runs `ray join <code>` or pastes it in their dashboard.";
+      $("inviteReusableBtn").hidden = !!reusable;
+      if (!$("inviteDlg").open) $("inviteDlg").showModal();
     }
+    $("inviteReusableBtn").onclick = () => {
+      if (currentInviteNet) mintInvite(currentInviteNet, true);
+    };
     $("inviteCopy").onclick = () =>
       copyText($("inviteCode").textContent).then(() => toast("Copied invite code"));
 
     document.addEventListener("click", ev => {
-      const t = ev.target.closest("[data-copy],[data-leave],[data-invite],[data-rename],[data-startup],[data-act],[data-run],[data-firewall-remove],[data-close],[data-open-fw],[data-fw-scope],[data-open-rule-dlg],[data-toggle-net],[data-preset]");
+      document.querySelectorAll("details.net-menu[open]").forEach(menu => {
+        if (!menu.contains(ev.target) || ev.target.closest(".net-menu-panel button")) {
+          menu.open = false;
+        }
+      });
+      const t = ev.target.closest("[data-copy],[data-leave],[data-invite],[data-rename],[data-startup],[data-act],[data-run],[data-firewall-remove],[data-close],[data-open-fw],[data-fw-scope],[data-open-rule-dlg],[data-toggle-net],[data-preset],[data-auto-accept-net]");
       if (!t) {
         if (ev.target.id === "toggleFirewallDefault" && lastFirewall) {
           const next = lastFirewall.default_inbound === "deny" ? "allow" : "deny";
@@ -1353,7 +1447,12 @@
         firewallScope = t.dataset.fwScope;
         refreshFirewall();
       } else if (t.dataset.openRuleDlg != null) {
-        openRuleDialog(t.dataset.openRuleDlg);
+        openRuleDialog(t.dataset.openRuleDlg, t.dataset.rulePeer || "");
+      } else if (t.dataset.autoAcceptNet != null) {
+        const net = t.dataset.autoAcceptNet;
+        const nextState = t.dataset.autoAcceptNext || "on";
+        autoAcceptByNet[net] = nextState === "on";
+        act(["firewall", "auto-accept", net, nextState], `auto-accept ${nextState} for ${net}`);
       } else if (t.dataset.preset != null) {
         const p = t.dataset.preset;
         if (p === "web") { $("ruleDirection").value = "in"; $("ruleAction").value = "allow"; $("ruleProtocol").value = "tcp"; $("rulePort").value = "80,443"; }
@@ -1417,6 +1516,10 @@
     };
     $("networkFilter").addEventListener("input", () => { if (lastData) render(lastData); });
     $("peerFilter").addEventListener("input", () => { if (lastData) renderDevices(lastData); });
+    $("peerActiveOnlyBtn").onclick = () => {
+      peerActiveOnly = !peerActiveOnly;
+      if (lastData) renderDevices(lastData);
+    };
     $("ruleNetwork").addEventListener("change", syncRuleDialogState);
     $("ruleProtocol").addEventListener("change", syncRuleDialogState);
 

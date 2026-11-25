@@ -12,12 +12,73 @@ struct IndexedFirewallRule: Identifiable, Equatable {
     var id: String { "\(index):\(rule.id)" }
 }
 
+struct FirewallPeerOption: Identifiable, Equatable {
+    let id: String
+    let label: String
+}
+
 /// Pure helpers for partitioning and formatting firewall state so per-network
 /// and general views stay consistent and keep exact daemon rule indices.
 enum FirewallModel {
     static func isWildcard(_ value: String) -> Bool {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return normalized.isEmpty || normalized == "*" || normalized == "any"
+    }
+
+    static func canonicalPeerSelector(
+        _ rawPeer: String,
+        forNetwork selectedNetwork: String,
+        in networks: [ProviderNetwork]
+    ) -> String {
+        let trimmed = rawPeer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isWildcard(trimmed) else { return "" }
+        let candidateNetworks = selectedNetwork.isEmpty ? networks : networks.filter { $0.name == selectedNetwork }
+        for net in candidateNetworks {
+            for item in net.peers where !item.isOwnDevice {
+                let canonical = item.identity ?? item.ipv6
+                if canonical == trimmed || item.ipv6 == trimmed || item.hostname == trimmed {
+                    return canonical
+                }
+                if let identity = item.identity, identity.hasPrefix(trimmed) || trimmed.hasPrefix(identity) {
+                    return canonical
+                }
+            }
+        }
+        return trimmed
+    }
+
+    static func peerOptions(
+        forNetwork selectedNetwork: String,
+        in networks: [ProviderNetwork],
+        selectedPeer: String = ""
+    ) -> [FirewallPeerOption] {
+        var labelsByIdentity: [String: Set<String>] = [:]
+        for net in networks {
+            if !selectedNetwork.isEmpty && net.name != selectedNetwork { continue }
+            for item in net.peers where !item.isOwnDevice {
+                let identity = item.identity ?? item.ipv6
+                let name = item.hostname.isEmpty ? item.ipv6 : item.hostname
+                let label = selectedNetwork.isEmpty ? "\(name) · \(net.name)" : name
+                labelsByIdentity[identity, default: []].insert(label)
+            }
+        }
+        var peers = labelsByIdentity.keys.sorted().compactMap { identity -> FirewallPeerOption? in
+            guard let labels = labelsByIdentity[identity] else { return nil }
+            return FirewallPeerOption(
+                id: identity,
+                label: "\(labels.sorted().joined(separator: ", ")) (\(identity.prefix(6)))"
+            )
+        }
+        let trimmedPeer = selectedPeer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !isWildcard(trimmedPeer) && !peers.contains(where: { $0.id == trimmedPeer }) {
+            let label = peerLabel(
+                for: trimmedPeer,
+                in: networks,
+                scopedNetwork: selectedNetwork.isEmpty ? nil : selectedNetwork
+            )
+            peers.append(FirewallPeerOption(id: trimmedPeer, label: label))
+        }
+        return [FirewallPeerOption(id: "", label: "Any peer")] + peers
     }
 
     static func indexedRules(_ rules: [ProviderFirewallRule]) -> [IndexedFirewallRule] {
@@ -803,43 +864,34 @@ struct AddFirewallRuleSheet: View {
     @State private var network: String
     @State private var localError: String?
 
-    init(controller: TunnelController, draft: FirewallDraftRule) {
+    init(controller: TunnelController, draft: FirewallDraftRule, initialPeer: String = "") {
         self.controller = controller
         self.draft = draft
-        _peer = State(initialValue: draft.peer)
+        let rawPeer = draft.peer.isEmpty ? initialPeer : draft.peer
+        let resolvedPeer = FirewallModel.canonicalPeerSelector(
+            rawPeer,
+            forNetwork: draft.network,
+            in: controller.status?.networks ?? []
+        )
+        _peer = State(initialValue: resolvedPeer)
         _network = State(initialValue: draft.network)
     }
 
-    private struct PeerOption: Identifiable {
-        let id: String
-        let label: String
-    }
-
-    private var peerOptions: [PeerOption] {
+    private var peerOptions: [FirewallPeerOption] {
         peerOptions(forNetwork: network)
     }
 
-    private func peerOptions(forNetwork selectedNetwork: String) -> [PeerOption] {
-        var labelsByIdentity: [String: Set<String>] = [:]
-        for net in controller.status?.networks ?? [] {
-            if !selectedNetwork.isEmpty && net.name != selectedNetwork { continue }
-            for item in net.peers where !item.isOwnDevice {
-                let identity = item.identity ?? item.ipv6
-                let name = item.hostname.isEmpty ? item.ipv6 : item.hostname
-                let label = selectedNetwork.isEmpty ? "\(name) · \(net.name)" : name
-                labelsByIdentity[identity, default: []].insert(label)
-            }
-        }
-        let peers = labelsByIdentity.keys.sorted().compactMap { identity -> PeerOption? in
-            guard let labels = labelsByIdentity[identity] else { return nil }
-            return PeerOption(id: identity, label: "\(labels.sorted().joined(separator: ", ")) (\(identity.prefix(6)))")
-        }
-        return [PeerOption(id: "", label: "Any peer")] + peers
+    private func peerOptions(forNetwork selectedNetwork: String) -> [FirewallPeerOption] {
+        FirewallModel.peerOptions(
+            forNetwork: selectedNetwork,
+            in: controller.status?.networks ?? [],
+            selectedPeer: peer
+        )
     }
 
-    private var networkOptions: [PeerOption] {
-        [PeerOption(id: "", label: "All networks (general rule)")] +
-            (controller.status?.networks ?? []).map { PeerOption(id: $0.name, label: $0.name) }
+    private var networkOptions: [FirewallPeerOption] {
+        [FirewallPeerOption(id: "", label: "All networks (general rule)")] +
+            (controller.status?.networks ?? []).map { FirewallPeerOption(id: $0.name, label: $0.name) }
     }
 
     private var usesPorts: Bool {
