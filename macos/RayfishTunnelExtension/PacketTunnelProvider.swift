@@ -270,6 +270,37 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let action = request.ruleAction else { throw ProviderError.missingSetting }
             try node.firewallSetDefaultInbound(action: action)
             firewall = try providerFirewall(node.firewallShow())
+        case .firewallSetOutboundDefault:
+            guard let action = request.ruleAction else { throw ProviderError.missingSetting }
+            try node.firewallSetDefaultOutbound(action: action)
+            firewall = try providerFirewall(node.firewallShow())
+        case .firewallSetEnabled:
+            guard let enabled = request.enabled else { throw ProviderError.missingSetting }
+            try node.firewallSetEnabled(enabled: enabled)
+            firewall = try providerFirewall(node.firewallShow())
+        case .firewallSetReject:
+            guard let reject = request.enabled else { throw ProviderError.missingSetting }
+            try node.firewallSetReject(reject: reject)
+            firewall = try providerFirewall(node.firewallShow())
+        case .firewallAcceptSuggestions:
+            guard let network = request.network ?? request.name, !network.isEmpty else {
+                throw ProviderError.missingNetworkName
+            }
+            try node.firewallAcceptSuggestions(network: network)
+            firewall = try providerFirewall(node.firewallShow())
+        case .firewallDenySuggestions:
+            guard let network = request.network ?? request.name, !network.isEmpty else {
+                throw ProviderError.missingNetworkName
+            }
+            try node.firewallDenySuggestions(network: network)
+            firewall = try providerFirewall(node.firewallShow())
+        case .setNetworkFirewallAutoAccept:
+            guard let network = request.network ?? request.name, !network.isEmpty else {
+                throw ProviderError.missingNetworkName
+            }
+            guard let enabled = request.enabled else { throw ProviderError.missingSetting }
+            try node.setNetworkFirewallAutoAccept(network: network, enabled: enabled)
+            firewall = try providerFirewall(node.firewallShow())
         case .connectPeer:
             guard let id = request.id, !id.isEmpty else { throw ProviderError.missingPeer }
             message = try node.connectPeer(peer: id, hostname: request.hostname)
@@ -347,6 +378,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             try node.denyRequest(network: name, id: id)
         }
+        if firewall == nil {
+            firewall = try? providerFirewall(node.firewallShow())
+        }
         return ProviderResponse(success: true, error: nil, status: status(from: try node.status()), inviteCode: inviteCode, message: message, firewall: firewall)
     }
 
@@ -354,12 +388,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ProviderFirewallState(
             defaultInbound: state.defaultInbound,
             defaultOutbound: state.defaultOutbound,
+            reject: state.reject,
             disabled: state.disabled,
-            rules: state.rules.map { rule in
-                ProviderFirewallRule(direction: rule.direction, action: rule.action,
-                                     protocolName: rule.`protocol`, port: rule.port,
-                                     peer: rule.peer, network: rule.network)
+            rules: state.rules.map(providerFirewallRule),
+            networks: state.networks.map { item in
+                ProviderNetworkFirewall(
+                    network: item.network,
+                    autoAccept: item.autoAccept,
+                    pendingRules: item.pendingRules.map(providerFirewallRule)
+                )
             }
+        )
+    }
+
+    private func providerFirewallRule(_ rule: FirewallRule) -> ProviderFirewallRule {
+        ProviderFirewallRule(
+            direction: rule.direction,
+            action: rule.action,
+            protocolName: rule.`protocol`,
+            port: rule.port,
+            peer: rule.peer,
+            network: rule.network,
+            suggestedBy: rule.suggestedBy
         )
     }
 
@@ -383,7 +433,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             isOwnDevice: peer.isOwnDevice,
                             identity: peer.identity
                         )
-                    }
+                    },
+                    pendingSuggestions: Int(network.pendingSuggestions),
+                    autoAcceptFirewall: network.autoAcceptFirewall
                 )
             },
             pendingRequests: status.requests.pendingRequests.map { request in

@@ -11,14 +11,17 @@ struct RayfishApp: App {
     var body: some Scene {
         Settings { EmptyView() }
         .commands {
-            CommandGroup(replacing: .appSettings) {}
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings...") { appDelegate.openSettings() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Open Rayfish") { appDelegate.openMainWindow() }
                     .keyboardShortcut("o", modifiers: .command)
             }
             CommandGroup(after: .appInfo) {
                 if appDelegate.canCheckForUpdates {
-                    Button("Check for Updates…") { appDelegate.checkForUpdates() }
+                    Button("Check for Updates...") { appDelegate.checkForUpdates() }
                 }
             }
         }
@@ -44,6 +47,11 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate, @preconcurrency
 
     func checkForUpdates() { updaterController?.checkForUpdates(nil) }
 
+    func openSettings() {
+        controller.page = .settings
+        openMainWindow()
+    }
+
     func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem,
                  immediateInstallationBlock immediateInstallHandler: @escaping () -> Void) -> Bool {
         updateVersion = item.displayVersionString
@@ -63,6 +71,10 @@ final class RayfishAppDelegate: NSObject, NSApplicationDelegate, @preconcurrency
         controller.notifications.install()
         controller.notifications.onOpen = { [weak self] page in
             self?.controller.page = page
+            self?.openMainWindow()
+        }
+        controller.notifications.onOpenFirewallNetwork = { [weak self] network in
+            self?.controller.openFirewall(for: network)
             self?.openMainWindow()
         }
         controller.notifications.onRevealFile = { url in
@@ -126,65 +138,72 @@ private struct ContentView: View {
     private var connected: Bool { controller.isConnected }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                header
-                if let status = controller.status {
-                    HStack(spacing: 18) {
-                        HStack(spacing: 6) {
-                            Text(status.ipv6)
-                            Button {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(status.ipv6, forType: .string)
-                            } label: {
-                                Image(systemName: "doc.on.doc")
-                            }
-                            .buttonStyle(.plain)
-                            .help("Copy IP address")
-                            .accessibilityLabel("Copy this Mac's IP address")
+        ZStack(alignment: .bottom) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    header
+                    if let status = controller.status {
+                        StatusStrip(controller: controller, status: status)
+                        if let warning = status.connectionWarning {
+                            BannerRow(icon: "wifi.exclamationmark", text: warning, color: RayfishTheme.amber)
                         }
-                        Text("\(status.networks.count) networks")
-                        Text("\(status.networks.reduce(0) { $0 + $1.peers.count }) peers")
                     }
-                    .font(RayfishTheme.mono())
-                    .foregroundColor(RayfishTheme.muted)
-                }
-                if let activity = controller.activity {
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text(activity)
+                    if let activity = controller.activity {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text(activity)
+                        }
+                        .font(RayfishTheme.text(14))
+                        .foregroundColor(RayfishTheme.muted)
                     }
-                    .foregroundColor(RayfishTheme.muted)
-                }
-                if let error = controller.error {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "exclamationmark.triangle")
-                        Text(error).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    if let error = controller.error {
+                        BannerRow(
+                            icon: "exclamationmark.triangle",
+                            text: error,
+                            color: RayfishTheme.amber,
+                            onDismiss: { controller.error = nil }
+                        )
                     }
-                    .font(RayfishTheme.text(14))
-                    .foregroundColor(RayfishTheme.amber)
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(RayfishTheme.amber.opacity(0.04))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(RayfishTheme.amber.opacity(0.25)))
+                    switch controller.page {
+                    case .networks:
+                        NetworksView(controller: controller)
+                    case .devices:
+                        DevicesView(controller: controller)
+                    case .firewall:
+                        FirewallPageView(controller: controller)
+                    case .files:
+                        FilesView(controller: controller)
+                    case .settings:
+                        SettingsView(controller: controller, updater: updater)
+                    }
+                    Spacer(minLength: 32)
                 }
-                switch controller.page {
-                case .networks:
-                    NetworksView(controller: controller)
-                case .devices:
-                    DevicesView(controller: controller)
-                case .files:
-                    FilesView(controller: controller)
-                case .settings:
-                    SettingsView(controller: controller, updater: updater)
-                }
-                Spacer(minLength: 24)
+                .padding(28)
+                .frame(maxWidth: 976)
+                .frame(maxWidth: .infinity)
             }
-            .padding(28)
-            .frame(maxWidth: 976)
-            .frame(maxWidth: .infinity)
+
+            if let toast = controller.toastMessage {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(RayfishTheme.green)
+                    Text(toast)
+                        .font(RayfishTheme.mono(12))
+                        .foregroundColor(RayfishTheme.ink)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(RayfishTheme.deep)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(RayfishTheme.border, lineWidth: 1))
+                .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+                .padding(.bottom, 20)
+                .transition(.opacity)
+                .allowsHitTesting(false)
+            }
         }
+        .animation(.easeOut(duration: 0.16), value: controller.toastMessage)
         .background(RayfishTheme.background)
         .font(RayfishTheme.text())
         .foregroundColor(RayfishTheme.body)
@@ -198,7 +217,7 @@ private struct ContentView: View {
     }
 
     private var header: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 18) {
             HStack(spacing: 14) {
                 Image("Logo").resizable().scaledToFit().frame(width: 34, height: 34)
                     .accessibilityHidden(true)
@@ -213,6 +232,10 @@ private struct ContentView: View {
                 }
                 .font(RayfishTheme.mono(11))
                 .foregroundColor(connected ? RayfishTheme.green : RayfishTheme.faint)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.03))
+                .clipShape(Capsule())
                 Spacer()
                 Button(connected ? "Disconnect" : "Connect") {
                     Task {
@@ -223,19 +246,18 @@ private struct ContentView: View {
                 .buttonStyle(RayfishButtonStyle(kind: connected ? .connected : .primary))
                 .disabled(controller.isLoading)
             }
-            HStack(spacing: 22) {
+            HStack(spacing: 24) {
                 ForEach(RayfishPage.allCases, id: \.self) { item in
-                    Button { controller.page = item } label: {
-                        Text(item.rawValue)
-                            .font(RayfishTheme.heading(14))
-                            .foregroundColor(controller.page == item ? RayfishTheme.ink : RayfishTheme.faint)
-                            .padding(.bottom, 10)
-                            .overlay(alignment: .bottom) {
-                                Rectangle().fill(controller.page == item ? RayfishTheme.accent : .clear).frame(height: 2)
-                            }
+                    TabBarButton(
+                        title: item.rawValue,
+                        isSelected: controller.page == item,
+                        badgeDotColor: tabBadgeColor(for: item)
+                    ) {
+                        if item == .firewall && controller.page != .firewall {
+                            controller.firewallReturnToNetworks = false
+                        }
+                        controller.page = item
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(controller.page == item ? .isSelected : [])
                 }
                 Spacer()
                 Text("PRIVATE MESH").font(RayfishTheme.mono(10)).tracking(1.4)
@@ -243,6 +265,218 @@ private struct ContentView: View {
             }
             .overlay(alignment: .bottom) { Rectangle().fill(RayfishTheme.line).frame(height: 1) }
         }
+    }
+
+    private func tabBadgeColor(for item: RayfishPage) -> Color? {
+        guard let status = controller.status else { return nil }
+        switch item {
+        case .networks:
+            let hasAttn = !status.pendingRequests.isEmpty || !(status.invitations ?? []).isEmpty
+            return hasAttn ? RayfishTheme.accent : nil
+        case .devices:
+            return status.connectionRequests.isEmpty ? nil : RayfishTheme.accent
+        case .firewall:
+            let hasSuggested = status.networks.contains { $0.pendingSuggestions > 0 }
+                || (controller.firewall?.networks.contains { !$0.pendingRules.isEmpty } ?? false)
+            return hasSuggested ? RayfishTheme.amber : nil
+        case .files:
+            let hasPending = (status.files ?? []).contains { $0.state == .pending }
+            return hasPending ? RayfishTheme.accent : nil
+        case .settings:
+            return nil
+        }
+    }
+}
+
+private struct TabBarButton: View {
+    let title: String
+    let isSelected: Bool
+    let badgeDotColor: Color?
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(RayfishTheme.heading(14))
+                    .foregroundColor(isSelected ? RayfishTheme.ink : (isHovered ? RayfishTheme.body : RayfishTheme.faint))
+                if let badgeDotColor {
+                    Circle().fill(badgeDotColor).frame(width: 6, height: 6)
+                }
+            }
+            .padding(.bottom, 10)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(isSelected ? RayfishTheme.accent : .clear).frame(height: 2)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+private struct BannerRow: View {
+    let icon: String
+    let text: String
+    let color: Color
+    var onDismiss: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .padding(.top, 2)
+            Text(text)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            if let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(RayfishTheme.muted)
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss")
+            }
+        }
+        .font(RayfishTheme.text(14))
+        .foregroundColor(color)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(color.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(color.opacity(0.28)))
+    }
+}
+
+private struct StatusStrip: View {
+    @ObservedObject var controller: TunnelController
+    let status: ProviderStatus
+    @State private var ipHovered = false
+
+    private var totalPeers: Int {
+        status.networks.reduce(0) { $0 + $1.peers.count }
+    }
+
+    private var activePeers: Int {
+        status.networks.reduce(0) { count, net in
+            count + net.peers.filter { $0.state == "direct" || $0.state == "relay" }.count
+        }
+    }
+
+    private var activeExitLabel: String? {
+        guard let active = status.exitNodes.first(where: { $0.using != nil }),
+              let selected = active.using else { return nil }
+        let peerName = status.networks
+            .first { $0.name == active.network }?
+            .peers.first { $0.identity == selected }?.hostname ?? selected
+        return "\(peerName) (\(active.network))"
+    }
+
+    private var hasExitChoices: Bool {
+        status.exitSelected || status.exitNodes.contains { !$0.available.isEmpty }
+    }
+
+    var body: some View {
+        HStack(spacing: 16) {
+            Button {
+                controller.copyToClipboard(status.ipv6, label: "Copied IPv6 address")
+            } label: {
+                HStack(spacing: 7) {
+                    Text(status.ipv6)
+                        .foregroundColor(ipHovered ? RayfishTheme.ink : RayfishTheme.body)
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 11))
+                        .foregroundColor(ipHovered ? RayfishTheme.rose : RayfishTheme.faint)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { ipHovered = $0 }
+            .help("Click to copy this Mac's mesh IPv6 address")
+            .accessibilityLabel("Copy this Mac's IP address")
+
+            Text("·").foregroundColor(RayfishTheme.border)
+            Text("\(status.networks.count) network\(status.networks.count == 1 ? "" : "s")")
+            Text("·").foregroundColor(RayfishTheme.border)
+            if activePeers > 0 {
+                Text("\(activePeers) active of \(totalPeers) peer\(totalPeers == 1 ? "" : "s")")
+            } else {
+                Text("\(totalPeers) peer\(totalPeers == 1 ? "" : "s")")
+            }
+
+            Spacer()
+
+            if hasExitChoices {
+                ExitNodeMenu(controller: controller, status: status, activeLabel: activeExitLabel)
+            }
+        }
+        .font(RayfishTheme.mono(12))
+        .foregroundColor(RayfishTheme.muted)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(RayfishTheme.panel.opacity(0.65))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(RayfishTheme.line))
+    }
+}
+
+private struct ExitNodeMenu: View {
+    @ObservedObject var controller: TunnelController
+    let status: ProviderStatus
+    let activeLabel: String?
+
+    var body: some View {
+        Menu {
+            Button {
+                let currentNet = status.exitNodes.first { $0.using != nil }?.network ?? status.exitNodes.first?.network ?? ""
+                if !currentNet.isEmpty {
+                    Task { await controller.selectExitNode(network: currentNet, peer: nil) }
+                }
+            } label: {
+                if !status.exitSelected {
+                    Label("Direct connection", systemImage: "checkmark")
+                } else {
+                    Text("Direct connection")
+                }
+            }
+            .disabled(!status.exitSelected || controller.isLoading)
+
+            ForEach(status.exitNodes.filter { !$0.available.isEmpty }, id: \.network) { exitNet in
+                Divider()
+                Text(exitNet.network)
+                ForEach(exitNet.available.filter { !exitNet.refused.contains($0) }, id: \.self) { peer in
+                    let isSelected: Bool = {
+                        guard let selected = exitNet.using else { return false }
+                        return status.networks.first { $0.name == exitNet.network }?.peers.contains {
+                            $0.hostname == peer && $0.identity == selected
+                        } == true
+                    }()
+                    Button {
+                        Task { await controller.selectExitNode(network: exitNet.network, peer: peer) }
+                    } label: {
+                        if isSelected {
+                            Label(peer, systemImage: "checkmark")
+                        } else {
+                            Text(peer)
+                        }
+                    }
+                    .disabled(controller.isLoading)
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: activeLabel == nil ? "arrow.up.right.circle" : "globe")
+                    .font(.system(size: 11))
+                Text(activeLabel.map { "Exit: \($0)" } ?? "Exit: Direct")
+                    .font(RayfishTheme.mono(11))
+            }
+            .foregroundColor(activeLabel == nil ? RayfishTheme.muted : RayfishTheme.green)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
     }
 }
 
@@ -253,62 +487,86 @@ private struct NetworksView: View {
     @State private var leavingNetwork: ProviderNetwork?
     @State private var renamingNetwork: ProviderNetwork?
     @State private var sendingInvite: ProviderNetwork?
+    @State private var peerFirewallDraft: FirewallDraftRule?
+    @State private var searchQuery = ""
+    @State private var collapsedNetworks: Set<String> = []
+
+    private var networks: [ProviderNetwork] { controller.status?.networks ?? [] }
+    private var totalPeers: Int { networks.reduce(0) { $0 + $1.peers.count } }
+    private var trimmedQuery: String { searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+
+    private var displayedNetworks: [(network: ProviderNetwork, peers: [ProviderPeer])] {
+        guard !trimmedQuery.isEmpty else {
+            return networks.map { ($0, $0.peers) }
+        }
+        return networks.compactMap { net in
+            let netMatches = net.name.lowercased().contains(trimmedQuery)
+                || "\(net.hostname).\(net.name).ray".lowercased().contains(trimmedQuery)
+            let matchingPeers = net.peers.filter { peer in
+                peer.hostname.lowercased().contains(trimmedQuery)
+                    || peer.ipv6.lowercased().contains(trimmedQuery)
+                    || peer.domain(in: net.name).lowercased().contains(trimmedQuery)
+            }
+            if netMatches {
+                return (net, matchingPeers.isEmpty ? net.peers : matchingPeers)
+            }
+            if !matchingPeers.isEmpty {
+                return (net, matchingPeers)
+            }
+            return nil
+        }
+    }
+
+    private var allCollapsed: Bool {
+        !networks.isEmpty && networks.allSatisfy { collapsedNetworks.contains($0.name) }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            let invitations = controller.status?.invitations ?? []
-            if let status = controller.status, !status.pendingRequests.isEmpty || !invitations.isEmpty {
-                Text("Needs attention").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
-                VStack(spacing: 0) {
-                    ForEach(invitations) { invitation in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("You are invited to join \(invitation.network)")
-                                Text("From \(invitation.coordinator)")
-                                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.faint)
-                                    .lineLimit(1).truncationMode(.middle)
-                            }
-                            Spacer()
-                            Button("Decline and block", role: .destructive) { Task { await controller.declineInvitation(id: invitation.id) } }
-                                .help("Decline and block the sender. Unblock it in Settings.")
-                            Button("Join") { Task { await controller.acceptInvitation(id: invitation.id) } }
-                                .buttonStyle(RayfishButtonStyle(kind: .primary))
-                        }
-                        .padding(14)
-                    }
-                    ForEach(status.pendingRequests) { request in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("\(request.hostname ?? request.id) wants to join \(request.network)")
-                                Text("Waiting \(request.waitingSecs)s")
-                                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.faint)
-                            }
-                            Spacer()
-                            Button("Deny", role: .destructive) { Task { await controller.deny(request: request) } }
-                            Button("Approve") { Task { await controller.accept(request: request) } }
-                                .buttonStyle(RayfishButtonStyle(kind: .primary))
-                        }
-                        .padding(14)
-                    }
-                }.rayfishCard()
-            }
-            HStack(spacing: 8) {
-                Text("Networks").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
-                Spacer()
-                Button("Join with a code") { networkAction = .join }
-                Button("Create a network") { networkAction = .create }
-                    .buttonStyle(RayfishButtonStyle(kind: .primary))
-            }
-            .disabled(controller.isLoading)
+        VStack(alignment: .leading, spacing: 16) {
+            attentionSection
+            toolbar
             if let status = controller.status, !status.networks.isEmpty {
-                ForEach(status.networks) { network in
-                    NetworkCard(
-                        network: network,
-                        invite: { Task { inviteCode = await controller.invite(network: network.name) } },
-                        sendInvite: { sendingInvite = network },
-                        leave: { leavingNetwork = network },
-                        rename: { renamingNetwork = network }
+                if displayedNetworks.isEmpty {
+                    EmptyState(
+                        title: "No matching networks or peers.",
+                        description: "Try a different network name, peer hostname, or IPv6 address."
                     )
+                } else {
+                    ForEach(displayedNetworks, id: \.network.id) { entry in
+                        let net = entry.network
+                        let ruleCount = FirewallModel.rules(forNetwork: net.name, in: controller.firewall).count
+                        let pendingFw = max(
+                            net.pendingSuggestions,
+                            FirewallModel.pendingRules(forNetwork: net.name, in: controller.firewall).count
+                        )
+                        NetworkCard(
+                            network: net,
+                            visiblePeers: entry.peers,
+                            isCollapsed: trimmedQuery.isEmpty && collapsedNetworks.contains(net.name),
+                            firewallRuleCount: ruleCount,
+                            pendingFirewallCount: pendingFw,
+                            toggleCollapsed: {
+                                if collapsedNetworks.contains(net.name) {
+                                    collapsedNetworks.remove(net.name)
+                                } else {
+                                    collapsedNetworks.insert(net.name)
+                                }
+                            },
+                            openFirewall: { controller.openFirewall(for: net.name) },
+                            invite: { Task { inviteCode = await controller.invite(network: net.name) } },
+                            sendInvite: { sendingInvite = net },
+                            leave: { leavingNetwork = net },
+                            rename: { renamingNetwork = net },
+                            copyText: { value, label in controller.copyToClipboard(value, label: label) },
+                            addPeerFirewallRule: { peer in
+                                peerFirewallDraft = FirewallDraftRule(
+                                    network: net.name,
+                                    peer: peer.identity ?? peer.ipv6,
+                                    lockNetwork: true
+                                )
+                            }
+                        )
+                    }
                 }
             } else if controller.status == nil {
                 EmptyState(title: controller.isConnected ? "Waiting for network status..." : "Connect to see your networks.",
@@ -321,8 +579,7 @@ private struct NetworksView: View {
         .alert("Invite code", isPresented: Binding(get: { inviteCode != nil }, set: { if !$0 { inviteCode = nil } })) {
             Button("Copy") {
                 if let inviteCode {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(inviteCode, forType: .string)
+                    controller.copyToClipboard(inviteCode, label: "Copied invite code")
                 }
             }
             Button("Done", role: .cancel) {}
@@ -337,51 +594,261 @@ private struct NetworksView: View {
         .sheet(item: $renamingNetwork) { network in RenameHostSheet(controller: controller, network: network) }
         .sheet(item: $sendingInvite) { network in SendInviteSheet(controller: controller, network: network) }
         .sheet(item: $networkAction) { action in NetworkSheet(controller: controller, action: action) }
+        .sheet(item: $peerFirewallDraft) { draft in AddFirewallRuleSheet(controller: controller, draft: draft) }
+    }
+
+    @ViewBuilder
+    private var attentionSection: some View {
+        let invitations = controller.status?.invitations ?? []
+        let requests = controller.status?.pendingRequests ?? []
+        let firewallNetworks = networks.filter { net in
+            net.pendingSuggestions > 0 || !FirewallModel.pendingRules(forNetwork: net.name, in: controller.firewall).isEmpty
+        }
+        if !invitations.isEmpty || !requests.isEmpty || !firewallNetworks.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Needs attention").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+                VStack(spacing: 0) {
+                    ForEach(Array(invitations.enumerated()), id: \.element.id) { index, invitation in
+                        if index > 0 { Rectangle().fill(RayfishTheme.line).frame(height: 1) }
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("You are invited to join \(invitation.network)").foregroundColor(RayfishTheme.ink)
+                                Text("From \(invitation.coordinator)")
+                                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.faint)
+                                    .lineLimit(1).truncationMode(.middle)
+                            }
+                            Spacer()
+                            Button("Decline and block", role: .destructive) { Task { await controller.declineInvitation(id: invitation.id) } }
+                                .buttonStyle(RayfishButtonStyle(kind: .danger, size: .compact))
+                                .help("Decline and block the sender. Unblock it in Settings.")
+                            Button("Join") { Task { await controller.acceptInvitation(id: invitation.id) } }
+                                .buttonStyle(RayfishButtonStyle(kind: .primary, size: .compact))
+                        }
+                        .padding(14)
+                    }
+
+                    ForEach(Array(requests.enumerated()), id: \.element.id) { index, request in
+                        if index > 0 || !invitations.isEmpty {
+                            Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                        }
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("\(request.hostname ?? request.id) wants to join \(request.network)")
+                                    .foregroundColor(RayfishTheme.ink)
+                                Text("Waiting \(request.waitingSecs)s")
+                                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.faint)
+                            }
+                            Spacer()
+                            Button("Deny", role: .destructive) { Task { await controller.deny(request: request) } }
+                                .buttonStyle(RayfishButtonStyle(kind: .danger, size: .compact))
+                            Button("Approve") { Task { await controller.accept(request: request) } }
+                                .buttonStyle(RayfishButtonStyle(kind: .primary, size: .compact))
+                        }
+                        .padding(14)
+                    }
+
+                    ForEach(Array(firewallNetworks.enumerated()), id: \.element.id) { index, net in
+                        if index > 0 || !invitations.isEmpty || !requests.isEmpty {
+                            Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                        }
+                        let count = max(net.pendingSuggestions, FirewallModel.pendingRules(forNetwork: net.name, in: controller.firewall).count)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Suggested firewall rules for \(net.name)")
+                                    .foregroundColor(RayfishTheme.ink)
+                                Text("\(count) rule\(count == 1 ? "" : "s") waiting for review before ports open to peers")
+                                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.faint)
+                            }
+                            Spacer()
+                            Button("Review in Firewall") {
+                                controller.openFirewall(for: net.name)
+                            }
+                            .buttonStyle(RayfishButtonStyle(kind: .primary, size: .compact))
+                        }
+                        .padding(14)
+                    }
+                }
+                .rayfishCard()
+            }
+        }
+    }
+
+    private var toolbar: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Networks").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+                Spacer()
+                if networks.count >= 2 && trimmedQuery.isEmpty {
+                    Button(allCollapsed ? "Expand all" : "Collapse all") {
+                        if allCollapsed {
+                            collapsedNetworks.removeAll()
+                        } else {
+                            collapsedNetworks = Set(networks.map(\.name))
+                        }
+                    }
+                    .buttonStyle(RayfishButtonStyle(kind: .subtle, size: .compact))
+                }
+                Button("Join with a code") { networkAction = .join }
+                Button("Create a network") { networkAction = .create }
+                    .buttonStyle(RayfishButtonStyle(kind: .primary))
+            }
+            .disabled(controller.isLoading)
+
+            if networks.count >= 2 || totalPeers >= 5 {
+                RayfishSearchField(prompt: "Filter networks, peers, or IPv6 addresses...", text: $searchQuery)
+            }
+        }
     }
 }
 
 private struct NetworkCard: View {
     let network: ProviderNetwork
+    let visiblePeers: [ProviderPeer]
+    let isCollapsed: Bool
+    let firewallRuleCount: Int
+    let pendingFirewallCount: Int
+    let toggleCollapsed: () -> Void
+    let openFirewall: () -> Void
     let invite: () -> Void
     let sendInvite: () -> Void
     let leave: () -> Void
     let rename: () -> Void
+    let copyText: (String, String) -> Void
+    let addPeerFirewallRule: (ProviderPeer) -> Void
+    @State private var domainHovered = false
+
+    private var myDomain: String { "\(network.hostname).\(network.name).ray" }
+
+    private var peerSummary: String {
+        let total = network.peers.count
+        guard total > 0 else { return "No peers yet" }
+        let active = network.peers.filter { $0.state == "direct" || $0.state == "relay" }.count
+        if active > 0 {
+            return "\(active) active · \(total) peer\(total == 1 ? "" : "s")"
+        }
+        return "\(total) peer\(total == 1 ? "" : "s")"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 8) {
-                        Text(network.name).font(RayfishTheme.heading(16)).foregroundColor(RayfishTheme.ink)
-                        Text(network.role.uppercased())
-                            .font(RayfishTheme.mono(9)).tracking(0.8)
-                            .foregroundColor(network.role == "coordinator" ? RayfishTheme.rose : RayfishTheme.muted)
-                            .padding(.horizontal, 8).padding(.vertical, 3)
-                            .overlay(Capsule().stroke(RayfishTheme.border))
+                        Button(action: toggleCollapsed) {
+                            HStack(spacing: 7) {
+                                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(RayfishTheme.faint)
+                                    .frame(width: 12)
+                                Text(network.name)
+                                    .font(RayfishTheme.heading(16))
+                                    .foregroundColor(RayfishTheme.ink)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(isCollapsed ? "Expand peer list" : "Collapse peer list")
+
+                        RayfishBadge(
+                            text: network.role.uppercased(),
+                            tone: network.role == "coordinator" ? .accent : .neutral
+                        )
+
+                        Text(peerSummary)
+                            .font(RayfishTheme.mono(11))
+                            .foregroundColor(RayfishTheme.faint)
                     }
-                    Text("\(network.hostname).\(network.name).ray")
-                        .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.faint)
-                        .textSelection(.enabled)
+
+                    Button {
+                        copyText(myDomain, "Copied \(myDomain)")
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(myDomain)
+                                .font(RayfishTheme.mono(11))
+                                .foregroundColor(domainHovered ? RayfishTheme.rose : RayfishTheme.muted)
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 9))
+                                .foregroundColor(domainHovered ? RayfishTheme.rose : RayfishTheme.faint.opacity(0.7))
+                        }
+                        .padding(.leading, 19)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { domainHovered = $0 }
+                    .help("Click to copy \(myDomain)")
                 }
-                Spacer()
-                if network.role == "coordinator" {
-                    Button("Invite", action: invite).help("Create an invite code to share.")
-                    Button("Send invite", action: sendInvite).help("Send an invite straight to someone's identity.")
+
+                Spacer(minLength: 12)
+
+                HStack(spacing: 8) {
+                    Button(action: openFirewall) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "shield.lefthalf.filled")
+                                .font(.system(size: 11))
+                            Text(firewallRuleCount > 0 ? "Firewall · \(firewallRuleCount)" : "Firewall")
+                            if pendingFirewallCount > 0 {
+                                Circle().fill(RayfishTheme.amber).frame(width: 6, height: 6)
+                            }
+                        }
+                    }
+                    .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
+                    .help("Open firewall rules for \(network.name)")
+
+                    if network.role == "coordinator" {
+                        Menu {
+                            Button("Create invite code", action: invite)
+                            Button("Send invite to identity...", action: sendInvite)
+                        } label: {
+                            Text("Invite")
+                                .font(RayfishTheme.heading(12))
+                        }
+                        .frame(height: 28)
+                        .help("Invite someone to \(network.name)")
+                    }
+
+                    Menu {
+                        Button("Rename this Mac...", action: rename)
+                        Button("Copy \(myDomain)") {
+                            copyText(myDomain, "Copied \(myDomain)")
+                        }
+                        Button("Copy IPv6 address") {
+                            copyText(network.ipv6, "Copied IPv6 address")
+                        }
+                        Divider()
+                        Button("Leave network...", role: .destructive, action: leave)
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 12, weight: .semibold))
+                            .frame(width: 14, height: 18)
+                    }
+                    .menuIndicator(.hidden)
+                    .frame(width: 30, height: 28)
+                    .help("More options for \(network.name)")
                 }
-                Button("Rename", action: rename)
-                Button("Leave", role: .destructive, action: leave)
-                    .buttonStyle(RayfishButtonStyle(kind: .danger))
             }
-            .padding(14)
-            ForEach(network.peers) { peer in
-                Rectangle().fill(RayfishTheme.line).frame(height: 1)
-                PeerRow(peer: peer, domains: peer.hostname.isEmpty ? [] : [peer.domain(in: network.name)])
-                    .padding(.horizontal, 14).padding(.vertical, 11)
-            }
-            if network.peers.isEmpty {
-                Rectangle().fill(RayfishTheme.line).frame(height: 1)
-                Text("Waiting for peers...").font(RayfishTheme.mono(12))
-                    .foregroundColor(RayfishTheme.faint).padding(18)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 13)
+
+            if !isCollapsed {
+                if visiblePeers.isEmpty {
+                    Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                    Text("Waiting for peers...")
+                        .font(RayfishTheme.mono(12))
+                        .foregroundColor(RayfishTheme.faint)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 35)
+                        .padding(.vertical, 14)
+                } else {
+                    ForEach(visiblePeers) { peer in
+                        Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                        PeerRow(
+                            peer: peer,
+                            domains: peer.hostname.isEmpty ? [] : [peer.domain(in: network.name)],
+                            copyText: copyText,
+                            onAddFirewallRule: peer.isOwnDevice ? nil : { addPeerFirewallRule(peer) }
+                        )
+                    }
+                }
             }
         }
         .rayfishCard()
@@ -391,13 +858,20 @@ private struct NetworkCard: View {
 private struct PeerRow: View {
     let peer: ProviderPeer
     let domains: [String]
+    let copyText: (String, String) -> Void
+    var onAddFirewallRule: (() -> Void)? = nil
+    @State private var isHovered = false
+
     private var color: Color {
         peer.state == "direct" ? RayfishTheme.green : peer.state == "relay" ? RayfishTheme.amber : RayfishTheme.faint
     }
+
     var body: some View {
         HStack(spacing: 12) {
             Circle().fill(color).frame(width: 7, height: 7)
-            Text(peer.hostname).foregroundColor(RayfishTheme.ink).frame(minWidth: 110, alignment: .leading)
+            Text(peer.hostname)
+                .foregroundColor(isHovered && !domains.isEmpty ? RayfishTheme.rose : RayfishTheme.ink)
+                .frame(minWidth: 120, alignment: .leading)
             if peer.isOwnDevice {
                 Text("YOU").font(RayfishTheme.mono(9)).foregroundColor(RayfishTheme.faint)
                     .padding(.horizontal, 5).padding(.vertical, 2)
@@ -405,21 +879,50 @@ private struct PeerRow: View {
             }
             Text(peer.ipv6).foregroundColor(RayfishTheme.muted).lineLimit(1)
             Spacer(minLength: 8)
+            if isHovered, let domain = domains.first {
+                Text("click to copy")
+                    .font(RayfishTheme.mono(10))
+                    .foregroundColor(RayfishTheme.faint)
+                    .help("Copy \(domain)")
+            }
             Text(peer.state).foregroundColor(color)
-            if let latency = peer.latencyMs { Text("\(latency) ms").foregroundColor(RayfishTheme.faint) }
+            if let latency = peer.latencyMs {
+                Text("\(latency) ms")
+                    .foregroundColor(RayfishTheme.faint)
+                    .frame(minWidth: 52, alignment: .trailing)
+            }
         }
         .font(RayfishTheme.mono(12))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(isHovered ? Color.white.opacity(0.025) : Color.clear)
         .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
         .onTapGesture {
-            guard let domain = domains.first else { return }
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(domain, forType: .string)
+            if let domain = domains.first {
+                copyText(domain, "Copied \(domain)")
+            } else {
+                copyText(peer.ipv6, "Copied \(peer.ipv6)")
+            }
         }
         .contextMenu {
             ForEach(domains, id: \.self) { domain in
                 Button("Copy \(domain)") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(domain, forType: .string)
+                    copyText(domain, "Copied \(domain)")
+                }
+            }
+            Button("Copy IPv6 (\(peer.ipv6))") {
+                copyText(peer.ipv6, "Copied IPv6 address")
+            }
+            if let identity = peer.identity {
+                Button("Copy identity") {
+                    copyText(identity, "Copied peer identity")
+                }
+            }
+            if let onAddFirewallRule {
+                Divider()
+                Button("Add firewall rule for \(peer.hostname.isEmpty ? peer.ipv6 : peer.hostname)...") {
+                    onAddFirewallRule()
                 }
             }
         }
@@ -429,18 +932,36 @@ private struct PeerRow: View {
 private struct DevicesView: View {
     @ObservedObject var controller: TunnelController
     @State private var connectingPeer = false
-    private var peers: [ProviderPeer] {
+    @State private var peerFilter = ""
+    @State private var activeOnly = false
+
+    private var allPeers: [ProviderPeer] {
         let all = controller.status?.networks.flatMap { $0.peers } ?? []
         return Dictionary(all.map { ($0.ipv6, $0) }, uniquingKeysWith: { first, _ in first })
-            .values.sorted { $0.hostname < $1.hostname }
+            .values.sorted { $0.hostname.localizedStandardCompare($1.hostname) == .orderedAscending }
     }
+
+    private var filteredPeers: [ProviderPeer] {
+        let query = peerFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return allPeers.filter { peer in
+            if activeOnly && peer.state != "direct" && peer.state != "relay" {
+                return false
+            }
+            guard !query.isEmpty else { return true }
+            return peer.hostname.lowercased().contains(query)
+                || peer.ipv6.lowercased().contains(query)
+                || domains(for: peer).contains { $0.lowercased().contains(query) }
+        }
+    }
+
     private func domains(for peer: ProviderPeer) -> [String] {
         (controller.status?.networks ?? []).compactMap { network in
             network.peers.first { $0.ipv6 == peer.ipv6 && !$0.hostname.isEmpty }?.domain(in: network.name)
         }.sorted()
     }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Text("Devices").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
                 Spacer()
@@ -450,33 +971,40 @@ private struct DevicesView: View {
             }
             if let identity = controller.status?.identity {
                 HStack(spacing: 12) {
-                    Text("Your identity").foregroundColor(RayfishTheme.muted)
-                    Text(identity).font(RayfishTheme.mono(11)).lineLimit(1).truncationMode(.middle)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Your identity").font(RayfishTheme.heading(14)).foregroundColor(RayfishTheme.ink)
+                        Text(identity).font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                            .lineLimit(1).truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
                     Spacer()
                     Button("Copy") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(identity, forType: .string)
-                    }.help("Share this ID so another peer can request a connection.")
+                        controller.copyToClipboard(identity, label: "Copied identity")
+                    }
+                    .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
+                    .help("Share this ID so another peer can request a connection.")
                 }.padding(14).rayfishCard()
             }
             if let requests = controller.status?.connectionRequests, !requests.isEmpty {
                 Text("Connection requests").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
                 VStack(spacing: 0) {
-                    ForEach(requests) { request in
+                    ForEach(Array(requests.enumerated()), id: \.element.id) { index, request in
+                        if index > 0 { Rectangle().fill(RayfishTheme.line).frame(height: 1) }
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(request.hostname ?? request.id)
+                                Text(request.hostname ?? request.id).foregroundColor(RayfishTheme.ink)
                                 Text("\(request.id), waiting \(request.waitingSecs)s")
                                     .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
                             }
                             Spacer()
                             Button("Block", role: .destructive) { Task { await controller.blockConnection(id: request.id) } }
-                                .buttonStyle(RayfishButtonStyle(kind: .danger))
+                                .buttonStyle(RayfishButtonStyle(kind: .danger, size: .compact))
                                 .help("Deny and block this identity. Unblock it in Settings.")
                             Button("Deny") { Task { await controller.rejectConnection(id: request.id) } }
+                                .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
                                 .help("Deny this request. The peer can ask again.")
                             Button("Approve") { Task { await controller.approveConnection(id: request.id) } }
-                                .buttonStyle(RayfishButtonStyle(kind: .primary))
+                                .buttonStyle(RayfishButtonStyle(kind: .primary, size: .compact))
                         }.padding(14)
                     }
                 }.rayfishCard().disabled(controller.isLoading)
@@ -486,6 +1014,7 @@ private struct DevicesView: View {
                 Spacer()
                 if controller.isRefreshingMachines { ProgressView().controlSize(.small) }
                 Button("Refresh") { controller.refreshMachines() }
+                    .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
                     .disabled(!controller.isConnected || controller.isRefreshingMachines || controller.isLoading)
             }
             if let error = controller.machinesError {
@@ -499,20 +1028,47 @@ private struct DevicesView: View {
                 EmptyState(title: "No enrolled machines.", description: "Use ray machines enroll to add a machine you control.")
             } else if !controller.machines.isEmpty {
                 VStack(spacing: 0) {
-                    ForEach(controller.machines) { machine in
-                        MachineRow(machine: machine).padding(14)
-                        Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                    ForEach(Array(controller.machines.enumerated()), id: \.element.id) { index, machine in
+                        if index > 0 { Rectangle().fill(RayfishTheme.line).frame(height: 1) }
+                        MachineRow(
+                            machine: machine,
+                            copyText: { value, label in controller.copyToClipboard(value, label: label) }
+                        ).padding(14)
                     }
                 }.rayfishCard()
             }
-            Text("Network peers").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
-            if peers.isEmpty {
+
+            HStack(spacing: 10) {
+                Text("Network peers").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+                if !allPeers.isEmpty {
+                    Text("\(allPeers.count)")
+                        .font(RayfishTheme.mono(11))
+                        .foregroundColor(RayfishTheme.faint)
+                }
+                Spacer()
+                if allPeers.count >= 5 {
+                    Button(activeOnly ? "Showing active" : "Active only") {
+                        activeOnly.toggle()
+                    }
+                    .buttonStyle(RayfishButtonStyle(kind: activeOnly ? .connected : .secondary, size: .compact))
+                }
+            }
+            if allPeers.count >= 5 {
+                RayfishSearchField(prompt: "Filter peers by name, .ray domain, or IPv6...", text: $peerFilter)
+            }
+            if allPeers.isEmpty {
                 EmptyState(title: "No devices to show.", description: "Devices appear here once this Mac joins a network.")
+            } else if filteredPeers.isEmpty {
+                EmptyState(title: "No matching peers.", description: "Clear the search or active filter to see all devices.")
             } else {
                 VStack(spacing: 0) {
-                    ForEach(peers) { peer in
-                        PeerRow(peer: peer, domains: domains(for: peer)).padding(14)
-                        Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                    ForEach(Array(filteredPeers.enumerated()), id: \.element.id) { index, peer in
+                        if index > 0 { Rectangle().fill(RayfishTheme.line).frame(height: 1) }
+                        PeerRow(
+                            peer: peer,
+                            domains: domains(for: peer),
+                            copyText: { value, label in controller.copyToClipboard(value, label: label) }
+                        )
                     }
                 }.rayfishCard()
             }
@@ -523,6 +1079,8 @@ private struct DevicesView: View {
 
 private struct MachineRow: View {
     let machine: ProviderMachine
+    let copyText: (String, String) -> Void
+
     private var color: Color {
         switch machine.state {
         case "online": RayfishTheme.green
@@ -530,10 +1088,11 @@ private struct MachineRow: View {
         default: RayfishTheme.faint
         }
     }
+
     var body: some View {
         HStack(spacing: 12) {
             Circle().fill(color).frame(width: 7, height: 7)
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(machine.hostname).foregroundColor(RayfishTheme.ink)
                 Text(machine.ipv6).font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
                 Text(machine.networks.isEmpty ? (machine.state == "online" ? "No networks" : "Networks unavailable") : machine.networks.joined(separator: ", "))
@@ -543,13 +1102,9 @@ private struct MachineRow: View {
             Text(machine.state).font(RayfishTheme.mono(12)).foregroundColor(color)
         }
         .contextMenu {
-            Button("Copy IP address") { copy(machine.ipv6) }
-            Button("Copy identity") { copy(machine.identity) }
+            Button("Copy IP address") { copyText(machine.ipv6, "Copied IPv6 address") }
+            Button("Copy identity") { copyText(machine.identity, "Copied machine identity") }
         }
-    }
-    private func copy(_ value: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(value, forType: .string)
     }
 }
 
@@ -639,7 +1194,7 @@ private struct InboundSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("Who can reach you")
+                Text("Who can reach you").font(RayfishTheme.heading(15)).foregroundColor(RayfishTheme.ink)
                 Spacer()
                 Picker("Who can reach you", selection: Binding(
                     get: { controller.status?.inboundPolicy ?? .anyone },
@@ -654,12 +1209,13 @@ private struct InboundSettingsView: View {
                 .frame(width: 200)
             }
             Text("Who may send you connection requests and network invitations. Blocked identities are always refused.")
+                .font(RayfishTheme.text(13))
                 .foregroundColor(RayfishTheme.muted)
             Rectangle().fill(RayfishTheme.line).frame(height: 1)
-            Text("Blocked").font(RayfishTheme.heading(15))
+            Text("Blocked identities").font(RayfishTheme.heading(14)).foregroundColor(RayfishTheme.ink)
             let blocked = controller.status?.blocked ?? []
             if blocked.isEmpty {
-                Text("Nobody is blocked.").foregroundColor(RayfishTheme.faint)
+                Text("Nobody is blocked.").font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.faint)
             }
             ForEach(blocked, id: \.self) { identity in
                 HStack {
@@ -667,10 +1223,13 @@ private struct InboundSettingsView: View {
                         .textSelection(.enabled)
                     Spacer()
                     Button("Unblock") { Task { await controller.unblockPeer(identity) } }
+                        .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
                 }
             }
-            HStack {
-                TextField("Identity to block", text: $blockInput).font(RayfishTheme.mono(12))
+            HStack(spacing: 8) {
+                TextField("Identity to block", text: $blockInput)
+                    .textFieldStyle(RayfishFieldStyle())
+                    .font(RayfishTheme.mono(12))
                 Button("Block") {
                     Task {
                         await controller.blockPeer(trimmed)
@@ -681,25 +1240,13 @@ private struct InboundSettingsView: View {
                 .disabled(trimmed.isEmpty)
             }
             if controller.status == nil {
-                Text("Connect to view and change these settings.").foregroundColor(RayfishTheme.faint)
+                Text("Connect to view and change these settings.")
+                    .font(RayfishTheme.text(13))
+                    .foregroundColor(RayfishTheme.faint)
             }
         }
         .disabled(controller.status == nil || controller.isLoading)
         .padding(18).rayfishCard()
-    }
-}
-
-private struct EmptyState: View {
-    let title: String
-    let description: String
-    var body: some View {
-        VStack(spacing: 10) {
-            Text(title).font(RayfishTheme.text(16)).foregroundColor(RayfishTheme.muted)
-            Text(description).font(RayfishTheme.text(14)).foregroundColor(RayfishTheme.faint)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 40)
-        .rayfishCard()
     }
 }
 
@@ -709,12 +1256,15 @@ private struct SettingsView: View {
     @State private var shellCommandResult: Result<URL, Error>?
     @State private var automaticUpdatesEnabled = false
     @State private var engineNeedsReconnect = false
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 18) {
             Text("Settings").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
+
+            sectionLabel("GENERAL")
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Text("Rayfish version")
+                    Text("Rayfish version").foregroundColor(RayfishTheme.ink)
                     Spacer()
                     Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown")
                         .font(RayfishTheme.mono(12)).foregroundColor(RayfishTheme.muted)
@@ -722,7 +1272,12 @@ private struct SettingsView: View {
                 if let updater {
                     Rectangle().fill(RayfishTheme.line).frame(height: 1)
                     HStack {
-                        Text("Automatically update Rayfish")
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Automatically update Rayfish").foregroundColor(RayfishTheme.ink)
+                            Text("Updates download in the background. Restart when notified, or they install when you quit.")
+                                .font(RayfishTheme.text(13))
+                                .foregroundColor(RayfishTheme.muted)
+                        }
                         Spacer()
                         Toggle("Automatically update Rayfish", isOn: Binding(
                             get: { automaticUpdatesEnabled },
@@ -735,8 +1290,22 @@ private struct SettingsView: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                     }
-                    Text("Updates download in the background. Restart when notified, or they install when you quit.")
-                        .foregroundColor(RayfishTheme.muted)
+                }
+                Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Start at login").foregroundColor(RayfishTheme.ink)
+                        Text("Open Rayfish and connect after you sign in.")
+                            .font(RayfishTheme.text(13))
+                            .foregroundColor(RayfishTheme.muted)
+                    }
+                    Spacer()
+                    Toggle("Start at login", isOn: Binding(
+                        get: { controller.launchAtLoginEnabled },
+                        set: { controller.setLaunchAtLogin($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
                 }
             }
             .padding(18).rayfishCard()
@@ -744,35 +1313,28 @@ private struct SettingsView: View {
                 automaticUpdatesEnabled = updater?.automaticallyChecksForUpdates == true
                     && updater?.automaticallyDownloadsUpdates == true
             }
-            SSHSettingsView(controller: controller)
-            FirewallSettingsView(controller: controller)
-            InboundSettingsView(controller: controller)
+
+            sectionLabel("CONNECTION & ROUTING")
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Text("VPN").font(RayfishTheme.heading(15))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("VPN tunnel").foregroundColor(RayfishTheme.ink)
+                        Text("Managed by the Rayfish system extension.")
+                            .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.muted)
+                    }
                     Spacer()
-                    Text(controller.connectionLabel)
-                        .font(RayfishTheme.mono(12)).foregroundColor(RayfishTheme.muted)
+                    RayfishBadge(
+                        text: controller.connectionLabel.uppercased(),
+                        tone: controller.isConnected ? .success : .neutral
+                    )
                 }
-                Text("The Rayfish system extension manages your connection.").foregroundColor(RayfishTheme.muted)
-            }.padding(18).rayfishCard()
-            VStack(alignment: .leading, spacing: 14) {
+                Rectangle().fill(RayfishTheme.line).frame(height: 1)
                 HStack {
-                    Text("Start at login")
-                    Spacer()
-                    Toggle("Start at login", isOn: Binding(
-                        get: { controller.launchAtLoginEnabled },
-                        set: { controller.setLaunchAtLogin($0) }
-                    ))
-                    .labelsHidden()
-                }
-                Text("Open Rayfish and connect after you sign in.").foregroundColor(RayfishTheme.muted)
-            }
-            .toggleStyle(.switch)
-            .padding(18).rayfishCard()
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Text("Magic DNS")
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Magic DNS").foregroundColor(RayfishTheme.ink)
+                        Text("Resolve device names ending in .ray.")
+                            .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.muted)
+                    }
                     Spacer()
                     Toggle("Magic DNS", isOn: Binding(
                         get: { controller.status?.dnsEnabled ?? false },
@@ -780,10 +1342,17 @@ private struct SettingsView: View {
                     ))
                     .labelsHidden()
                 }
-                Text("Resolve device names ending in .ray.").foregroundColor(RayfishTheme.muted)
                 Rectangle().fill(RayfishTheme.line).frame(height: 1)
                 HStack {
-                    Text("mDNS discovery")
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("mDNS discovery").foregroundColor(RayfishTheme.ink)
+                        Text("Discover peers on your local network.")
+                            .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.muted)
+                        if let status = controller.status, status.mdnsEnabled && !status.mdnsActive {
+                            Text("mDNS discovery is not running. Check Rayfish logs.")
+                                .font(RayfishTheme.text(12)).foregroundColor(RayfishTheme.amber)
+                        }
+                    }
                     Spacer()
                     Toggle("mDNS discovery", isOn: Binding(
                         get: { controller.status?.mdnsEnabled ?? false },
@@ -791,22 +1360,13 @@ private struct SettingsView: View {
                     ))
                     .labelsHidden()
                 }
-                Text("Discover peers on your local network.")
-                    .foregroundColor(RayfishTheme.muted)
-                if let status = controller.status, status.mdnsEnabled && !status.mdnsActive {
-                    Text("mDNS discovery is not running. Check Rayfish logs.")
-                        .foregroundColor(RayfishTheme.muted)
-                }
-                if controller.status == nil {
-                    Text("Connect to view and change DNS settings.").foregroundColor(RayfishTheme.faint)
-                }
-            }
-            .toggleStyle(.switch)
-            .disabled(controller.status == nil || controller.isLoading)
-            .padding(18).rayfishCard()
-            VStack(alignment: .leading, spacing: 14) {
+                Rectangle().fill(RayfishTheme.line).frame(height: 1)
                 HStack {
-                    Text("QUIC engine")
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("QUIC engine").foregroundColor(RayfishTheme.ink)
+                        Text("Standalone sends packets directly. FQ-CoDel is experimental and gives small transfers a turn alongside bulk traffic.")
+                            .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.muted)
+                    }
                     Spacer()
                     Picker("QUIC engine", selection: Binding(
                         get: { controller.status?.quicFqCodel ?? false },
@@ -824,230 +1384,91 @@ private struct SettingsView: View {
                     .pickerStyle(.menu)
                     .frame(width: 150)
                 }
-                Text("Standalone sends packets directly. FQ-CoDel is experimental and gives small transfers a turn alongside bulk traffic.")
-                    .foregroundColor(RayfishTheme.muted)
                 if engineNeedsReconnect {
                     HStack {
-                        Text("Reconnect to apply this change.").foregroundColor(RayfishTheme.amber)
+                        Text("Reconnect to apply this change.")
+                            .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.amber)
                         Spacer()
                         Button("Reconnect now") {
                             engineNeedsReconnect = false
                             Task { await controller.reconnect() }
                         }
+                        .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
                     }
                 }
                 if controller.status == nil {
-                    Text("Connect to view and change this setting.").foregroundColor(RayfishTheme.faint)
+                    Text("Connect to view and change connection settings.")
+                        .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.faint)
                 }
             }
             .toggleStyle(.switch)
             .disabled(controller.status == nil || controller.isLoading)
             .padding(18).rayfishCard()
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Command line").font(RayfishTheme.heading(15))
-                Text("ray status").font(RayfishTheme.mono(13)).foregroundColor(RayfishTheme.rose)
+
+            sectionLabel("ACCESS & PRIVACY")
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Mesh firewall").font(RayfishTheme.heading(15)).foregroundColor(RayfishTheme.ink)
+                    Text("Configure per-network rules, general cross-network rules, and default policies.")
+                        .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.muted)
+                }
+                Spacer()
+                Button("Open Firewall") {
+                    controller.openFirewall()
+                }
+                .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
+            }
+            .padding(18).rayfishCard()
+
+            InboundSettingsView(controller: controller)
+            SSHSettingsView(controller: controller)
+
+            sectionLabel("TOOLS")
+            VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("Make ray and tab completion available in new \(ShellCommandInstaller.shellName()) terminals.")
-                        .foregroundColor(RayfishTheme.muted)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Command line").font(RayfishTheme.heading(15)).foregroundColor(RayfishTheme.ink)
+                        Text("Make ray and tab completion available in new \(ShellCommandInstaller.shellName()) terminals.")
+                            .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.muted)
+                    }
                     Spacer()
                     Button("Install shell command") {
                         shellCommandResult = Result { try ShellCommandInstaller.install() }
                     }
                 }
+                Text("ray status").font(RayfishTheme.mono(12)).foregroundColor(RayfishTheme.rose)
                 switch shellCommandResult {
                 case let .success(config)?:
                     Label("Installed in ~/\(config.lastPathComponent). Open a new terminal to use ray.", systemImage: "checkmark.circle.fill")
+                        .font(RayfishTheme.text(13))
                         .foregroundColor(RayfishTheme.green)
                 case let .failure(error)?:
                     Label(error.localizedDescription, systemImage: "exclamationmark.triangle.fill")
+                        .font(RayfishTheme.text(13))
                         .foregroundColor(RayfishTheme.amber)
                 case nil:
                     EmptyView()
                 }
             }.padding(18).rayfishCard()
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Existing installation").font(RayfishTheme.heading(15))
-                Text("Your identity and networks are imported automatically from the old Rayfish service. The old service is stopped and its original data is kept.")
-                    .foregroundColor(RayfishTheme.muted)
-            }.padding(18).frame(maxWidth: .infinity, alignment: .leading).rayfishCard()
-        }
-    }
-}
 
-private struct FirewallSettingsView: View {
-    @ObservedObject var controller: TunnelController
-    @State private var showingAddRule = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("Firewall").font(RayfishTheme.heading(15))
-                Spacer()
-                if let firewall = controller.firewall {
-                    Text(firewall.disabled ? "disabled" : "enabled")
-                        .font(RayfishTheme.mono(11))
-                        .foregroundColor(firewall.disabled ? RayfishTheme.amber : RayfishTheme.green)
-                }
-                Button("Refresh") { Task { await controller.loadFirewall() } }
-                    .disabled(controller.isLoading || !controller.isConnected)
+            if LegacyDaemon.isInstalled {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Existing installation").font(RayfishTheme.heading(15)).foregroundColor(RayfishTheme.ink)
+                    Text("Your identity and networks are imported automatically from the old Rayfish service. The old service is stopped and its original data is kept.")
+                        .font(RayfishTheme.text(13))
+                        .foregroundColor(RayfishTheme.muted)
+                }.padding(18).frame(maxWidth: .infinity, alignment: .leading).rayfishCard()
             }
-            Text("Rules filter traffic on the Rayfish mesh. They work alongside your Mac's system firewall.")
-                .foregroundColor(RayfishTheme.muted)
-            if let firewall = controller.firewall {
-                HStack {
-                    Text("Inbound default")
-                    Spacer()
-                    Button(firewall.defaultInbound) {
-                        Task { await controller.setFirewallDefaultInbound(firewall.defaultInbound == "deny" ? "allow" : "deny") }
-                    }
-                    .disabled(controller.isLoading || !controller.isConnected)
-                }
-                HStack {
-                    Text("Outbound default")
-                    Spacer()
-                    Text(firewall.defaultOutbound).foregroundColor(RayfishTheme.muted)
-                }
-                if firewall.rules.isEmpty {
-                    Text("No rules configured.").font(RayfishTheme.mono(12)).foregroundColor(RayfishTheme.faint)
-                } else {
-                    ForEach(Array(firewall.rules.enumerated()), id: \.offset) { index, rule in
-                        Rectangle().fill(RayfishTheme.line).frame(height: 1)
-                        HStack(alignment: .top, spacing: 12) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("\(rule.direction)  \(rule.action)  \(rule.protocolName)  \(rule.port)")
-                                    .font(RayfishTheme.mono(12)).foregroundColor(RayfishTheme.body)
-                                Text("peer \(rule.peer)  ·  network \(rule.network)")
-                                    .font(RayfishTheme.mono(10)).foregroundColor(RayfishTheme.faint)
-                            }
-                            Spacer()
-                            Button("Remove", role: .destructive) {
-                                Task { await controller.removeFirewallRule(at: UInt32(index)) }
-                            }
-                            .disabled(controller.isLoading || !controller.isConnected)
-                        }
-                    }
-                }
-            } else {
-                Text(controller.isConnected ? "Loading firewall rules…" : "Connect to view and change firewall rules.")
-                    .foregroundColor(RayfishTheme.faint)
-            }
-            Button("Add rule") { showingAddRule = true }
-                .disabled(controller.isLoading || !controller.isConnected)
-        }
-        .padding(18).rayfishCard()
-        .task {
-            if controller.isConnected { await controller.loadFirewall() }
-        }
-        .sheet(isPresented: $showingAddRule) {
-            AddFirewallRuleSheet(controller: controller)
-        }
-    }
-}
-
-private struct AddFirewallRuleSheet: View {
-    @ObservedObject var controller: TunnelController
-    @Environment(\.dismiss) private var dismiss
-    @State private var direction = "in"
-    @State private var action = "allow"
-    @State private var protocolName = "tcp"
-    @State private var port = ""
-    @State private var peer = ""
-    @State private var network = ""
-
-    private var peerOptions: [FirewallPeerOption] {
-        var labelsByIdentity: [String: Set<String>] = [:]
-        for network in controller.status?.networks ?? [] {
-            if !self.network.isEmpty && network.name != self.network { continue }
-            for peer in network.peers {
-                let identity = peer.identity ?? peer.ipv6
-                let name = peer.hostname.isEmpty ? peer.ipv6 : peer.hostname
-                labelsByIdentity[identity, default: []].insert("\(name) · \(network.name)")
-            }
-        }
-        let peers = labelsByIdentity.keys.sorted().compactMap { identity -> FirewallPeerOption? in
-            guard let labels = labelsByIdentity[identity] else { return nil }
-            return FirewallPeerOption(id: identity, label: "\(labels.sorted().joined(separator: ", ")) (\(identity.prefix(6)))")
-        }
-        return [FirewallPeerOption(id: "", label: "Any peer")] + peers
-    }
-
-    private var networkOptions: [FirewallPeerOption] {
-        [FirewallPeerOption(id: "", label: "Any network")] +
-            (controller.status?.networks ?? []).map { FirewallPeerOption(id: $0.name, label: $0.name) }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Add firewall rule").font(RayfishTheme.heading(18))
-            fieldRow("Direction") {
-                Picker("Direction", selection: $direction) {
-                    Text("Inbound").tag("in")
-                    Text("Outbound").tag("out")
-                }
-                .labelsHidden().pickerStyle(.menu)
-            }
-            fieldRow("Action") {
-                Picker("Action", selection: $action) {
-                    Text("Allow").tag("allow")
-                    Text("Deny").tag("deny")
-                }
-                .labelsHidden().pickerStyle(.menu)
-            }
-            fieldRow("Protocol") {
-                Picker("Protocol", selection: $protocolName) {
-                    ForEach(["tcp", "udp", "icmp", "any"], id: \.self) { Text($0.uppercased()).tag($0) }
-                }
-                .labelsHidden().pickerStyle(.menu)
-            }
-            fieldRow("Ports") {
-                TextField("Optional, for example 22 or 80,443", text: $port)
-            }
-            fieldRow("Peer") {
-                Picker("Peer", selection: $peer) {
-                    ForEach(peerOptions) { option in Text(option.label).tag(option.id) }
-                }
-                .labelsHidden().pickerStyle(.menu)
-            }
-            fieldRow("Network") {
-                Picker("Network", selection: $network) {
-                    ForEach(networkOptions) { option in Text(option.label).tag(option.id) }
-                }
-                .labelsHidden().pickerStyle(.menu)
-            }
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
-                Button("Add rule") {
-                    Task {
-                        await controller.addFirewallRule(direction: direction, action: action,
-                                                         protocolName: protocolName, port: port,
-                                                         peer: peer.isEmpty ? nil : peer,
-                                                         network: network.isEmpty ? nil : network)
-                        if controller.error == nil { dismiss() }
-                    }
-                }
-                .buttonStyle(RayfishButtonStyle(kind: .primary))
-                .disabled(controller.isLoading)
-            }
-        }
-        .padding(24).frame(width: 560)
-        .background(RayfishTheme.background)
-        .onChange(of: network) { _ in
-            if !peerOptions.contains(where: { $0.id == peer }) { peer = "" }
         }
     }
 
-    private func fieldRow<Field: View>(_ title: String, @ViewBuilder field: () -> Field) -> some View {
-        HStack(spacing: 16) {
-            Text(title).frame(width: 100, alignment: .leading)
-            field().frame(maxWidth: .infinity, alignment: .leading)
-        }
+    private func sectionLabel(_ title: String) -> some View {
+        Text(title)
+            .font(RayfishTheme.mono(10))
+            .tracking(1.2)
+            .foregroundColor(RayfishTheme.faint)
+            .padding(.top, 4)
     }
-}
-
-private struct FirewallPeerOption: Identifiable {
-    let id: String
-    let label: String
 }
 
 private struct RenameHostSheet: View {

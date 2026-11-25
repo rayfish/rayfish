@@ -11,19 +11,20 @@
     @font-face { font-family: "Press Start 2P"; src: url("/fonts/logo.ttf?token=__TOKEN__"); font-weight: 400; }
     :root {
       color-scheme: dark;
-      --bg: #18181b;          /* zinc-900 */
+      --bg: #18181b;
       --panel: #1c1c20;
-      --deep: #09090b;        /* zinc-950 */
-      --line: #27272a;        /* zinc-800 */
-      --line-2: #3f3f46;      /* zinc-700 */
-      --ink: #f4f4f5;         /* zinc-100 */
-      --body: #d4d4d8;        /* zinc-300 */
-      --muted: #a1a1aa;       /* zinc-400 */
-      --faint: #71717a;       /* zinc-500 */
-      --rose: #fb7185;        /* rose-400 */
-      --rose-strong: #f43f5e; /* rose-500 */
-      --rose-deep: #e11d48;   /* rose-600 */
-      --green: #34d399;       /* emerald-400 */
+      --panel-hover: #222227;
+      --deep: #09090b;
+      --line: #27272a;
+      --line-2: #3f3f46;
+      --ink: #f4f4f5;
+      --body: #d4d4d8;
+      --muted: #a1a1aa;
+      --faint: #71717a;
+      --rose: #fb7185;
+      --rose-strong: #f43f5e;
+      --rose-deep: #e11d48;
+      --green: #34d399;
       --amber: #fbbf24;
       --robot: "Chakra Petch", system-ui, sans-serif;
       --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -50,8 +51,9 @@
       padding: 0 12px;
       cursor: pointer;
       font-weight: 600;
+      transition: background .12s ease, border-color .12s ease, color .12s ease;
     }
-    button:hover { border-color: var(--faint); color: var(--ink); }
+    button:hover { border-color: var(--muted); color: var(--ink); background: rgba(255,255,255,.035); }
     button:focus-visible, input:focus-visible, select:focus-visible {
       outline: 2px solid var(--rose);
       outline-offset: 1px;
@@ -63,50 +65,55 @@
       font-weight: 600;
     }
     button.primary:hover { background: var(--rose-deep); border-color: var(--rose-deep); color: #fff; }
-    button.small { min-height: 32px; padding: 0 12px; font-size: 13px; }
+    button.small { min-height: 28px; padding: 0 10px; font-size: 12.5px; }
+    button.subtle { border-color: transparent; color: var(--muted); }
+    button.subtle:hover { border-color: var(--line-2); color: var(--ink); }
     button.danger { color: var(--rose); border-color: rgba(244,63,94,.35); }
-    button.danger:hover { border-color: var(--rose-strong); }
+    button.danger:hover { border-color: var(--rose-strong); background: rgba(244,63,94,.08); }
     button.on { color: var(--green); border-color: rgba(52,211,153,.4); }
-    button.on:hover { color: var(--green); border-color: var(--green); }
+    button.on:hover { color: var(--green); border-color: var(--green); background: rgba(52,211,153,.07); }
     input, select, textarea {
       width: 100%;
-      min-height: 38px;
+      min-height: 36px;
       border: 1px solid var(--line-2);
       border-radius: 8px;
       background: var(--deep);
       color: var(--ink);
-      padding: 7px 11px;
+      padding: 6px 11px;
     }
     textarea { min-height: 100px; resize: vertical; font-family: var(--mono); }
     input::placeholder { color: var(--faint); }
     label { display: grid; gap: 5px; font-size: 13px; color: var(--muted); }
-    label.check { display: flex; align-items: center; gap: 8px; color: var(--body); font-size: 14px; }
-    label.check input { width: auto; min-height: auto; accent-color: var(--rose-strong); }
 
     .wrap { max-width: 976px; margin: 0 auto; padding: 28px 28px 64px; }
-    header.top {
-      display: grid; gap: 20px;
-    }
+    header.top { display: grid; gap: 18px; }
     .brand-row { display: flex; align-items: center; gap: 14px; }
     .brand-mark { width: 34px; height: 34px; object-fit: contain; }
     .logo { font-family: var(--logo); font-size: 15px; color: var(--ink); text-decoration: none; }
     .logo .dot-i { color: var(--rose); }
-    .live { display: inline-flex; align-items: center; gap: 6px; color: var(--faint); font-family: var(--mono); font-size: 11px; }
+    .live {
+      display: inline-flex; align-items: center; gap: 6px; color: var(--faint);
+      font-family: var(--mono); font-size: 11px;
+      padding: 3px 9px; border-radius: 999px; background: rgba(255,255,255,.03);
+    }
     .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
     .live.on { color: var(--green); }
     .live.on i { background: var(--green); box-shadow: 0 0 7px rgba(52,211,153,.8); }
     .top-actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     .tabs {
-      display: flex; align-items: end; gap: 22px;
+      display: flex; align-items: end; gap: 24px;
       border-bottom: 1px solid var(--line);
     }
     button.tab {
       min-height: auto; padding: 0 0 10px; border: 0; border-radius: 0;
       color: var(--faint); font-size: 14px; font-weight: 600;
       border-bottom: 2px solid transparent; margin-bottom: -1px;
+      display: inline-flex; align-items: center; gap: 6px;
+      background: transparent;
     }
-    button.tab:hover { color: var(--body); }
+    button.tab:hover { color: var(--body); background: transparent; }
     button.tab.active { color: var(--ink); border-bottom-color: var(--rose-strong); }
+    .tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); }
     .mesh-label {
       margin-left: auto; padding-bottom: 10px; color: var(--faint);
       font: 10px var(--mono); letter-spacing: .14em;
@@ -115,16 +122,20 @@
     .page.active { display: block; }
 
     .statline {
-      display: flex; flex-wrap: wrap; gap: 6px 18px;
-      font-family: var(--mono); font-size: 12.5px; color: var(--muted);
-      padding: 20px 0 0;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+      font-family: var(--mono); font-size: 12px; color: var(--muted);
+      margin-top: 18px;
+      padding: 10px 14px;
+      background: rgba(28,28,32,.65);
+      border: 1px solid var(--line);
+      border-radius: 8px;
     }
     .statline .copyable { cursor: pointer; color: var(--body); }
     .statline .copyable:hover { color: var(--rose); }
-    .statline b { color: var(--ink); font-weight: 600; }
+    .statline .sep { color: var(--line-2); }
 
-    section { margin-top: 26px; }
-    .sec-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    section { margin-top: 22px; }
+    .sec-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
     .sec-head h2 {
       margin: 0;
       font-size: 17px;
@@ -132,20 +143,19 @@
       color: var(--ink);
       letter-spacing: .02em;
     }
-    .sec-head .spacer { flex: 1; }
     .spacer { flex: 1; }
+    .filter-bar { margin-bottom: 14px; }
 
-    /* Needs attention */
-    #attention .card { border-color: rgba(251,191,36,.25); }
+    #attention .card { border-color: rgba(251,191,36,.28); }
     .attn-row {
       display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-      padding: 11px 14px;
+      padding: 12px 16px;
       border-top: 1px solid var(--line);
     }
     .attn-row:first-child { border-top: 0; }
     .attn-row .what { flex: 1; min-width: 220px; }
     .attn-row .what b { color: var(--ink); font-weight: 600; }
-    .attn-row .sub { display: block; color: var(--faint); font-family: var(--mono); font-size: 12px; }
+    .attn-row .sub { display: block; color: var(--faint); font-family: var(--mono); font-size: 11.5px; margin-top: 2px; }
 
     .card {
       background: var(--panel);
@@ -153,40 +163,46 @@
       border-radius: 10px;
       overflow: hidden;
     }
-    .net-card { margin-bottom: 14px; }
+    .net-card { margin-bottom: 12px; }
     .net-head {
       display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--line);
+      padding: 13px 16px;
     }
-    .net-head strong { color: var(--ink); font-size: 16px; font-weight: 600; }
-    .net-title { display: flex; align-items: center; gap: 8px; }
+    .net-toggle {
+      min-height: auto; padding: 0; border: 0; background: transparent;
+      display: inline-flex; align-items: center; gap: 8px;
+      color: var(--ink); font-size: 16px; font-weight: 600;
+    }
+    .net-toggle:hover { background: transparent; color: var(--rose); }
+    .chev { font-family: var(--mono); font-size: 11px; color: var(--faint); width: 12px; text-align: center; }
+    .net-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .role {
-      font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+      font-family: var(--mono); font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
       border: 1px solid var(--line-2);
       color: var(--muted);
       border-radius: 999px;
       padding: 2px 8px;
     }
-    .role.coordinator { color: var(--rose); border-color: rgba(251,113,133,.4); }
-    .net-head .self { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+    .role.coordinator { color: var(--rose); border-color: rgba(251,113,133,.35); background: rgba(244,63,94,.07); }
+    .net-meta { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+    .net-head .self { color: var(--faint); font-family: var(--mono); font-size: 11.5px; padding-left: 20px; margin-top: 3px; }
     .net-head .self .copyable { cursor: pointer; color: var(--muted); }
     .net-head .self .copyable:hover { color: var(--rose); }
-    .net-head .net-actions { margin-left: auto; display: flex; gap: 8px; }
+    .net-head .net-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
     .peer-row {
       display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-      padding: 9px 14px;
+      padding: 10px 16px;
       border-top: 1px solid var(--line);
-      font-family: var(--mono); font-size: 13px;
+      font-family: var(--mono); font-size: 12.5px;
     }
-    .peer-row:first-of-type { border-top: 0; }
     .peer-row[data-copy] { cursor: pointer; }
-    .peer-row .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+    .peer-row[data-copy]:hover { background: rgba(255,255,255,.025); }
+    .peer-row .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
     .dot.direct { background: var(--green); box-shadow: 0 0 6px rgba(52,211,153,.6); }
     .dot.relay { background: var(--amber); }
     .dot.idle { background: transparent; border: 1px solid var(--faint); }
-    .peer-row .host { color: var(--ink); min-width: 110px; }
+    .peer-row .host { color: var(--ink); min-width: 120px; }
     .peer-row .tag {
       font-size: 9px; letter-spacing: .07em; text-transform: uppercase;
       border: 1px solid var(--line-2); border-radius: 4px; padding: 1px 5px; margin-left: 6px;
@@ -196,21 +212,66 @@
     .peer-row[data-copy]:hover .host { color: var(--rose); }
     .peer-row .conn { color: var(--faint); }
     .peer-row .conn.direct { color: var(--green); }
-    .peer-row .acts { margin-left: auto; display: flex; gap: 6px; }
-    .empty {
-      padding: 26px 14px; text-align: center; color: var(--faint);
-    }
-    .empty .big { color: var(--muted); margin-bottom: 14px; }
+    .peer-row .conn.relay { color: var(--amber); }
+    .empty { padding: 32px 16px; text-align: center; color: var(--faint); }
+    .empty .big { color: var(--body); font-weight: 600; margin-bottom: 6px; }
 
-    .summary-card { display: flex; align-items: center; gap: 12px; padding: 14px; }
+    /* Firewall split layout */
+    .fw-layout { display: grid; grid-template-columns: 228px 1fr; gap: 18px; align-items: start; }
+    .fw-rail { padding: 12px; display: grid; gap: 6px; }
+    .fw-rail-label {
+      font: 10px var(--mono); letter-spacing: .11em; color: var(--faint);
+      padding: 6px 8px 2px; display: flex; justify-content: space-between;
+    }
+    button.scope-btn {
+      width: 100%; text-align: left; padding: 8px 10px; min-height: auto;
+      border-color: transparent; border-radius: 7px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    button.scope-btn:hover { background: rgba(255,255,255,.04); border-color: transparent; }
+    button.scope-btn.active {
+      background: rgba(244,63,94,.12);
+      border-color: rgba(251,113,133,.35);
+      color: var(--ink);
+    }
+    .scope-main { min-width: 0; flex: 1; }
+    .scope-title { display: block; font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .scope-sub { display: block; font: 10px var(--mono); color: var(--faint); }
+    .scope-count {
+      font: 10px var(--mono); color: var(--muted);
+      background: rgba(255,255,255,.05); border-radius: 999px; padding: 1px 6px;
+    }
+    .fw-detail { display: grid; gap: 14px; }
+    .fw-banner {
+      display: flex; align-items: center; gap: 12px; padding: 14px 16px;
+      border-radius: 10px; border: 1px solid rgba(251,191,36,.3);
+      background: rgba(251,191,36,.06);
+    }
+    .rule-row {
+      display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+      border-top: 1px solid var(--line);
+    }
+    .rule-pill {
+      font: 10px var(--mono); letter-spacing: .06em; text-transform: uppercase;
+      padding: 3px 8px; border-radius: 999px; min-width: 58px; text-align: center;
+      border: 1px solid var(--line-2);
+    }
+    .rule-pill.allow { color: var(--green); border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.08); }
+    .rule-pill.deny { color: var(--rose); border-color: rgba(251,113,133,.35); background: rgba(244,63,94,.08); }
+    .rule-main { flex: 1; min-width: 0; }
+    .rule-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--ink); font-weight: 600; font-size: 13.5px; }
+    .rule-proto { font: 12px var(--mono); color: var(--body); font-weight: 400; }
+    .rule-sub { font: 11px var(--mono); color: var(--muted); margin-top: 2px; }
+    .preset-row { display: flex; flex-wrap: wrap; gap: 6px; }
+
+    .summary-card { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
     .summary-card .label { color: var(--muted); }
     .summary-card .value {
       min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       color: var(--ink); font: 11px var(--mono);
     }
-    .summary-card .spacer, .settings-card .spacer { flex: 1; }
     .device-row {
-      display: flex; align-items: center; gap: 12px; padding: 14px;
+      display: flex; align-items: center; gap: 12px; padding: 14px 16px;
       border-top: 1px solid var(--line);
     }
     .device-row:first-child { border-top: 0; }
@@ -224,7 +285,7 @@
     .settings-card { padding: 18px; display: grid; gap: 14px; margin-bottom: 14px; }
     .setting-row { display: flex; align-items: center; gap: 14px; }
     .setting-title { color: var(--ink); font-weight: 600; }
-    .setting-description { color: var(--muted); }
+    .setting-description { color: var(--muted); font-size: 13.5px; }
     .setting-divider { height: 1px; background: var(--line); }
     [hidden] { display: none !important; }
     button.switch {
@@ -240,92 +301,69 @@
     button.switch:disabled { opacity: .45; cursor: default; }
     .command-example { color: var(--rose); font: 13px var(--mono); }
 
-    /* Advanced drawer */
     #advanced { display: none; }
     #advanced.open { display: block; }
     .console pre {
-      margin: 0;
-      min-height: 200px;
-      max-height: 46vh;
-      overflow: auto;
-      background: var(--deep);
-      border-top: 1px solid var(--line);
-      color: var(--body);
-      padding: 12px 14px;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font: 13px/1.55 var(--mono);
+      margin: 0; min-height: 200px; max-height: 46vh; overflow: auto;
+      background: var(--deep); border-top: 1px solid var(--line);
+      color: var(--body); padding: 12px 14px;
+      white-space: pre-wrap; word-break: break-word; font: 13px/1.55 var(--mono);
     }
     .console .prompt { color: var(--rose); user-select: none; }
-    .cmdbar {
-      display: flex; gap: 8px; padding: 10px 14px; flex-wrap: wrap;
-      border-top: 1px solid var(--line);
-    }
+    .cmdbar { display: flex; gap: 8px; padding: 10px 14px; flex-wrap: wrap; border-top: 1px solid var(--line); }
     .cmdbar input { flex: 1; min-width: 200px; font-family: var(--mono); font-size: 13px; }
-    .cmdbar select { width: auto; max-width: 240px; font-family: var(--mono); font-size: 13px; }
     .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 14px 2px; }
     .chips button { font-family: var(--mono); font-size: 12px; }
     .console-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px 0; }
     .console-head h3 { margin: 0; font-size: 14px; color: var(--ink); font-weight: 600; }
     .console-head .badge { margin-left: auto; }
     .badge {
-      font-family: var(--mono); font-size: 11px;
+      font-family: var(--mono); font-size: 10.5px;
       border: 1px solid var(--line-2); border-radius: 999px;
-      color: var(--muted);
-      padding: 2px 9px;
+      color: var(--muted); padding: 2px 9px;
     }
-    .badge.good { color: var(--green); border-color: rgba(52,211,153,.35); }
+    .badge.good { color: var(--green); border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.08); }
+    .badge.warn { color: var(--amber); border-color: rgba(251,191,36,.35); background: rgba(251,191,36,.08); }
     .badge.bad { color: var(--rose); border-color: rgba(251,113,133,.4); }
 
     dialog {
-      background: var(--panel);
-      color: var(--body);
-      border: 1px solid var(--line-2);
-      border-radius: 12px;
-      padding: 20px;
-      width: min(440px, calc(100vw - 32px));
+      background: var(--panel); color: var(--body);
+      border: 1px solid var(--line-2); border-radius: 12px;
+      padding: 22px; width: min(480px, calc(100vw - 32px));
     }
     dialog::backdrop { background: rgba(0,0,0,.6); }
-    dialog h3 { margin: 0 0 14px; color: var(--ink); font-size: 17px; font-weight: 600; }
+    dialog h3 { margin: 0 0 8px; color: var(--ink); font-size: 17px; font-weight: 600; }
     dialog form { display: grid; gap: 12px; }
     dialog .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
     .code-block {
       font-family: var(--mono); font-size: 13px;
-      background: var(--deep);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-      word-break: break-all;
-      color: var(--ink);
-      user-select: all;
+      background: var(--deep); border: 1px solid var(--line);
+      border-radius: 8px; padding: 12px; word-break: break-all;
+      color: var(--ink); user-select: all;
     }
-    .dlg-note { color: var(--faint); font-size: 13px; }
+    .dlg-note { color: var(--muted); font-size: 13px; margin: 0; }
 
     #toast {
-      position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
-      background: var(--deep);
-      border: 1px solid var(--line-2);
-      color: var(--ink);
-      border-radius: 8px;
-      padding: 9px 16px;
-      font-family: var(--mono); font-size: 13px;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity .18s ease;
+      position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+      background: var(--deep); border: 1px solid var(--line-2);
+      color: var(--ink); border-radius: 999px;
+      padding: 8px 16px; font-family: var(--mono); font-size: 12px;
+      opacity: 0; pointer-events: none; transition: opacity .16s ease;
       max-width: min(560px, calc(100vw - 32px));
     }
     #toast.show { opacity: 1; }
     #toast.err { border-color: var(--rose-strong); color: var(--rose); }
 
-    @media (max-width: 640px) {
-      .peer-row .acts, .net-head .net-actions { margin-left: 0; width: 100%; }
+    @media (max-width: 720px) {
+      .fw-layout { grid-template-columns: 1fr; }
+      .net-head .net-actions { margin-left: 0; width: 100%; }
       .top-actions { width: 100%; }
       .wrap { padding: 20px 16px 48px; }
       .brand-row { flex-wrap: wrap; }
       .mesh-label { display: none; }
     }
     @media (prefers-reduced-motion: reduce) {
-      #toast { transition: none; }
+      #toast, button { transition: none; }
     }
   </style>
 </head>
@@ -343,7 +381,7 @@
       <nav class="tabs" aria-label="Dashboard pages">
         <button class="tab active" data-page="networks">Networks</button>
         <button class="tab" data-page="devices">Devices</button>
-        <button class="tab" data-page="firewall">Firewall</button>
+        <button class="tab" data-page="firewall">Firewall<span id="fwTabDot" class="tab-dot" hidden></span></button>
         <button class="tab" data-page="settings">Settings</button>
         <span class="mesh-label">PRIVATE MESH</span>
       </nav>
@@ -361,8 +399,12 @@
         <div class="sec-head">
           <h2>Networks</h2>
           <div class="spacer"></div>
+          <button id="collapseAllBtn" class="small subtle" hidden>Collapse all</button>
           <button id="joinBtn" class="small">Join with a code</button>
           <button id="createBtn" class="small primary">Create a network</button>
+        </div>
+        <div id="networkFilterWrap" class="filter-bar" hidden>
+          <input id="networkFilter" placeholder="Filter networks, peers, or IPv6 addresses..." autocomplete="off">
         </div>
         <div id="networks"></div>
       </section>
@@ -392,6 +434,9 @@
       </section>
       <section>
         <div class="sec-head"><h2>Network peers</h2></div>
+        <div id="peerFilterWrap" class="filter-bar" hidden>
+          <input id="peerFilter" placeholder="Filter peers by name, domain, or IPv6..." autocomplete="off">
+        </div>
         <div id="networkPeers"></div>
       </section>
     </main>
@@ -399,17 +444,17 @@
     <main id="pageFirewall" class="page">
       <section>
         <div class="sec-head">
+          <button id="fwBackBtn" class="small subtle" hidden>Back to Networks</button>
           <h2>Firewall</h2>
+          <span id="fwStatusBadge" class="badge">loading</span>
           <span class="spacer"></span>
           <button id="refreshFirewall" class="small">Refresh</button>
-          <button id="addFirewallRule" class="small primary">Add rule</button>
+          <button id="addFirewallRule" class="small primary">Add general rule</button>
         </div>
-        <div class="card settings-card">
-          <div class="setting-row"><span class="setting-title">Inbound default</span><span class="spacer"></span><span id="firewallInbound" class="badge">loading</span><button id="toggleFirewallDefault" class="small">Change</button></div>
-          <div class="setting-row"><span class="setting-title">Outbound default</span><span class="spacer"></span><span id="firewallOutbound" class="badge">loading</span></div>
-          <div class="setting-description">Rayfish mesh rules work alongside the Windows system firewall.</div>
+        <div class="fw-layout">
+          <aside class="card fw-rail" id="fwScopeRail"></aside>
+          <div class="fw-detail" id="fwDetail"></div>
         </div>
-        <div id="firewallRules" class="card"></div>
       </section>
     </main>
 
@@ -422,7 +467,7 @@
             <span class="spacer"></span>
             <span id="vpnState" class="badge">checking</span>
           </div>
-          <div id="vpnDescription" class="setting-description">Rayfish manages this connection through its Windows service.</div>
+          <div id="vpnDescription" class="setting-description">Rayfish manages this connection through its background service.</div>
         </div>
         <div id="launchAtLoginCard" class="card settings-card" hidden>
           <div class="setting-row">
@@ -467,7 +512,7 @@
             <div>
               <div class="setting-title">Command line</div>
               <div class="command-example">ray status</div>
-              <div class="setting-description">Run Rayfish commands without leaving the app.</div>
+              <div class="setting-description">Run Rayfish commands without leaving the dashboard.</div>
             </div>
             <span class="spacer"></span>
             <button id="advancedBtn" class="small">Open console</button>
@@ -509,7 +554,7 @@
     <form id="createForm" method="dialog">
       <p class="dlg-note">Only people you invite can join.</p>
       <label>Network name <span>(optional, generated if empty)</span><input id="createName" autocomplete="off"></label>
-      <label>This PC's name in the network <span>(optional)</span><input id="createHost" autocomplete="off"></label>
+      <label>This machine's name in the network <span>(optional)</span><input id="createHost" autocomplete="off"></label>
       <div class="dlg-actions">
         <button type="button" data-close>Cancel</button>
         <button class="primary" type="submit">Create</button>
@@ -522,7 +567,7 @@
     <form id="joinForm" method="dialog">
       <p class="dlg-note">Paste the invite code you received.</p>
       <label>Invite code<textarea id="joinKey" required autocomplete="off"></textarea></label>
-      <label>This PC's name in the network <span>(optional)</span><input id="joinHost" autocomplete="off"></label>
+      <label>This machine's name in the network <span>(optional)</span><input id="joinHost" autocomplete="off"></label>
       <div class="dlg-actions">
         <button type="button" data-close>Cancel</button>
         <button class="primary" type="submit">Join</button>
@@ -545,7 +590,7 @@
     <form id="connectForm" method="dialog">
       <p class="dlg-note">Paste their identity. They must approve the request before a private network is created.</p>
       <label>Identity or nearby peer ID<input id="connectId" required autocomplete="off"></label>
-      <label>This PC's name <span>(optional)</span><input id="connectHost" autocomplete="off"></label>
+      <label>This machine's name <span>(optional)</span><input id="connectHost" autocomplete="off"></label>
       <div class="dlg-actions">
         <button type="button" data-close>Cancel</button>
         <button class="primary" type="submit">Send request</button>
@@ -554,7 +599,7 @@
   </dialog>
 
   <dialog id="renameDlg">
-    <h3>Rename this PC</h3>
+    <h3>Rename this machine</h3>
     <form id="renameForm" method="dialog">
       <div id="renameDomain" class="dlg-note"></div>
       <label>Hostname<input id="renameHost" required autocomplete="off"></label>
@@ -564,15 +609,24 @@
       </div>
     </form>
   </dialog>
+
   <dialog id="firewallRuleDlg">
     <form id="firewallRuleForm">
-      <h3>Add firewall rule</h3>
-      <label>Direction<select id="ruleDirection"><option value="in">Inbound</option><option value="out">Outbound</option></select></label>
+      <h3 id="firewallRuleTitle">Add firewall rule</h3>
+      <p class="dlg-note" id="firewallRuleNote">Applies across every network unless scoped below.</p>
+      <div class="preset-row">
+        <button type="button" class="small" data-preset="web">Allow web (80, 443)</button>
+        <button type="button" class="small" data-preset="ssh">Allow SSH (22)</button>
+        <button type="button" class="small" data-preset="tcp">Allow all TCP</button>
+        <button type="button" class="small" data-preset="block">Block peer</button>
+      </div>
+      <label>Scope<select id="ruleNetwork"></select></label>
       <label>Action<select id="ruleAction"><option value="allow">Allow</option><option value="deny">Deny</option></select></label>
-      <label>Protocol<select id="ruleProtocol"><option>tcp</option><option>udp</option><option>icmp</option><option>any</option></select></label>
-      <label>Ports, optional<input id="rulePort" placeholder="22 or 80,443"></label>
-      <label>Peer, optional<input id="rulePeer" placeholder="Any peer"></label>
-      <label>Network, optional<input id="ruleNetwork" placeholder="Any network"></label>
+      <label>Direction<select id="ruleDirection"><option value="in">Inbound</option><option value="out">Outbound</option></select></label>
+      <label>Protocol<select id="ruleProtocol"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option><option value="any">Any</option></select></label>
+      <label id="rulePortWrap">Ports, optional<input id="rulePort" placeholder="All ports, or 22, 80,443, 8000-9000"></label>
+      <label>Peer, optional<input id="rulePeer" list="rulePeerList" placeholder="Any peer"></label>
+      <datalist id="rulePeerList"></datalist>
       <div class="dlg-actions"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Add rule</button></div>
     </form>
   </dialog>
@@ -605,8 +659,6 @@
       return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
     function copyText(text) {
-      // Clipboard API needs a secure context; this dashboard is plain http on
-      // the LAN, so fall back to a hidden textarea + execCommand.
       if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
       const ta = document.createElement("textarea");
       ta.value = text;
@@ -663,21 +715,21 @@
       });
       return http.json();
     }
-    // Quiet action: no console. Toasts the result, then refreshes state.
     async function act(args, okMsg) {
       try {
         const res = await call(args, false);
         if (res.success) toast(okMsg || "done");
         else toast((res.stderr || res.stdout || "command failed").trim().split("\n")[0], true);
-        refresh();
-        if (args[0] === "firewall") refreshFirewall();
+        await refresh();
+        if (args[0] === "firewall" || (args[0] === "config" && String(args[2] || "").startsWith("firewall."))) {
+          await refreshFirewall();
+        }
         return res;
       } catch (err) {
         toast(String(err), true);
         return null;
       }
     }
-    // Console run: opens the Advanced drawer and prints there.
     async function run(args, opts = {}) {
       openAdvanced();
       $("lastStatus").className = "badge";
@@ -700,25 +752,34 @@
       return res;
     }
 
-    // ---- live state ----
     let statusBusy = false;
     let lastData = null;
     let lastConfig = null;
+    let lastFirewall = null;
+    let firewallScope = ""; // "" = General, else network name
+    let fwReturnToNetworks = false;
+    const collapsedNets = new Set();
     let launchAtLoginAvailable = false;
     let launchAtLoginEnabled = false;
     let launchAtLoginPending = false;
+
     async function refresh() {
       if (statusBusy || document.hidden) return;
       statusBusy = true;
       try {
-        const [res, config] = await Promise.all([
+        const [res, config, fw] = await Promise.all([
           call(["status"], true),
           call(["config"], true),
+          call(["firewall", "show"], true),
         ]);
         lastConfig = config && config.success ? JSON.parse(config.stdout) : null;
+        if (fw && fw.success) {
+          lastFirewall = JSON.parse(fw.stdout);
+        }
         if (res && res.success) {
           lastData = JSON.parse(res.stdout);
           render(lastData);
+          renderFirewallView();
           await renderAttention(lastData);
           setLive(true, lastData.active);
         } else {
@@ -748,34 +809,92 @@
       if (type) return "relay";
       return "idle";
     }
+    function isWildcard(v) {
+      const s = String(v || "").trim().toLowerCase();
+      return !s || s === "*" || s === "any";
+    }
+    function resolvePeerLabel(peerSel, scopedNet) {
+      if (isWildcard(peerSel)) return "Any peer";
+      const nets = Array.isArray(lastData?.networks) ? lastData.networks : [];
+      const searchNets = scopedNet ? nets.filter(n => n.name === scopedNet) : nets;
+      for (const n of [...searchNets, ...nets]) {
+        for (const p of (n.peers || [])) {
+          const eid = String(p.endpoint_id || "");
+          if (p.hostname && (eid === peerSel || eid.startsWith(peerSel) || p.ipv6 === peerSel)) {
+            return `${p.hostname} (${peerSel.slice(0, 8)})`;
+          }
+        }
+      }
+      return `Peer ${peerSel}`;
+    }
+    function trafficSummary(rule) {
+      const proto = String(rule.protocol || "any").toLowerCase();
+      if (proto === "any") return "All protocols and ports";
+      if (proto === "icmp") return "ICMP (ping)";
+      const upper = proto.toUpperCase();
+      return isWildcard(rule.port) || rule.port === "0-65535" ? `${upper} · all ports` : `${upper} · port ${rule.port}`;
+    }
+
     function render(data) {
       const nets = Array.isArray(data.networks) ? data.networks : [];
-
-      // power button
       const power = $("powerBtn");
       power.textContent = data.active ? "Disconnect" : "Connect";
       power.className = "small" + (data.active ? " on" : " primary");
       $("connectPeerBtn").disabled = !data.active;
 
       const peerCount = nets.reduce((count, network) => count + (network.peers || []).length, 0);
+      const activePeers = nets.reduce((count, network) => count + (network.peers || []).filter(p => peerKind(p) !== "idle").length, 0);
       const myIp = nets.find(n => n.my_ipv6)?.my_ipv6 || "";
       $("statusLine").innerHTML =
-        (myIp ? `<span class="copyable" data-copy="${esc(myIp)}" title="Copy IP address">${esc(myIp)}</span>` : "") +
-        `<span>${nets.length} network${nets.length === 1 ? "" : "s"}</span>` +
-        `<span>${peerCount} peer${peerCount === 1 ? "" : "s"}</span>`;
+        (myIp ? `<span class="copyable" data-copy="${esc(myIp)}" title="Click to copy IPv6 address">${esc(myIp)}</span><span class="sep">·</span>` : "") +
+        `<span>${nets.length} network${nets.length === 1 ? "" : "s"}</span><span class="sep">·</span>` +
+        `<span>${activePeers > 0 ? `${activePeers} active of ${peerCount}` : peerCount} peer${peerCount === 1 ? "" : "s"}</span>`;
 
-      // networks
-      $("networks").innerHTML = nets.length ? nets.map(n => {
+      const hasPendingSuggestions = nets.some(n => (n.pending_suggestions || 0) > 0);
+      $("fwTabDot").hidden = !hasPendingSuggestions;
+
+      $("networkFilterWrap").hidden = nets.length < 2 && peerCount < 5;
+      const filterQuery = $("networkFilter").value.trim().toLowerCase();
+      $("collapseAllBtn").hidden = nets.length < 2 || !!filterQuery;
+      const allCollapsed = nets.length > 0 && nets.every(n => collapsedNets.has(n.name));
+      $("collapseAllBtn").textContent = allCollapsed ? "Expand all" : "Collapse all";
+
+      const rules = Array.isArray(lastFirewall?.rules) ? lastFirewall.rules : [];
+      const filteredNets = nets.map(n => {
+        if (!filterQuery) return { net: n, peers: n.peers || [] };
+        const netMatches = String(n.name).toLowerCase().includes(filterQuery) ||
+          `${n.my_hostname || ""}.${n.name}.ray`.toLowerCase().includes(filterQuery);
+        const matchingPeers = (n.peers || []).filter(p =>
+          String(p.hostname || "").toLowerCase().includes(filterQuery) ||
+          String(p.ipv6 || "").toLowerCase().includes(filterQuery) ||
+          `${p.hostname || ""}.${n.name}.ray`.toLowerCase().includes(filterQuery)
+        );
+        if (netMatches) return { net: n, peers: matchingPeers.length ? matchingPeers : (n.peers || []) };
+        if (matchingPeers.length) return { net: n, peers: matchingPeers };
+        return null;
+      }).filter(Boolean);
+
+      $("networks").innerHTML = !nets.length ? `<div class="card"><div class="empty">
+          <div class="big">No networks yet.</div>
+          <div>Create a private network or join one with an invite code.</div>
+        </div></div>` : (!filteredNets.length ? `<div class="card"><div class="empty">
+          <div class="big">No matching networks or peers.</div>
+          <div>Try a different network name, peer hostname, or IPv6 address.</div>
+        </div></div>` : filteredNets.map(({net: n, peers: visiblePeers}) => {
         const role = String(n.role || "member");
         const isCoord = role.toLowerCase() === "coordinator";
-        const peers = (n.peers || []).map(p => {
+        const collapsed = !filterQuery && collapsedNets.has(n.name);
+        const total = (n.peers || []).length;
+        const active = (n.peers || []).filter(p => peerKind(p) !== "idle").length;
+        const peerSummary = total ? (active ? `${active} active · ${total} peer${total === 1 ? "" : "s"}` : `${total} peer${total === 1 ? "" : "s"}`) : "No peers yet";
+        const netRuleCount = rules.filter(r => r.network === n.name).length;
+        const pendingFw = n.pending_suggestions || 0;
+        const peerHtml = visiblePeers.map(p => {
           const kind = peerKind(p);
           const conn = p.connection;
           const domain = p.hostname ? `${p.hostname}.${n.name}.ray` : "";
-          const connText = conn
-            ? kind
-            : "idle";
-          return `<div class="peer-row" ${domain ? `data-copy="${esc(domain)}" title="Copy ${esc(domain)}"` : ""}>
+          const connText = conn ? kind : "idle";
+          return `<div class="peer-row" ${domain ? `data-copy="${esc(domain)}" title="Click to copy ${esc(domain)}"` : ""}>
             <span class="dot ${kind}"></span>
             <span class="host">${esc(p.hostname || "?")}${p.is_own_device ? `<span class="tag">YOU</span>` : ""}</span>
             <span class="ip">${esc(p.ipv6 || "")}</span>
@@ -786,22 +905,27 @@
         }).join("");
         return `<div class="card net-card">
           <div class="net-head">
-            <div><div class="net-title"><strong>${esc(n.name)}</strong>
-              <span class="role ${isCoord ? "coordinator" : ""}">${esc(role.toUpperCase())}</span></div>
+            <div>
+              <div class="net-title">
+                <button type="button" class="net-toggle" data-toggle-net="${esc(n.name)}">
+                  <span class="chev">${collapsed ? "&gt;" : "v"}</span>
+                  <span>${esc(n.name)}</span>
+                </button>
+                <span class="role ${isCoord ? "coordinator" : ""}">${esc(role.toUpperCase())}</span>
+                <span class="net-meta">${esc(peerSummary)}</span>
+              </div>
               <div class="self"><span class="copyable" data-copy="${esc((n.my_hostname || "") + "." + n.name + ".ray")}" title="Copy domain">${esc(n.my_hostname || "?")}.${esc(n.name)}.ray</span></div>
             </div>
             <span class="net-actions">
+              <button class="small" data-open-fw="${esc(n.name)}">Firewall${netRuleCount ? ` · ${netRuleCount}` : ""}${pendingFw ? " *" : ""}</button>
               ${isCoord ? `<button class="small" data-invite="${esc(n.name)}">Invite</button>` : ""}
               <button class="small" data-rename="${esc(n.name)}" data-host="${esc(n.my_hostname || "")}">Rename</button>
               <button class="small danger" data-leave="${esc(n.name)}">Leave</button>
             </span>
           </div>
-          ${peers || `<div class="peer-row"><span class="conn">Waiting for peers...</span></div>`}
+          ${collapsed ? "" : (peerHtml || `<div class="peer-row"><span class="conn">Waiting for peers...</span></div>`)}
         </div>`;
-      }).join("") : `<div class="card"><div class="empty">
-          <div class="big">No networks yet.</div>
-          <div>Create a private network or join one with an invite code.</div>
-        </div></div>`;
+      }).join(""));
 
       renderDevices(data);
       renderSettings(data);
@@ -857,9 +981,18 @@
       }).join("") : `<div class="empty"><div class="big">No enrolled machines.</div><div>Use ray machines enroll to add a machine you control.</div></div>`;
 
       const peers = uniquePeers(data);
-      $("networkPeers").innerHTML = peers.length
-        ? `<div class="card">${peers.map(renderPeer).join("")}</div>`
-        : `<div class="card"><div class="empty"><div class="big">No devices to show.</div><div>Devices appear here once this PC joins a network.</div></div></div>`;
+      $("peerFilterWrap").hidden = peers.length < 5;
+      const query = $("peerFilter").value.trim().toLowerCase();
+      const shownPeers = query ? peers.filter(p =>
+        String(p.hostname || "").toLowerCase().includes(query) ||
+        String(p.ipv6 || "").toLowerCase().includes(query) ||
+        String(p.domain || "").toLowerCase().includes(query)
+      ) : peers;
+      $("networkPeers").innerHTML = !peers.length
+        ? `<div class="card"><div class="empty"><div class="big">No devices to show.</div><div>Devices appear here once this machine joins a network.</div></div></div>`
+        : (!shownPeers.length
+          ? `<div class="card"><div class="empty"><div class="big">No matching peers.</div><div>Clear the filter to see all devices.</div></div></div>`
+          : `<div class="card">${shownPeers.map(renderPeer).join("")}</div>`);
     }
 
     function settingToggle(enabled, args, label, disabled) {
@@ -870,14 +1003,12 @@
       $("launchAtLoginCard").hidden = !launchAtLoginAvailable;
       $("launchAtLoginToggle").innerHTML = `<button type="button" class="switch${launchAtLoginEnabled ? " on" : ""}" aria-label="Start at login" aria-pressed="${launchAtLoginEnabled}" ${launchAtLoginPending ? "disabled" : ""} data-startup="${launchAtLoginEnabled ? "off" : "on"}"></button>`;
     }
-
     function requestLaunchAtLogin() {
       if (!window.ipc || launchAtLoginPending) return;
       launchAtLoginPending = true;
       renderLaunchAtLogin();
       window.ipc.postMessage("startup:get");
     }
-
     function setLaunchAtLoginState(enabled, error) {
       launchAtLoginAvailable = true;
       launchAtLoginEnabled = !!enabled;
@@ -885,7 +1016,6 @@
       renderLaunchAtLogin();
       if (error) toast(error, true);
     }
-
     function configEnabled(key, fallback) {
       const value = lastConfig && lastConfig[key];
       return value == null ? !!fallback : value === true || String(value).toLowerCase() === "on";
@@ -895,7 +1025,7 @@
       const active = !!data.active;
       $("vpnState").textContent = active ? "connected" : "standby";
       $("vpnState").className = "badge" + (active ? " good" : "");
-      $("vpnDescription").textContent = "The Rayfish Windows service manages your connection.";
+      $("vpnDescription").textContent = "Rayfish manages this connection through its background service.";
 
       const dns = configEnabled("dns", false) || String(lastConfig?.dns).toLowerCase() === "partial";
       const mdns = configEnabled("mdns", data.mdns);
@@ -905,23 +1035,217 @@
       $("autoUpdateToggle").innerHTML = settingToggle(autoUpdate, ["auto-update", autoUpdate ? "off" : "on"], "Automatic updates", !lastData);
     }
 
+    let pendingByNet = {};
     async function refreshFirewall() {
       const res = await call(["firewall", "show"], true);
       if (!res || !res.success) {
-        $("firewallRules").innerHTML = `<div class="empty"><div class="big">Firewall unavailable.</div><div>${esc((res && (res.stderr || res.stdout) || "Could not read firewall state.").trim())}</div></div>`;
+        lastFirewall = null;
+        $("fwDetail").innerHTML = `<div class="card"><div class="empty"><div class="big">Firewall unavailable.</div><div>${esc((res && (res.stderr || res.stdout) || "Could not read firewall state.").trim())}</div></div></div>`;
         return;
       }
-      const state = JSON.parse(res.stdout);
-      $("firewallInbound").textContent = state.default_inbound;
-      $("firewallOutbound").textContent = state.default_outbound;
-      const rules = Array.isArray(state.rules) ? state.rules : [];
-      $("firewallRules").innerHTML = rules.length ? rules.map((rule, index) => `<div class="attn-row">
-        <span class="what"><b>${esc(rule.direction)} ${esc(rule.action)} ${esc(rule.protocol)} ${esc(rule.port)}</b><span class="sub">peer ${esc(rule.peer)} · network ${esc(rule.network)}</span></span>
-        <button class="small danger" data-firewall-remove="${index}">Remove</button>
-      </div>`).join("") : `<div class="empty"><div class="big">No firewall rules.</div><div>Use Add rule to allow or deny mesh traffic.</div></div>`;
+      lastFirewall = JSON.parse(res.stdout);
+      if (firewallScope && lastData) {
+        const net = (lastData.networks || []).find(n => n.name === firewallScope);
+        if (net && net.pending_suggestions > 0) {
+          const pRes = await call(["firewall", "pending", firewallScope], true);
+          if (pRes && pRes.success) {
+            pendingByNet[firewallScope] = JSON.parse(pRes.stdout).rules || [];
+          }
+        } else {
+          delete pendingByNet[firewallScope];
+        }
+      }
+      renderFirewallView();
     }
 
-    // Fetch details for pending items and render them as actionable rows.
+    function renderRuleRow(item, scopedNet) {
+      const r = item.rule;
+      const dir = r.direction === "out" ? "Outbound" : "Inbound";
+      const origin = r.suggested_by === "ssh" ? `<span class="badge">MESH SSH</span>` : (r.suggested_by ? `<span class="badge">SUGGESTED</span>` : "");
+      const inactiveNet = !scopedNet && !isWildcard(r.network) ? ` · <span style="color:var(--amber)">network ${esc(r.network)} (inactive)</span>` : "";
+      const actionCtrl = item.readonly ? "" : (r.suggested_by === "ssh"
+        ? `<span class="net-meta">Managed by SSH</span>`
+        : `<button class="small danger" data-firewall-remove="${item.index}">Remove</button>`);
+      return `<div class="rule-row">
+        <span class="rule-pill ${esc(r.action)}">${esc(r.action)}</span>
+        <div class="rule-main">
+          <div class="rule-top"><span>${esc(dir)}</span><span class="rule-proto">${esc(trafficSummary(r))}</span>${origin}</div>
+          <div class="rule-sub">${esc(resolvePeerLabel(r.peer, scopedNet))}${inactiveNet}</div>
+        </div>
+        ${actionCtrl}
+      </div>`;
+    }
+
+    function renderFirewallView() {
+      const nets = Array.isArray(lastData?.networks) ? lastData.networks : [];
+      const activeNames = new Set(nets.map(n => n.name));
+      if (firewallScope && !activeNames.has(firewallScope)) firewallScope = "";
+
+      $("fwBackBtn").hidden = !fwReturnToNetworks;
+      $("addFirewallRule").textContent = firewallScope ? `Add rule for ${firewallScope}` : "Add general rule";
+
+      const state = lastFirewall;
+      if (!state) {
+        $("fwStatusBadge").textContent = "loading";
+        $("fwStatusBadge").className = "badge";
+        return;
+      }
+      $("fwStatusBadge").textContent = state.disabled ? "paused" : "enforcing";
+      $("fwStatusBadge").className = "badge " + (state.disabled ? "warn" : "good");
+
+      const indexed = (state.rules || []).map((rule, index) => ({ index, rule }));
+      const generalRules = indexed.filter(it => isWildcard(it.rule.network) || !activeNames.has(it.rule.network));
+
+      $("fwScopeRail").innerHTML = `
+        <button type="button" class="scope-btn${!firewallScope ? " active" : ""}" data-fw-scope="">
+          <span class="scope-main">
+            <span class="scope-title">General</span>
+            <span class="scope-sub">Defaults &amp; other rules</span>
+          </span>
+          ${generalRules.length ? `<span class="scope-count">${generalRules.length}</span>` : ""}
+        </button>
+        <div class="setting-divider"></div>
+        <div class="fw-rail-label"><span>PER NETWORK</span><span>${nets.length}</span></div>
+        ${nets.length ? nets.map(n => {
+          const cnt = indexed.filter(it => it.rule.network === n.name).length;
+          const pend = n.pending_suggestions || 0;
+          return `<button type="button" class="scope-btn${firewallScope === n.name ? " active" : ""}" data-fw-scope="${esc(n.name)}">
+            <span class="scope-main">
+              <span class="scope-title">${esc(n.name)}</span>
+              <span class="scope-sub">${(n.peers || []).length} peer${(n.peers || []).length === 1 ? "" : "s"}</span>
+            </span>
+            ${pend ? `<span class="tab-dot" title="Suggested rules waiting"></span>` : ""}
+            ${cnt ? `<span class="scope-count">${cnt}</span>` : ""}
+          </button>`;
+        }).join("") : `<div class="dlg-note" style="padding:4px 8px">Join a network to configure per-network rules.</div>`}
+      `;
+
+      if (!firewallScope) {
+        const pausedBanner = state.disabled ? `<div class="fw-banner">
+          <div style="flex:1"><b style="color:var(--ink)">Mesh firewall is paused</b><div class="setting-description">All mesh packets are currently allowed regardless of rules or defaults.</div></div>
+          <button class="small primary" data-act='${esc(JSON.stringify(["firewall", "on"]))}' data-ok="firewall resumed">Resume firewall</button>
+        </div>` : "";
+        const scopedCount = indexed.length - generalRules.length;
+        $("fwDetail").innerHTML = `${pausedBanner}
+          <div class="card settings-card">
+            <div>
+              <div class="setting-title">Default posture</div>
+              <div class="setting-description">Rules filter Rayfish mesh traffic alongside your system firewall. Return traffic for connections you initiate is allowed automatically.</div>
+            </div>
+            <div class="setting-divider"></div>
+            <div class="setting-row">
+              <div><div class="setting-title">Enforce mesh firewall</div><div class="setting-description">Evaluate rules and defaults on every mesh packet.</div></div>
+              <span class="spacer"></span>
+              ${settingToggle(!state.disabled, ["firewall", state.disabled ? "on" : "off"], "Enforce mesh firewall", false)}
+            </div>
+            <div class="setting-divider"></div>
+            <div class="setting-row">
+              <div><div class="setting-title">Inbound default</div><div class="setting-description">Unsolicited incoming traffic when no rule matches.</div></div>
+              <span class="spacer"></span>
+              <span class="badge ${state.default_inbound === "deny" ? "good" : "warn"}">${esc(state.default_inbound)}</span>
+              <button class="small" id="toggleFirewallDefault">Set to ${state.default_inbound === "deny" ? "allow" : "deny"}</button>
+            </div>
+            <div class="setting-divider"></div>
+            <div class="setting-row">
+              <div><div class="setting-title">Outbound default</div><div class="setting-description">Outgoing connections started from this machine.</div></div>
+              <span class="spacer"></span>
+              <span class="badge">${esc(state.default_outbound)}</span>
+              <button class="small" id="toggleFirewallOutDefault">Set to ${state.default_outbound === "allow" ? "deny" : "allow"}</button>
+            </div>
+            <div class="setting-divider"></div>
+            <div class="setting-row">
+              <div><div class="setting-title">Reject blocked traffic immediately</div><div class="setting-description">Reply with TCP reset or ICMP unreachable instead of dropping silently.</div></div>
+              <span class="spacer"></span>
+              ${settingToggle(!!state.reject, ["firewall", "reject", state.reject ? "off" : "on"], "Reject blocked traffic", false)}
+            </div>
+          </div>
+          <div class="card">
+            <div class="net-head">
+              <div><strong style="color:var(--ink)">General rules</strong><div class="setting-description">Cross-network rules evaluated in order, first match wins.</div></div>
+              <span class="spacer"></span>
+              <button class="small" data-open-rule-dlg="">Add rule</button>
+            </div>
+            ${generalRules.length ? generalRules.map(it => renderRuleRow(it, "")).join("") : `<div class="empty"><div class="big">No general rules configured.</div><div>Traffic not matched by a network rule uses your default policies above.</div></div>`}
+          </div>
+          ${scopedCount > 0 ? `<div class="card summary-card"><span class="setting-description">${scopedCount} network-specific rule${scopedCount === 1 ? "" : "s"} configured. Select a network on the left to view or edit them.</span></div>` : ""}`;
+      } else {
+        const net = nets.find(n => n.name === firewallScope);
+        const scopedRules = indexed.filter(it => it.rule.network === firewallScope);
+        const pendRules = pendingByNet[firewallScope] || [];
+        const pendCount = Math.max(net?.pending_suggestions || 0, pendRules.length);
+        const pendingHtml = pendCount > 0 ? `<div class="card" style="border-color:rgba(251,191,36,.35)">
+          <div class="net-head">
+            <div><strong style="color:var(--ink)">Coordinator suggested ${pendCount} rule${pendCount === 1 ? "" : "s"}</strong><div class="setting-description">Review before accepting. Accepted rules apply to peers on ${esc(firewallScope)}.</div></div>
+            <span class="spacer"></span>
+            <button class="small danger" data-act='${esc(JSON.stringify(["firewall", "deny", firewallScope]))}' data-ok="dismissed suggestions">Dismiss</button>
+            <button class="small primary" data-act='${esc(JSON.stringify(["firewall", "accept", firewallScope]))}' data-ok="accepted suggestions">Accept all</button>
+          </div>
+          ${pendRules.map((rule, idx) => renderRuleRow({ index: idx, rule, readonly: true }, firewallScope)).join("")}
+        </div>` : "";
+        $("fwDetail").innerHTML = `
+          <div class="card summary-card">
+            <div>
+              <div class="net-title"><strong style="color:var(--ink);font-size:17px">${esc(firewallScope)}</strong>${net ? `<span class="role ${String(net.role).toLowerCase() === "coordinator" ? "coordinator" : ""}">${esc(String(net.role).toUpperCase())}</span>` : ""}</div>
+              <div class="net-meta">${net ? `${esc(net.my_hostname || "?")}.${esc(net.name)}.ray · ${(net.peers || []).length} peer${(net.peers || []).length === 1 ? "" : "s"}` : ""}</div>
+            </div>
+            <span class="spacer"></span>
+            <button class="small primary" data-open-rule-dlg="${esc(firewallScope)}">Add rule</button>
+          </div>
+          ${pendingHtml}
+          <div class="card">
+            <div class="net-head">
+              <div><strong style="color:var(--ink)">Rules on ${esc(firewallScope)}</strong><div class="setting-description">Only match peers sharing ${esc(firewallScope)}. Evaluated in order.</div></div>
+            </div>
+            ${scopedRules.length ? scopedRules.map(it => renderRuleRow(it, firewallScope)).join("") : `<div class="empty"><div class="big">No rules specific to ${esc(firewallScope)}.</div><div>Traffic with peers on ${esc(firewallScope)} follows your general rules and ${esc(state.default_inbound)} inbound default.</div></div>`}
+          </div>
+          <div class="card summary-card">
+            <div>
+              <div class="setting-title">General rules also apply</div>
+              <div class="net-meta">${generalRules.length} cross-network rule${generalRules.length === 1 ? "" : "s"} · inbound default ${esc(state.default_inbound)} · outbound default ${esc(state.default_outbound)}</div>
+            </div>
+            <span class="spacer"></span>
+            <button class="small" data-fw-scope="">View general rules</button>
+          </div>`;
+      }
+    }
+
+    function openFirewallFor(netName, fromNetworks) {
+      firewallScope = netName || "";
+      fwReturnToNetworks = !!fromNetworks;
+      showPage("firewall");
+    }
+
+    function openRuleDialog(netName) {
+      const nets = Array.isArray(lastData?.networks) ? lastData.networks : [];
+      $("ruleNetwork").innerHTML = `<option value="">All networks (general rule)</option>` +
+        nets.map(n => `<option value="${esc(n.name)}">${esc(n.name)}</option>`).join("");
+      $("ruleNetwork").value = netName || "";
+      $("ruleDirection").value = "in";
+      $("ruleAction").value = "allow";
+      $("ruleProtocol").value = "tcp";
+      $("rulePort").value = "";
+      $("rulePeer").value = "";
+      syncRuleDialogState();
+      $("firewallRuleDlg").showModal();
+    }
+
+    function syncRuleDialogState() {
+      const net = $("ruleNetwork").value;
+      $("firewallRuleTitle").textContent = net ? `Add rule for ${net}` : "Add firewall rule";
+      $("firewallRuleNote").textContent = net ? `Applies only to peers sharing ${net}.` : "Applies across every network on this machine.";
+      const proto = $("ruleProtocol").value;
+      $("rulePortWrap").hidden = proto === "icmp" || proto === "any";
+      const nets = Array.isArray(lastData?.networks) ? lastData.networks : [];
+      const peers = (net ? nets.filter(n => n.name === net) : nets).flatMap(n => (n.peers || []).filter(p => !p.is_own_device));
+      const seen = new Set();
+      $("rulePeerList").innerHTML = peers.filter(p => {
+        const k = p.hostname || p.ipv6;
+        if (!k || seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      }).map(p => `<option value="${esc(p.hostname || p.ipv6)}"></option>`).join("");
+    }
+
     async function renderAttention(data) {
       const nets = Array.isArray(data.networks) ? data.networks : [];
       const pd = data.pending || {};
@@ -936,19 +1260,17 @@
               rows.push(`<div class="attn-row">
                 <span class="what"><b>${esc(r.hostname || r.id)}</b> asks to join <b>${esc(n.name)}</b>
                   <span class="sub">waiting ${esc(String(r.waiting_secs))}s · id ${esc(r.id)}</span></span>
-                <button class="small primary" data-act='${esc(JSON.stringify(["requests", n.name, "accept", r.id]))}' data-ok="let ${esc(r.hostname || r.id)} in">Let in</button>
                 <button class="small danger" data-act='${esc(JSON.stringify(["requests", n.name, "deny", r.id]))}' data-ok="denied">Deny</button>
+                <button class="small primary" data-act='${esc(JSON.stringify(["requests", n.name, "accept", r.id]))}' data-ok="let ${esc(r.hostname || r.id)} in">Approve</button>
               </div>`);
             }
           }
         }
         if (n.pending_suggestions > 0) {
           rows.push(`<div class="attn-row">
-            <span class="what">Firewall rules suggested for <b>${esc(n.name)}</b>
+            <span class="what">Suggested firewall rules for <b>${esc(n.name)}</b>
               <span class="sub">review before accepting, they open ports to peers</span></span>
-            <button class="small" data-run="firewall pending ${esc(n.name)}">View</button>
-            <button class="small primary" data-act='${esc(JSON.stringify(["firewall", "accept", n.name]))}' data-ok="rules accepted">Accept</button>
-            <button class="small danger" data-act='${esc(JSON.stringify(["firewall", "deny", n.name]))}' data-ok="rules dismissed">Dismiss</button>
+            <button class="small primary" data-open-fw="${esc(n.name)}">Review in Firewall</button>
           </div>`);
         }
       }
@@ -984,7 +1306,6 @@
       $("connectionRequests").innerHTML = connectionRows.join("");
     }
 
-    // ---- invites ----
     async function mintInvite(net) {
       toast("minting invite...");
       const res = await call(["invite", net], false);
@@ -992,7 +1313,6 @@
         toast((res && (res.stderr || res.stdout) || "invite failed").trim().split("\n")[0], true);
         return;
       }
-      // The code is the long standalone base58 line of the output.
       const lines = res.stdout.split("\n").map(l => l.trim()).filter(Boolean);
       const code = lines.find(l => /^[1-9A-HJ-NP-Za-km-z]{40,}$/.test(l));
       $("inviteNetName").textContent = net;
@@ -1002,14 +1322,45 @@
       $("inviteDlg").showModal();
     }
     $("inviteCopy").onclick = () =>
-      copyText($("inviteCode").textContent).then(() => toast("invite code copied"));
+      copyText($("inviteCode").textContent).then(() => toast("Copied invite code"));
 
-    // ---- wiring ----
     document.addEventListener("click", ev => {
-      const t = ev.target.closest("[data-copy],[data-leave],[data-invite],[data-rename],[data-startup],[data-act],[data-run],[data-firewall-remove],[data-close]");
-      if (!t) return;
+      const t = ev.target.closest("[data-copy],[data-leave],[data-invite],[data-rename],[data-startup],[data-act],[data-run],[data-firewall-remove],[data-close],[data-open-fw],[data-fw-scope],[data-open-rule-dlg],[data-toggle-net],[data-preset]");
+      if (!t) {
+        if (ev.target.id === "toggleFirewallDefault" && lastFirewall) {
+          const next = lastFirewall.default_inbound === "deny" ? "allow" : "deny";
+          if (next !== "allow" || confirm("Allow inbound mesh traffic by default across networks when no rule matches?")) {
+            act(["firewall", "default", next], `inbound default set to ${next}`);
+          }
+        } else if (ev.target.id === "toggleFirewallOutDefault" && lastFirewall) {
+          const next = lastFirewall.default_outbound === "allow" ? "deny" : "allow";
+          if (next !== "deny" || confirm("Deny outbound mesh traffic by default when no rule matches?")) {
+            act(["config", "set", "firewall.default-out", next], `outbound default set to ${next}`);
+          }
+        }
+        return;
+      }
       if (t.dataset.copy != null) {
-        if (t.dataset.copy) copyText(t.dataset.copy).then(() => toast("copied"));
+        if (t.dataset.copy) copyText(t.dataset.copy).then(() => toast(`Copied ${t.dataset.copy}`));
+      } else if (t.dataset.toggleNet != null) {
+        const name = t.dataset.toggleNet;
+        if (collapsedNets.has(name)) collapsedNets.delete(name);
+        else collapsedNets.add(name);
+        if (lastData) render(lastData);
+      } else if (t.dataset.openFw != null) {
+        openFirewallFor(t.dataset.openFw, true);
+      } else if (t.dataset.fwScope != null) {
+        firewallScope = t.dataset.fwScope;
+        refreshFirewall();
+      } else if (t.dataset.openRuleDlg != null) {
+        openRuleDialog(t.dataset.openRuleDlg);
+      } else if (t.dataset.preset != null) {
+        const p = t.dataset.preset;
+        if (p === "web") { $("ruleDirection").value = "in"; $("ruleAction").value = "allow"; $("ruleProtocol").value = "tcp"; $("rulePort").value = "80,443"; }
+        if (p === "ssh") { $("ruleDirection").value = "in"; $("ruleAction").value = "allow"; $("ruleProtocol").value = "tcp"; $("rulePort").value = "22"; }
+        if (p === "tcp") { $("ruleDirection").value = "in"; $("ruleAction").value = "allow"; $("ruleProtocol").value = "tcp"; $("rulePort").value = ""; }
+        if (p === "block") { $("ruleDirection").value = "in"; $("ruleAction").value = "deny"; $("ruleProtocol").value = "any"; $("rulePort").value = ""; }
+        syncRuleDialogState();
       } else if (t.dataset.leave != null) {
         if (confirm(`Leave ${t.dataset.leave} on this machine?`))
           act(["leave", t.dataset.leave], `left ${t.dataset.leave}`);
@@ -1027,7 +1378,9 @@
       } else if (t.dataset.act != null) {
         act(JSON.parse(t.dataset.act), t.dataset.ok);
       } else if (t.dataset.firewallRemove != null) {
-        act(["firewall", "remove", t.dataset.firewallRemove], "rule removed");
+        if (confirm("Remove this firewall rule?")) {
+          act(["firewall", "remove", t.dataset.firewallRemove], "rule removed");
+        }
       } else if (t.dataset.run != null) {
         run(splitArgs(t.dataset.run));
       } else if (t.dataset.close != null) {
@@ -1046,8 +1399,27 @@
       if (page === "firewall") refreshFirewall();
     }
     document.querySelectorAll(".tab").forEach(tab => {
-      tab.onclick = () => showPage(tab.dataset.page);
+      tab.onclick = () => {
+        if (tab.dataset.page === "firewall") fwReturnToNetworks = false;
+        showPage(tab.dataset.page);
+      };
     });
+    $("fwBackBtn").onclick = () => {
+      fwReturnToNetworks = false;
+      showPage("networks");
+    };
+    $("collapseAllBtn").onclick = () => {
+      const nets = Array.isArray(lastData?.networks) ? lastData.networks : [];
+      const allCollapsed = nets.length > 0 && nets.every(n => collapsedNets.has(n.name));
+      if (allCollapsed) collapsedNets.clear();
+      else nets.forEach(n => collapsedNets.add(n.name));
+      if (lastData) render(lastData);
+    };
+    $("networkFilter").addEventListener("input", () => { if (lastData) render(lastData); });
+    $("peerFilter").addEventListener("input", () => { if (lastData) renderDevices(lastData); });
+    $("ruleNetwork").addEventListener("change", syncRuleDialogState);
+    $("ruleProtocol").addEventListener("change", syncRuleDialogState);
+
     $("advancedBtn").onclick = () => {
       const adv = $("advanced");
       adv.classList.toggle("open");
@@ -1059,44 +1431,41 @@
       $("advanced").classList.add("open");
       $("advancedBtn").textContent = "Close console";
     }
-    $("copyOutput").onclick = () => copyText(out.textContent).then(() => toast("output copied"));
+    $("copyOutput").onclick = () => copyText(out.textContent).then(() => toast("Copied output"));
 
     $("createBtn").onclick = () => $("createDlg").showModal();
     $("joinBtn").onclick = () => $("joinDlg").showModal();
     $("connectPeerBtn").onclick = () => $("connectDlg").showModal();
-    $("copyIdentity").onclick = () => copyText($("identityId").textContent).then(() => toast("identity copied"));
+    $("copyIdentity").onclick = () => copyText($("identityId").textContent).then(() => toast("Copied identity"));
     $("refreshMachines").onclick = () => refresh();
     $("refreshFirewall").onclick = () => refreshFirewall();
-    $("addFirewallRule").onclick = () => $("firewallRuleDlg").showModal();
-    $("toggleFirewallDefault").onclick = () => {
-      const next = $("firewallInbound").textContent === "deny" ? "allow" : "deny";
-      act(["firewall", "default", next], `inbound default set to ${next}`);
-    };
+    $("addFirewallRule").onclick = () => openRuleDialog(firewallScope);
+
     $("firewallRuleForm").addEventListener("submit", ev => {
       ev.preventDefault();
-      const args = ["firewall", "add", $("ruleDirection").value, $("ruleAction").value,
-        "--proto", $("ruleProtocol").value];
-      if ($("rulePort").value.trim()) args.push("--port", $("rulePort").value.trim());
+      const proto = $("ruleProtocol").value;
+      const args = ["firewall", "add", $("ruleDirection").value, $("ruleAction").value, "--proto", proto];
+      if ((proto === "tcp" || proto === "udp") && $("rulePort").value.trim()) args.push("--port", $("rulePort").value.trim());
       if ($("rulePeer").value.trim()) args.push("--peer", $("rulePeer").value.trim());
       if ($("ruleNetwork").value.trim()) args.push("--network", $("ruleNetwork").value.trim());
-      act(args, "rule added");
+      act(args, "Firewall rule added");
       $("firewallRuleDlg").close();
     });
     $("createForm").addEventListener("submit", () => {
       const args = ["create"];
       if ($("createName").value.trim()) args.push("--name", $("createName").value.trim());
       if ($("createHost").value.trim()) args.push("--hostname", $("createHost").value.trim());
-      act(args, "network created");
+      act(args, "Network created");
     });
     $("joinForm").addEventListener("submit", () => {
       const args = ["join", $("joinKey").value.trim()];
       if ($("joinHost").value.trim()) args.push("--hostname", $("joinHost").value.trim());
-      act(args, "network joined");
+      act(args, "Network joined");
     });
     $("connectForm").addEventListener("submit", () => {
       const args = ["connect", $("connectId").value.trim()];
       if ($("connectHost").value.trim()) args.push("--hostname", $("connectHost").value.trim());
-      act(args, "request sent");
+      act(args, "Request sent");
     });
 
     let renameNetwork = "";
@@ -1106,7 +1475,7 @@
     $("renameHost").addEventListener("input", updateRenameDomain);
     $("renameForm").addEventListener("submit", () => {
       const hostname = $("renameHost").value.trim();
-      if (renameNetwork && hostname) act(["hostname", renameNetwork, hostname], "hostname updated");
+      if (renameNetwork && hostname) act(["hostname", renameNetwork, hostname], "Hostname updated");
     });
 
     $("cmdlist").innerHTML = templates.map(t => `<option>${esc(t)}</option>`).join("");

@@ -143,6 +143,13 @@ enum Dialog {
     Output,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FirewallScope {
+    General,
+    All,
+    Network(String),
+}
+
 pub(crate) struct Dashboard {
     pub snapshot: Option<Box<Snapshot>>,
     pub busy: bool,
@@ -153,6 +160,7 @@ pub(crate) struct Dashboard {
     pub output: String,
     output_kind: OutputKind,
     pub page: Page,
+    pub firewall_scope: FirewallScope,
     pub submitted_form: bool,
     joining: Option<String>,
     dialog: Option<Dialog>,
@@ -265,6 +273,7 @@ impl Dashboard {
             output: String::new(),
             output_kind: OutputKind::Command,
             page: Page::Networks,
+            firewall_scope: FirewallScope::General,
             submitted_form: false,
             joining: None,
             dialog: None,
@@ -775,6 +784,12 @@ impl Dashboard {
                                         },
                                     });
                                 }
+                                if button(ui, "Firewall rules", Kind::Secondary, !unavailable) {
+                                    self.firewall_scope =
+                                        FirewallScope::Network(network.name.clone());
+                                    self.page = Page::Firewall;
+                                    self.notice = None;
+                                }
                             });
                         });
                         if let Some(inactive) = restoring {
@@ -1045,11 +1060,77 @@ impl Dashboard {
 
     fn firewall(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let enabled = self.firewall_ready();
-        ui.horizontal(|ui| {
+        let active_networks: Vec<String> = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .status
+                    .visible_networks()
+                    .map(|network| network.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let FirewallScope::Network(selected) = &self.firewall_scope
+            && !active_networks.iter().any(|name| name == selected)
+        {
+            self.firewall_scope = FirewallScope::General;
+        }
+        ui.horizontal_wrapped(|ui| {
             ui.label(heading("Firewall", 17.0));
+            ui.add_space(6.0);
+            let is_general = self.firewall_scope == FirewallScope::General;
+            if button(
+                ui,
+                "General",
+                if is_general {
+                    Kind::Primary
+                } else {
+                    Kind::Secondary
+                },
+                true,
+            ) {
+                self.firewall_scope = FirewallScope::General;
+            }
+            let is_all = self.firewall_scope == FirewallScope::All;
+            if button(
+                ui,
+                "All rules",
+                if is_all {
+                    Kind::Primary
+                } else {
+                    Kind::Secondary
+                },
+                true,
+            ) {
+                self.firewall_scope = FirewallScope::All;
+            }
+            for net_name in &active_networks {
+                let selected =
+                    matches!(&self.firewall_scope, FirewallScope::Network(current) if current == net_name);
+                if button(
+                    ui,
+                    net_name,
+                    if selected {
+                        Kind::Primary
+                    } else {
+                        Kind::Secondary
+                    },
+                    true,
+                ) {
+                    self.firewall_scope = FirewallScope::Network(net_name.clone());
+                }
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if button(ui, "Add rule", Kind::Primary, enabled) {
-                    self.dialog = Some(form(FormKind::Firewall, None, ""));
+                    let mut created = form(FormKind::Firewall, None, "");
+                    if let (FirewallScope::Network(net), Dialog::Form { values, .. }) =
+                        (&self.firewall_scope, &mut created)
+                        && values.len() > 5
+                    {
+                        values[5] = net.clone();
+                    }
+                    self.dialog = Some(created);
                     self.error = None;
                 }
             });
@@ -1062,7 +1143,13 @@ impl Dashboard {
         let pending = snapshot
             .pending
             .iter()
-            .filter(|item| matches!(item.kind, PendingKind::Firewall { .. }))
+            .filter(|item| match (&self.firewall_scope, &item.kind) {
+                (FirewallScope::Network(selected), PendingKind::Firewall { network }) => {
+                    network == selected
+                }
+                (_, PendingKind::Firewall { .. }) => true,
+                _ => false,
+            })
             .collect::<Vec<_>>();
         let mut dialog = None;
         pending_section(
@@ -1094,38 +1181,90 @@ impl Dashboard {
                 return;
             }
         };
-        card().show(ui, |ui| {
-            ui.label(heading("Default policies", 15.0));
-            for (title, current, key) in [
-                ("Inbound", firewall.default_inbound, FirewallKey::DefaultIn),
-                ("Outbound", firewall.default_outbound, FirewallKey::DefaultOut),
-            ] {
+        if let FirewallScope::Network(net_name) = &self.firewall_scope {
+            let net_name = net_name.clone();
+            card().show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(title);
-                    ui.label(mono(current.to_string().to_uppercase(), 11.0).color(if current == FirewallAction::Deny { ROSE } else { GREEN }));
+                    ui.vertical(|ui| {
+                        ui.label(heading(format!("Rules for {net_name}"), 15.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "General cross-network rules and defaults (inbound {}, outbound {}) also apply.",
+                                firewall.default_inbound, firewall.default_outbound
+                            ))
+                            .color(MUTED),
+                        );
+                    });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if button(ui, &format!("Change {}", title.to_lowercase()), Kind::Secondary, enabled) {
-                            let next = if current == FirewallAction::Deny { FirewallAction::Allow } else { FirewallAction::Deny };
-                            self.dialog = Some(Dialog::Confirm {
-                                title: format!("Change {} default?", title.to_lowercase()),
-                                message: format!("Set the default {} mesh policy to {next}. This applies when no rule matches.", title.to_lowercase()),
-                                request: Some(Box::new(IpcMessage::ConfigSet {
-                                    key: NodeKey::Firewall(key), value: next.to_string(), replace: false,
-                                })),
-                            });
+                        if button(ui, "View general rules", Kind::Secondary, true) {
+                            self.firewall_scope = FirewallScope::General;
                         }
                     });
                 });
-            }
-        });
+            });
+        } else {
+            card().show(ui, |ui| {
+                ui.label(heading("Default policies", 15.0));
+                for (title, current, key) in [
+                    ("Inbound", firewall.default_inbound, FirewallKey::DefaultIn),
+                    ("Outbound", firewall.default_outbound, FirewallKey::DefaultOut),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(title);
+                        ui.label(mono(current.to_string().to_uppercase(), 11.0).color(if current == FirewallAction::Deny { ROSE } else { GREEN }));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if button(ui, &format!("Change {}", title.to_lowercase()), Kind::Secondary, enabled) {
+                                let next = if current == FirewallAction::Deny { FirewallAction::Allow } else { FirewallAction::Deny };
+                                self.dialog = Some(Dialog::Confirm {
+                                    title: format!("Change {} default?", title.to_lowercase()),
+                                    message: format!("Set the default {} mesh policy to {next}. This applies when no rule matches.", title.to_lowercase()),
+                                    request: Some(Box::new(IpcMessage::ConfigSet {
+                                        key: NodeKey::Firewall(key), value: next.to_string(), replace: false,
+                                    })),
+                                });
+                            }
+                        });
+                    });
+                }
+            });
+        }
         ui.add_space(10.0);
-        ui.label(heading("Rules", 15.0));
-        if firewall.rules.is_empty() {
-            empty(
-                ui,
-                "No firewall rules.",
-                "Traffic follows the default policies above.",
-            );
+        let active_set: HashSet<&str> = active_networks.iter().map(String::as_str).collect();
+        let scoped_rules: Vec<(usize, &FirewallRuleView)> = firewall
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| match &self.firewall_scope {
+                FirewallScope::All => true,
+                FirewallScope::Network(net) => item.network == *net,
+                FirewallScope::General => {
+                    scope_label(&item.network) == "Any"
+                        || !active_set.contains(item.network.as_str())
+                }
+            })
+            .collect();
+        let rules_heading = match &self.firewall_scope {
+            FirewallScope::General => "General rules",
+            FirewallScope::All => "All rules",
+            FirewallScope::Network(_) => "Network rules",
+        };
+        ui.label(heading(rules_heading, 15.0));
+        if scoped_rules.is_empty() {
+            let (empty_title, empty_detail) = match &self.firewall_scope {
+                FirewallScope::Network(net) => (
+                    "No rules for this network.",
+                    format!("Traffic on {net} follows your general rules and default policies."),
+                ),
+                FirewallScope::General => (
+                    "No general firewall rules.",
+                    "Cross-network traffic follows the default policies above.".to_owned(),
+                ),
+                FirewallScope::All => (
+                    "No firewall rules.",
+                    "Traffic follows the default policies above.".to_owned(),
+                ),
+            };
+            empty(ui, empty_title, &empty_detail);
             return;
         }
         card().inner_margin(12).show(ui, |ui| {
@@ -1149,7 +1288,7 @@ impl Dashboard {
                                 ui.label(mono(title, 10.0).color(FAINT));
                             }
                             ui.end_row();
-                            for (index, item) in firewall.rules.iter().enumerate() {
+                            for (index, item) in scoped_rules {
                                 ui.label(mono(item.direction.to_string().to_uppercase(), 11.0));
                                 ui.label(mono(item.action.to_string().to_uppercase(), 11.0).color(
                                     if item.action == FirewallAction::Deny {
@@ -2101,6 +2240,34 @@ mod tests {
         assert!(click(&mut app, &ctx, "Add rule").iter().any(|action| matches!(action,
             Action::Run(IpcMessage::FirewallAdd { port: Some(port), peer: None, network: None, .. }) if port == "443"
         )));
+    }
+
+    #[test]
+    fn network_card_opens_scoped_firewall_and_switches_to_general_rules() {
+        let ctx = Context::default();
+        let mut app = Dashboard::new(&ctx).unwrap();
+        app.snapshot = Some(Box::new(crate::preview::fixture(true)));
+        assert!(click(&mut app, &ctx, "Firewall rules").is_empty());
+        assert_eq!(app.page, Page::Firewall);
+        assert_eq!(app.firewall_scope, FirewallScope::Network("example".into()));
+        let labels = render(&mut app, &ctx);
+        assert!(labels.iter().any(|(text, _)| text == "Rules for example"));
+        assert!(click(&mut app, &ctx, "Remove").is_empty());
+        assert!(
+            click(&mut app, &ctx, "Confirm")
+                .iter()
+                .any(|action| matches!(
+                    action,
+                    Action::Run(IpcMessage::FirewallRemove { index: 0 })
+                ))
+        );
+        assert!(click(&mut app, &ctx, "Add rule").is_empty());
+        assert!(click(&mut app, &ctx, "Add rule").iter().any(|action| matches!(action,
+            Action::Run(IpcMessage::FirewallAdd { network: Some(net), .. }) if net == "example"
+        )));
+        app.dialog = None;
+        assert!(click(&mut app, &ctx, "View general rules").is_empty());
+        assert_eq!(app.firewall_scope, FirewallScope::General);
     }
 
     #[test]

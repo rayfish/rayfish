@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use iroh::EndpointId;
 use rayfish::config;
-use rayfish::config::settings::GlobalKey;
+use rayfish::config::settings::{GlobalKey, NetworkKey};
 use rayfish::config::{DnsMode, QuicEngine};
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
@@ -250,6 +250,8 @@ pub struct Network {
     pub ipv6: String,
     pub role: String,
     pub peers: Vec<Peer>,
+    pub pending_suggestions: u32,
+    pub auto_accept_firewall: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -285,14 +287,24 @@ pub struct FirewallRule {
     pub port: String,
     pub peer: String,
     pub network: String,
+    pub suggested_by: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NetworkFirewall {
+    pub network: String,
+    pub auto_accept: bool,
+    pub pending_rules: Vec<FirewallRule>,
 }
 
 #[derive(uniffi::Record)]
 pub struct FirewallState {
     pub default_inbound: String,
     pub default_outbound: String,
+    pub reject: bool,
     pub disabled: bool,
     pub rules: Vec<FirewallRule>,
+    pub networks: Vec<NetworkFirewall>,
 }
 
 /// One Rayfish node hosted by a packet tunnel provider.
@@ -519,32 +531,43 @@ impl Node {
             .map(|(_, warning)| warning);
         let networks = networks
             .into_iter()
-            .map(|network| Network {
-                name: network.name,
-                hostname: network.my_hostname.unwrap_or_default(),
-                ipv6: network.my_ipv6.to_string(),
-                role: network.role.to_string(),
-                peers: network
-                    .peers
-                    .into_iter()
-                    .map(|peer| Peer {
-                        identity: peer.endpoint_id.to_string(),
-                        hostname: peer
-                            .hostname
-                            .unwrap_or_else(|| peer.endpoint_id.to_string()),
-                        ipv6: peer.ipv6.to_string(),
-                        state: peer
-                            .connection
-                            .as_ref()
-                            .map(|connection| connection.conn_type.to_string())
-                            .unwrap_or_else(|| peer.state.to_string()),
-                        latency_ms: peer
-                            .connection
-                            .and_then(|connection| connection.rtt_ms)
-                            .map(|latency| latency.round() as u32),
-                        is_own_device: peer.is_own_device,
-                    })
-                    .collect(),
+            .map(|network| {
+                let auto_accept_firewall = settings
+                    .networks
+                    .iter()
+                    .find(|saved| saved.name == network.name)
+                    .is_some_and(|saved| saved.auto_accept_firewall);
+                let pending_suggestions =
+                    u32::try_from(network.pending_suggestions).unwrap_or(u32::MAX);
+                Network {
+                    name: network.name,
+                    hostname: network.my_hostname.unwrap_or_default(),
+                    ipv6: network.my_ipv6.to_string(),
+                    role: network.role.to_string(),
+                    peers: network
+                        .peers
+                        .into_iter()
+                        .map(|peer| Peer {
+                            identity: peer.endpoint_id.to_string(),
+                            hostname: peer
+                                .hostname
+                                .unwrap_or_else(|| peer.endpoint_id.to_string()),
+                            ipv6: peer.ipv6.to_string(),
+                            state: peer
+                                .connection
+                                .as_ref()
+                                .map(|connection| connection.conn_type.to_string())
+                                .unwrap_or_else(|| peer.state.to_string()),
+                            latency_ms: peer
+                                .connection
+                                .and_then(|connection| connection.rtt_ms)
+                                .map(|latency| latency.round() as u32),
+                            is_own_device: peer.is_own_device,
+                        })
+                        .collect(),
+                    pending_suggestions,
+                    auto_accept_firewall,
+                }
             })
             .collect();
         let mesh = NodeMeshStatus {
@@ -708,28 +731,44 @@ impl Node {
     }
 
     pub fn firewall_show(&self) -> Result<FirewallState, AppleError> {
+        let state = self.state()?;
         let FirewallView {
             default_inbound,
             default_outbound,
+            reject,
             disabled,
             rules,
-            ..
-        } = self.state()?.firewall_show();
+        } = state.firewall_show();
+        let settings = config::load().map_err(AppleError::network)?;
+        let active_networks = state.status().networks;
+        let networks = active_networks
+            .into_iter()
+            .map(|network| {
+                let auto_accept = settings
+                    .networks
+                    .iter()
+                    .find(|saved| saved.name == network.name)
+                    .is_some_and(|saved| saved.auto_accept_firewall);
+                let pending_rules = state
+                    .firewall_pending_rules(&network.name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(firewall_rule)
+                    .collect();
+                NetworkFirewall {
+                    network: network.name,
+                    auto_accept,
+                    pending_rules,
+                }
+            })
+            .collect();
         Ok(FirewallState {
             default_inbound: default_inbound.to_string(),
             default_outbound: default_outbound.to_string(),
+            reject,
             disabled,
-            rules: rules
-                .into_iter()
-                .map(|rule| FirewallRule {
-                    direction: rule.direction.to_string(),
-                    action: rule.action.to_string(),
-                    protocol: rule.protocol.to_string(),
-                    port: rule.port,
-                    peer: rule.peer,
-                    network: rule.network,
-                })
-                .collect(),
+            rules: rules.into_iter().map(firewall_rule).collect(),
+            networks,
         })
     }
 
@@ -765,6 +804,47 @@ impl Node {
     pub fn firewall_set_default_inbound(&self, action: String) -> Result<(), AppleError> {
         let action: Action = action.parse().map_err(AppleError::network)?;
         self.state()?.firewall_default(action)?;
+        Ok(())
+    }
+
+    pub fn firewall_set_default_outbound(&self, action: String) -> Result<(), AppleError> {
+        let action: Action = action.parse().map_err(AppleError::network)?;
+        self.state()?.firewall_default_outbound(action)?;
+        Ok(())
+    }
+
+    pub fn firewall_set_enabled(&self, enabled: bool) -> Result<(), AppleError> {
+        self.state()?.firewall_set_enabled(enabled)?;
+        Ok(())
+    }
+
+    pub fn firewall_set_reject(&self, reject: bool) -> Result<(), AppleError> {
+        self.state()?.firewall_set_reject(reject)?;
+        Ok(())
+    }
+
+    pub fn firewall_accept_suggestions(&self, network: String) -> Result<(), AppleError> {
+        self.state()?.firewall_accept_suggestions(&network)?;
+        Ok(())
+    }
+
+    pub fn firewall_deny_suggestions(&self, network: String) -> Result<(), AppleError> {
+        self.state()?.firewall_deny_suggestions(&network)?;
+        Ok(())
+    }
+
+    pub fn set_network_firewall_auto_accept(
+        &self,
+        network: String,
+        enabled: bool,
+    ) -> Result<(), AppleError> {
+        let state = self.state()?;
+        let value = if enabled { "on" } else { "off" };
+        self.runtime.block_on(state.net_config_set(
+            &network,
+            NetworkKey::AutoAcceptFirewall,
+            value,
+        ))?;
         Ok(())
     }
 
@@ -1032,6 +1112,18 @@ impl Node {
             #[cfg(not(target_os = "macos"))]
             shutdown.await;
         });
+    }
+}
+
+fn firewall_rule(rule: ipc::FirewallRuleView) -> FirewallRule {
+    FirewallRule {
+        direction: rule.direction.to_string(),
+        action: rule.action.to_string(),
+        protocol: rule.protocol.to_string(),
+        port: rule.port,
+        peer: rule.peer,
+        network: rule.network,
+        suggested_by: rule.suggested_by,
     }
 }
 
@@ -1330,6 +1422,20 @@ mod tests {
                 assert_eq!(disabled.mesh.active, before.mesh.active);
                 node.set_setting(GlobalSetting::QuicFqCodel, true).unwrap();
                 assert!(node.status().unwrap().services.quic_fq_codel);
+                node.firewall_set_enabled(false).unwrap();
+                node.firewall_set_reject(true).unwrap();
+                node.firewall_set_default_outbound("deny".into()).unwrap();
+                let fw = node.firewall_show().unwrap();
+                assert!(fw.disabled);
+                assert!(fw.reject);
+                assert_eq!(fw.default_outbound, "deny");
+                node.firewall_set_enabled(true).unwrap();
+                node.firewall_set_reject(false).unwrap();
+                node.firewall_set_default_outbound("allow".into()).unwrap();
+                let fw = node.firewall_show().unwrap();
+                assert!(!fw.disabled);
+                assert!(!fw.reject);
+                assert_eq!(fw.default_outbound, "allow");
                 assert!(Arc::ptr_eq(&state, &node.state().unwrap()));
                 assert!(matches!(
                     node.connect_peer("invalid identity".into(), None),

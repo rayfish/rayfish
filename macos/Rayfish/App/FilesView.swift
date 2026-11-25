@@ -13,24 +13,87 @@ struct FilesView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
             Text("Files").font(RayfishTheme.heading()).foregroundColor(RayfishTheme.ink)
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Auto-accept from trusted peers").font(RayfishTheme.heading(15))
-                Text("Files from these exact devices save to your Downloads folder without asking while Rayfish is open.")
+
+            let files = controller.status?.files ?? []
+            if files.isEmpty {
+                EmptyState(
+                    title: "No file transfers yet.",
+                    description: "Incoming files offered by peers appear here so you can save or decline them."
+                )
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(files.enumerated()), id: \.element.id) { index, file in
+                        if index > 0 { Rectangle().fill(RayfishTheme.line).frame(height: 1) }
+                        let isReceiving = file.state == .transferring
+                            || (file.state == .pending && controller.receivingFileIDs.contains(file.transferId))
+                        HStack(spacing: 14) {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(file.filename).font(RayfishTheme.heading(14)).foregroundColor(RayfishTheme.ink)
+                                Text("From \(file.peer) · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: file.size), countStyle: .file))")
+                                    .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                                if isReceiving {
+                                    let received = ByteCountFormatter.string(fromByteCount: Int64(clamping: file.transferred), countStyle: .file)
+                                    let percent = file.size == 0 ? 0 : Int(Double(min(file.transferred, file.size)) / Double(file.size) * 100)
+                                    ProgressView(value: Double(file.transferred), total: Double(max(file.size, 1)))
+                                        .progressViewStyle(.linear)
+                                        .tint(RayfishTheme.accent)
+                                        .frame(width: 200)
+                                    Text("\(received) received (\(percent)%)")
+                                        .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                                }
+                            }
+                            Spacer()
+                            if file.state == .pending && !isReceiving {
+                                Button("Decline", role: .destructive) { Task { await controller.rejectFile(file) } }
+                                    .buttonStyle(RayfishButtonStyle(kind: .danger, size: .compact))
+                                Button("Save to folder...") { chooseFolder(for: file) }
+                                    .buttonStyle(RayfishButtonStyle(kind: .primary, size: .compact))
+                            } else if file.state == .received {
+                                RayfishBadge(text: "RECEIVED", tone: .success)
+                                if let destination = file.destination {
+                                    Button("Show in Finder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: destination)])
+                                    }
+                                    .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
+                                }
+                            }
+                        }
+                        .padding(16)
+                    }
+                }
+                .rayfishCard()
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Auto-accept from trusted peers").font(RayfishTheme.heading(15)).foregroundColor(RayfishTheme.ink)
+                Text("Files from these exact devices save to your Downloads folder automatically while Rayfish is open.")
+                    .font(RayfishTheme.text(13))
                     .foregroundColor(RayfishTheme.muted)
-                ForEach(controller.status?.fileAutoAcceptPeers ?? [], id: \.self) { peer in
+                let trusted = controller.status?.fileAutoAcceptPeers ?? []
+                if trusted.isEmpty {
+                    Text("No auto-accept peers configured.")
+                        .font(RayfishTheme.text(13))
+                        .foregroundColor(RayfishTheme.faint)
+                }
+                ForEach(trusted, id: \.self) { peer in
                     HStack {
                         Text(peerLabel(peer)).font(RayfishTheme.mono(11)).textSelection(.enabled)
                         Spacer()
-                        Button("Remove") { Task { _ = await controller.setFileAutoAccept(peer: peer, allow: false) } }
+                        Button("Remove", role: .destructive) {
+                            Task { _ = await controller.setFileAutoAccept(peer: peer, allow: false) }
+                        }
+                        .buttonStyle(RayfishButtonStyle(kind: .danger, size: .compact))
                     }
                 }
-                HStack {
+                HStack(spacing: 8) {
                     TextField("Peer name or identity", text: $trustedPeer)
+                        .textFieldStyle(RayfishFieldStyle())
+                        .font(RayfishTheme.mono(12))
                     Menu("Choose peer") {
                         ForEach(controller.status?.networks ?? []) { network in
-                            ForEach(network.peers) { peer in
+                            ForEach(network.peers.filter { !$0.isOwnDevice }) { peer in
                                 Button("\(peer.hostname) (\(network.name))") { trustedPeer = peer.identity ?? peer.ipv6 }
                             }
                         }
@@ -41,57 +104,24 @@ struct FilesView: View {
                                 trustedPeer = ""
                             }
                         }
-                    }.disabled(trustedPeer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-                if let error = controller.error { Text(error).foregroundColor(RayfishTheme.amber) }
-            }.padding(14).rayfishCard().disabled(controller.status?.fileAutoAcceptPeers == nil)
-            let files = controller.status?.files ?? []
-            if files.isEmpty {
-                Text("Incoming files appear here.").foregroundColor(RayfishTheme.muted)
-            }
-            ForEach(files) { file in
-                let isReceiving = file.state == .transferring
-                    || (file.state == .pending && controller.receivingFileIDs.contains(file.transferId))
-                HStack(spacing: 14) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(file.filename).foregroundColor(RayfishTheme.ink)
-                        Text("From \(file.peer) · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: file.size), countStyle: .file))")
-                            .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
-                        if isReceiving {
-                            let received = ByteCountFormatter.string(fromByteCount: Int64(clamping: file.transferred), countStyle: .file)
-                            let percent = file.size == 0 ? 0 : Int(Double(min(file.transferred, file.size)) / Double(file.size) * 100)
-                            ProgressView(value: Double(file.transferred), total: Double(max(file.size, 1)))
-                                .progressViewStyle(.linear)
-                                .tint(RayfishTheme.accent)
-                                .frame(width: 180)
-                            Text("\(received) received (\(percent)%)")
-                                .font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
-                        }
                     }
-                    Spacer()
-                    if file.state == .pending && !isReceiving {
-                        Button("Decline") { Task { await controller.rejectFile(file) } }
-                        Button("Save to folder...") { chooseFolder(for: file) }
-                            .buttonStyle(RayfishButtonStyle(kind: .primary))
-                    } else if file.state == .received {
-                        Text("Received").foregroundColor(RayfishTheme.green)
-                        if let destination = file.destination {
-                            Button("Show in Finder") {
-                                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: destination)])
-                            }
-                        }
-                    }
-                }.padding(14).rayfishCard()
-            }
-        }.disabled(controller.isLoading)
-            .alert("Replace existing file?", isPresented: $showReplaceConfirmation, presenting: replacement) { destination in
-                Button("Replace", role: .destructive) {
-                    Task { await controller.acceptFile(destination.file, directory: destination.directory, replace: true) }
+                    .buttonStyle(RayfishButtonStyle(kind: .primary))
+                    .disabled(trustedPeer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                Button("Cancel", role: .cancel) {}
-            } message: { destination in
-                Text("\(destination.file.filename) already exists in \(destination.directory.lastPathComponent). Replacing it will overwrite the existing file.")
             }
+            .padding(18)
+            .rayfishCard()
+            .disabled(controller.status?.fileAutoAcceptPeers == nil)
+        }
+        .disabled(controller.isLoading)
+        .alert("Replace existing file?", isPresented: $showReplaceConfirmation, presenting: replacement) { destination in
+            Button("Replace", role: .destructive) {
+                Task { await controller.acceptFile(destination.file, directory: destination.directory, replace: true) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { destination in
+            Text("\(destination.file.filename) already exists in \(destination.directory.lastPathComponent). Replacing it will overwrite the existing file.")
+        }
     }
 
     private func peerLabel(_ identity: String) -> String {

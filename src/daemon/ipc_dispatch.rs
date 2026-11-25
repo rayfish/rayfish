@@ -223,6 +223,17 @@ impl Daemon {
             .await
     }
 
+    /// Per-network `ray config` setter for an embedder, running the same live
+    /// re-materialization as `NetConfigSet`.
+    pub async fn net_config_set(
+        self: &Arc<Self>,
+        network: &str,
+        key: NetworkKey,
+        value: &str,
+    ) -> OpResult<Done> {
+        self.net_config_apply(network, key, value).await
+    }
+
     /// `ray block <peer>` and friends for an embedder: add or remove exactly
     /// one peer in a peer-list key. Blocking drops what the peer has queued.
     pub async fn edit_peer_list(

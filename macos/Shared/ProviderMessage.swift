@@ -30,6 +30,12 @@ struct ProviderRequest: Codable {
         case firewallAdd
         case firewallRemove
         case firewallSetDefault
+        case firewallSetOutboundDefault
+        case firewallSetEnabled
+        case firewallSetReject
+        case firewallAcceptSuggestions
+        case firewallDenySuggestions
+        case setNetworkFirewallAutoAccept
         case selectExitNode
     }
 
@@ -76,8 +82,18 @@ struct ProviderResponse: Codable {
 struct ProviderFirewallState: Codable, Equatable {
     var defaultInbound: String
     var defaultOutbound: String
+    var reject: Bool = false
     var disabled: Bool
     var rules: [ProviderFirewallRule]
+    var networks: [ProviderNetworkFirewall] = []
+}
+
+struct ProviderNetworkFirewall: Codable, Equatable, Identifiable {
+    var network: String
+    var autoAccept: Bool
+    var pendingRules: [ProviderFirewallRule]
+
+    var id: String { network }
 }
 
 struct ProviderFirewallRule: Codable, Equatable, Identifiable {
@@ -87,8 +103,9 @@ struct ProviderFirewallRule: Codable, Equatable, Identifiable {
     var port: String
     var peer: String
     var network: String
+    var suggestedBy: String? = nil
 
-    var id: String { "\(direction):\(action):\(protocolName):\(port):\(peer):\(network)" }
+    var id: String { "\(direction):\(action):\(protocolName):\(port):\(peer):\(network):\(suggestedBy ?? "")" }
 }
 
 struct ProviderStatus: Codable, Equatable {
@@ -197,6 +214,8 @@ struct ProviderNetwork: Codable, Equatable, Identifiable {
     var ipv6: String
     var role: String
     var peers: [ProviderPeer]
+    var pendingSuggestions: Int = 0
+    var autoAcceptFirewall: Bool = false
 
     var id: String { name }
 }

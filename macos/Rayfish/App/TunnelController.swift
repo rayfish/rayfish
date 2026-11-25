@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Darwin
 import Foundation
@@ -16,6 +17,7 @@ final class TunnelController: ObservableObject {
     private var pollingTask: Task<Void, Never>?
     private var machinesTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var toastTask: Task<Void, Never>?
     private let pathMonitor = NWPathMonitor()
     private let pathMonitorQueue = DispatchQueue(label: "com.rayfish.app.network-path")
     private var networkAvailable = false
@@ -24,6 +26,9 @@ final class TunnelController: ObservableObject {
     let notifications = RayfishNotifications()
 
     @Published var page: RayfishPage = .networks
+    @Published var firewallScope: FirewallScope = .general
+    @Published var firewallReturnToNetworks = false
+    @Published private(set) var toastMessage: String?
 
     private let fileHandoff = FileHandoff()
     private var deliveredFiles: [FileHandoff.Delivered]
@@ -79,7 +84,35 @@ final class TunnelController: ObservableObject {
         pollingTask?.cancel()
         machinesTask?.cancel()
         reconnectTask?.cancel()
+        toastTask?.cancel()
         pathMonitor.cancel()
+    }
+
+    func showToast(_ message: String) {
+        toastTask?.cancel()
+        toastMessage = message
+        toastTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 2_200_000_000) }
+            catch { return }
+            self?.toastMessage = nil
+        }
+    }
+
+    func copyToClipboard(_ value: String, label: String = "Copied") {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        showToast(label)
+    }
+
+    func openFirewall(for network: String? = nil) {
+        if let network {
+            firewallReturnToNetworks = page == .networks
+            firewallScope = .network(network)
+        } else {
+            firewallReturnToNetworks = false
+            firewallScope = .general
+        }
+        page = .firewall
     }
 
     func startup() async {
@@ -171,10 +204,11 @@ final class TunnelController: ObservableObject {
             let manager = try await TunnelPreferences.load()
             guard !isLoading, !isQuitting else { return }
             connectionStatus = manager?.connection.status ?? .disconnected
-            guard isConnected else { status = nil; clearMachines(); return }
+            guard isConnected else { status = nil; firewall = nil; clearMachines(); return }
             let response = try await TunnelIPC.request(ProviderRequest(action: .status))
             guard !isLoading, !isQuitting else { return }
             status = response.status
+            if let firewall = response.firewall { self.firewall = firewall }
             if status?.needsTCPHelper == true { try SSHHelper.register() }
             error = status?.needsTCPHelper == true ? SSHHelper.approvalMessage : nil
             if Date().timeIntervalSince(lastMachinesRefresh) >= 30 { refreshMachines() }
@@ -229,6 +263,7 @@ final class TunnelController: ObservableObject {
             let response = try await TunnelIPC.request(ProviderRequest(action: .status))
             RayfishLog.startup("initial status received", since: started, logger: RayfishLog.app)
             status = response.status
+            if let firewall = response.firewall { self.firewall = firewall }
             if status?.needsTCPHelper == true {
                 try SSHHelper.register(openSettings: true)
                 error = SSHHelper.approvalMessage
@@ -291,6 +326,7 @@ final class TunnelController: ObservableObject {
             connectionStatus = manager.connection.status
             if connectionStatus == .disconnected || connectionStatus == .invalid {
                 status = nil
+                firewall = nil
                 let elapsedMs = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
                 RayfishLog.app.info("VPN disconnected in \(elapsedMs) ms")
                 return
@@ -494,18 +530,56 @@ final class TunnelController: ObservableObject {
     }
 
     func addFirewallRule(direction: String, action: String, protocolName: String,
-                         port: String, peer: String?, network: String?) async {
-        _ = await perform(ProviderRequest(action: .firewallAdd, direction: direction, ruleAction: action,
-                                          protocolName: protocolName, port: port.isEmpty ? nil : port,
-                                          peer: peer, network: network))
+                         port: String, peer: String?, network: String?) async -> Bool {
+        let ok = await perform(ProviderRequest(action: .firewallAdd, direction: direction, ruleAction: action,
+                                               protocolName: protocolName, port: port.isEmpty ? nil : port,
+                                               peer: peer, network: network)) != nil
+        if ok { showToast("Firewall rule added") }
+        return ok
     }
 
     func removeFirewallRule(at index: UInt32) async {
-        _ = await perform(ProviderRequest(action: .firewallRemove, ruleIndex: index))
+        if await perform(ProviderRequest(action: .firewallRemove, ruleIndex: index)) != nil {
+            showToast("Firewall rule removed")
+        }
     }
 
     func setFirewallDefaultInbound(_ action: String) async {
-        _ = await perform(ProviderRequest(action: .firewallSetDefault, ruleAction: action))
+        if await perform(ProviderRequest(action: .firewallSetDefault, ruleAction: action)) != nil {
+            showToast("Inbound default set to \(action)")
+        }
+    }
+
+    func setFirewallDefaultOutbound(_ action: String) async {
+        if await perform(ProviderRequest(action: .firewallSetOutboundDefault, ruleAction: action)) != nil {
+            showToast("Outbound default set to \(action)")
+        }
+    }
+
+    func setFirewallEnabled(_ enabled: Bool) async {
+        if await perform(ProviderRequest(action: .firewallSetEnabled, enabled: enabled)) != nil {
+            showToast(enabled ? "Firewall resumed" : "Firewall paused")
+        }
+    }
+
+    func setFirewallReject(_ reject: Bool) async {
+        _ = await perform(ProviderRequest(action: .firewallSetReject, enabled: reject))
+    }
+
+    func acceptFirewallSuggestions(network: String) async {
+        if await perform(ProviderRequest(action: .firewallAcceptSuggestions, network: network)) != nil {
+            showToast("Accepted suggested rules for \(network)")
+        }
+    }
+
+    func denyFirewallSuggestions(network: String) async {
+        if await perform(ProviderRequest(action: .firewallDenySuggestions, network: network)) != nil {
+            showToast("Dismissed suggested rules for \(network)")
+        }
+    }
+
+    func setNetworkFirewallAutoAccept(network: String, enabled: Bool) async {
+        _ = await perform(ProviderRequest(action: .setNetworkFirewallAutoAccept, enabled: enabled, network: network))
     }
 
     private func perform(_ request: ProviderRequest) async -> ProviderResponse? {

@@ -3,7 +3,7 @@ import OSLog
 import UserNotifications
 
 enum RayfishPage: String, CaseIterable {
-    case networks = "Networks", devices = "Devices", files = "Files", settings = "Settings"
+    case networks = "Networks", devices = "Devices", firewall = "Firewall", files = "Files", settings = "Settings"
 }
 
 struct RayfishNotice: Equatable {
@@ -13,6 +13,7 @@ struct RayfishNotice: Equatable {
     var page: RayfishPage
     var destination: String? = nil
     var invitation: String? = nil
+    var network: String? = nil
 }
 
 enum InvitationResponse {
@@ -50,6 +51,11 @@ struct RayfishNoticeTracker {
             RayfishNotice(id: prefix + "invitation:\(invitation.id)", title: "Network invitation",
                           body: "You are invited to join \(invitation.network).", page: .networks,
                           invitation: invitation.id)
+        }
+        notices += status.networks.filter { $0.pendingSuggestions > 0 }.map { network in
+            RayfishNotice(id: prefix + "firewall:\(network.name)", title: "Suggested firewall rules",
+                          body: "Review \(network.pendingSuggestions) suggested rule\(network.pendingSuggestions == 1 ? "" : "s") for \(network.name).",
+                          page: .firewall, network: network.name)
         }
         let files = status.files ?? []
         notices += files.map { file in
@@ -91,6 +97,7 @@ struct RayfishNoticeTracker {
 @MainActor
 final class RayfishNotifications: NSObject, UNUserNotificationCenterDelegate {
     var onOpen: ((RayfishPage) -> Void)?
+    var onOpenFirewallNetwork: ((String) -> Void)?
     var onRevealFile: ((URL) -> Void)?
     var onRestartUpdate: (() -> Void)?
     var onInvitation: ((String, InvitationResponse) -> Void)?
@@ -165,6 +172,9 @@ final class RayfishNotifications: NSObject, UNUserNotificationCenterDelegate {
                 if let destination = notice.destination {
                     content.userInfo["destination"] = destination
                 }
+                if let network = notice.network {
+                    content.userInfo["network"] = network
+                }
                 if let invitation = notice.invitation {
                     content.categoryIdentifier = "rayfish.invitation"
                     content.userInfo["invitation"] = invitation
@@ -194,6 +204,7 @@ final class RayfishNotifications: NSObject, UNUserNotificationCenterDelegate {
             .flatMap(RayfishPage.init(rawValue:)) ?? .networks
         let destination = response.notification.request.content.userInfo["destination"] as? String
         let invitation = response.notification.request.content.userInfo["invitation"] as? String
+        let network = response.notification.request.content.userInfo["network"] as? String
         Task { @MainActor in
             if isUpdate {
                 if response.actionIdentifier == UNNotificationDefaultActionIdentifier
@@ -207,6 +218,8 @@ final class RayfishNotifications: NSObject, UNUserNotificationCenterDelegate {
             } else if response.actionIdentifier == UNNotificationDefaultActionIdentifier {
                 if let destination, FileManager.default.fileExists(atPath: destination) {
                     self.onRevealFile?(URL(fileURLWithPath: destination))
+                } else if page == .firewall, let network {
+                    self.onOpenFirewallNetwork?(network)
                 } else {
                     self.onOpen?(page)
                 }

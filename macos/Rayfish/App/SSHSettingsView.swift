@@ -8,7 +8,7 @@ struct SSHSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("Mesh SSH").font(RayfishTheme.heading(15))
+                Text("Mesh SSH").font(RayfishTheme.heading(15)).foregroundColor(RayfishTheme.ink)
                 Spacer()
                 Toggle("Mesh SSH", isOn: Binding(
                     get: { controller.status?.sshEnabled ?? false },
@@ -16,30 +16,41 @@ struct SSHSettingsView: View {
                 )).labelsHidden().toggleStyle(.switch)
             }
             Text("Allow trusted Rayfish peers to sign in to this Mac. Access is limited to the networks, peers, and local accounts below.")
+                .font(RayfishTheme.text(13))
                 .foregroundColor(RayfishTheme.muted)
             let rules = controller.status?.sshRules ?? []
             if rules.isEmpty {
-                Text("No peers have SSH access. Add a rule to allow someone.").foregroundColor(RayfishTheme.faint)
-            }
-            ForEach(rules) { rule in
-                HStack {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("\(peerLabel(rule)) on \(rule.network)").foregroundColor(RayfishTheme.ink)
-                        Text(rule.accounts).font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                Text("No peers have SSH access. Add a rule to allow someone.")
+                    .font(RayfishTheme.text(13))
+                    .foregroundColor(RayfishTheme.faint)
+            } else {
+                ForEach(rules) { rule in
+                    Rectangle().fill(RayfishTheme.line).frame(height: 1)
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(peerLabel(rule)) on \(rule.network)").foregroundColor(RayfishTheme.ink)
+                            Text(rule.accounts).font(RayfishTheme.mono(11)).foregroundColor(RayfishTheme.muted)
+                        }
+                        Spacer()
+                        Button("Edit") { editing = rule }
+                            .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
+                        Button("Remove", role: .destructive) { removing = rule }
+                            .buttonStyle(RayfishButtonStyle(kind: .danger, size: .compact))
                     }
-                    Spacer()
-                    Button("Edit") { editing = rule }
-                    Button("Remove", role: .destructive) { removing = rule }
                 }
             }
             Button("Add access rule") {
                 editing = ProviderSSHRule(network: controller.status?.networks.first?.name ?? "",
                                           peer: "", users: [NSUserName()])
-            }.disabled(controller.status?.networks.isEmpty != false)
+            }
+            .buttonStyle(RayfishButtonStyle(kind: .secondary, size: .compact))
+            .disabled(controller.status?.networks.isEmpty != false)
             if controller.status == nil {
-                Text("Connect to manage SSH access.").foregroundColor(RayfishTheme.faint)
+                Text("Connect to manage SSH access.")
+                    .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.faint)
             } else if controller.status?.sshEnabled != true && !rules.isEmpty {
-                Text("SSH is off. These rules take effect when you enable it.").foregroundColor(RayfishTheme.faint)
+                Text("SSH is off. These rules take effect when you enable it.")
+                    .font(RayfishTheme.text(13)).foregroundColor(RayfishTheme.faint)
             }
         }
         .padding(18).rayfishCard()
@@ -115,6 +126,7 @@ private struct SSHRuleEditor: View {
                 TextField("Local usernames, separated by commas", text: $usernames)
             }
             Text("Rules apply to the peer's identity, including its paired devices. An all-peers rule also covers future members of this network.")
+                .font(RayfishTheme.text(13))
                 .foregroundColor(RayfishTheme.muted)
             if let error = controller.error { Text(error).foregroundColor(RayfishTheme.amber) }
             HStack {

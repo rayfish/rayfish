@@ -75,5 +75,18 @@ struct NotificationTests {
         precondition(ProviderSSHRule(network: "box", peer: "*", users: []).accounts == "Any account except root")
         precondition(ProviderSSHRule(network: "box", peer: "*", users: ["*"]).accounts == "Any account, including root")
         print("PASS: file status round-trips and SSH account scopes remain distinct")
+
+        var fwTracker = RayfishNoticeTracker()
+        var fwStatus = ProviderStatus(active: true, ipv6: "200::1", networks: [
+            ProviderNetwork(name: "work-net", hostname: "laptop", ipv6: "200::1", role: "member",
+                            peers: [], pendingSuggestions: 2)
+        ], pendingRequests: [])
+        let fwAdded = fwTracker.update(fwStatus)
+        precondition(fwAdded.added.count == 1 && fwAdded.added[0].page == .firewall)
+        precondition(fwAdded.added[0].network == "work-net")
+        precondition(fwTracker.update(fwStatus).added.isEmpty)
+        fwStatus.networks[0].pendingSuggestions = 0
+        precondition(fwTracker.update(fwStatus).removed == [fwAdded.added[0].id])
+        print("PASS: pending firewall suggestions notify once and route to that network's firewall view")
     }
 }

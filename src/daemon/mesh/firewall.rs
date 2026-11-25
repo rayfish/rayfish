@@ -545,6 +545,45 @@ impl Daemon {
         self.registry.firewall_default(action)
     }
 
+    pub fn firewall_default_outbound(&self, action: firewall::Action) -> OpResult<Done> {
+        self.registry
+            .firewall_config_set(FirewallKey::DefaultOut, &action.to_string())
+    }
+
+    pub fn firewall_set_enabled(&self, enabled: bool) -> OpResult<Done> {
+        self.registry
+            .firewall_config_set(FirewallKey::Enabled, if enabled { "on" } else { "off" })
+    }
+
+    pub fn firewall_set_reject(&self, reject: bool) -> OpResult<Done> {
+        self.registry
+            .firewall_config_set(FirewallKey::Reject, if reject { "on" } else { "off" })
+    }
+
+    pub fn firewall_pending_rules(&self, network: &str) -> OpResult<Vec<FirewallRuleView>> {
+        match self.registry.firewall_pending(network) {
+            IpcMessage::FirewallPendingResponse { rules, .. } => Ok(rules),
+            IpcMessage::Error { message } => op_err(message),
+            other => op_err(format!("unexpected firewall_pending reply: {other:?}")),
+        }
+    }
+
+    pub fn firewall_accept_suggestions(&self, network: &str) -> OpResult<Done> {
+        match self.registry.firewall_accept(network) {
+            IpcMessage::Ok { message } => Ok(Done(message)),
+            IpcMessage::Error { message } => op_err(message),
+            other => op_err(format!("unexpected firewall_accept reply: {other:?}")),
+        }
+    }
+
+    pub fn firewall_deny_suggestions(&self, network: &str) -> OpResult<Done> {
+        match self.registry.firewall_deny(network) {
+            IpcMessage::Ok { message } => Ok(Done(message)),
+            IpcMessage::Error { message } => op_err(message),
+            other => op_err(format!("unexpected firewall_deny reply: {other:?}")),
+        }
+    }
+
     /// Apply the `ssh` settings key (`ray firewall ssh on|off`, `ray config set
     /// ssh <on|off>`), which is more than a config write: it also seeds/removes
     /// the port's passthrough so SSH packets reach the listener under

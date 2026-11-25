@@ -5,7 +5,11 @@ import NetworkExtension
 // A view model fixture keeps these UI tests away from the installed VPN.
 @MainActor
 final class TunnelController: ObservableObject {
+    @Published var page: RayfishPage = .networks
+    @Published var firewallScope: FirewallScope = .general
+    @Published var firewallReturnToNetworks = false
     @Published var status: ProviderStatus?
+    @Published var firewall: ProviderFirewallState?
     @Published var activity: String? = "Connecting..."
     @Published var error: String?
     @Published var isLoading = true
@@ -15,12 +19,28 @@ final class TunnelController: ObservableObject {
     func connect() async { connectionStatus = .connected }
     func disconnect() async { connectionStatus = .disconnected }
     func selectExitNode(network: String, peer: String?) async {}
+    func loadFirewall() async {}
+    func addFirewallRule(direction: String, action: String, protocolName: String,
+                         port: String, peer: String?, network: String?) async -> Bool { true }
+    func removeFirewallRule(at index: UInt32) async {}
+    func setFirewallDefaultInbound(_ action: String) async {}
+    func setFirewallDefaultOutbound(_ action: String) async {}
+    func setFirewallEnabled(_ enabled: Bool) async {}
+    func setFirewallReject(_ reject: Bool) async {}
+    func acceptFirewallSuggestions(network: String) async {}
+    func denyFirewallSuggestions(network: String) async {}
+    func setNetworkFirewallAutoAccept(network: String, enabled: Bool) async {}
+}
+
+enum RayfishPage: String, CaseIterable {
+    case networks = "Networks", devices = "Devices", firewall = "Firewall", files = "Files", settings = "Settings"
 }
 
 @main
 struct AppUITests {
     @MainActor
     static func main() throws {
+        firewallPartitioningAndLabels()
         try shellCommandAliases()
         try fishCommandInstallation()
         _ = NSApplication.shared
@@ -225,5 +245,52 @@ struct AppUITests {
         let reinstalled = try String(contentsOf: customInstalled, encoding: .utf8)
         precondition(reinstalled == contents)
         print("PASS: fish installation creates its config directory and preserves settings on reinstall")
+    }
+
+    private static func firewallPartitioningAndLabels() {
+        let networks = [
+            ProviderNetwork(name: "alpha", hostname: "laptop", ipv6: "200::1", role: "coordinator", peers: [
+                ProviderPeer(hostname: "server-a", ipv6: "200::2", state: "direct", latencyMs: 12,
+                             isOwnDevice: false, identity: "abcdef1234567890")
+            ]),
+            ProviderNetwork(name: "beta", hostname: "laptop", ipv6: "200::1", role: "member", peers: [])
+        ]
+        let firewall = ProviderFirewallState(
+            defaultInbound: "deny",
+            defaultOutbound: "allow",
+            reject: true,
+            disabled: false,
+            rules: [
+                ProviderFirewallRule(direction: "in", action: "allow", protocolName: "icmp",
+                                     port: "*", peer: "any", network: "any"),
+                ProviderFirewallRule(direction: "in", action: "allow", protocolName: "tcp",
+                                     port: "443", peer: "abcdef", network: "alpha", suggestedBy: "alpha"),
+                ProviderFirewallRule(direction: "out", action: "deny", protocolName: "udp",
+                                     port: "53", peer: "any", network: "beta"),
+                ProviderFirewallRule(direction: "in", action: "allow", protocolName: "tcp",
+                                     port: "22", peer: "any", network: "departed")
+            ],
+            networks: [
+                ProviderNetworkFirewall(network: "alpha", autoAccept: true, pendingRules: [
+                    ProviderFirewallRule(direction: "in", action: "allow", protocolName: "tcp",
+                                         port: "8080", peer: "any", network: "alpha", suggestedBy: "alpha")
+                ])
+            ]
+        )
+        let alphaRules = FirewallModel.rules(forNetwork: "alpha", in: firewall)
+        precondition(alphaRules.map(\.index) == [1])
+        let betaRules = FirewallModel.rules(forNetwork: "beta", in: firewall)
+        precondition(betaRules.map(\.index) == [2])
+        let generalRules = FirewallModel.generalRules(in: firewall, activeNetworks: ["alpha", "beta"])
+        precondition(generalRules.map(\.index) == [0, 3])
+        precondition(FirewallModel.autoAccept(forNetwork: "alpha", in: firewall))
+        precondition(!FirewallModel.autoAccept(forNetwork: "beta", in: firewall))
+        precondition(FirewallModel.pendingRules(forNetwork: "alpha", in: firewall).count == 1)
+        precondition(FirewallModel.peerLabel(for: "abcdef", in: networks, scopedNetwork: "alpha") == "server-a (abcdef)")
+        precondition(FirewallModel.peerLabel(for: "any", in: networks, scopedNetwork: nil) == "Any peer")
+        precondition(FirewallModel.trafficSummary(for: firewall.rules[0]) == "ICMP (ping and diagnostics)")
+        precondition(FirewallModel.trafficSummary(for: firewall.rules[1]) == "TCP · port 443")
+        precondition(FirewallModel.originLabel(for: firewall.rules[1]) == "SUGGESTED")
+        print("PASS: per-network and general firewall views preserve global rule indices and resolve peers")
     }
 }
