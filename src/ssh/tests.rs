@@ -697,6 +697,37 @@ async fn pipe_and_pty_commands_report_exit_status_before_close() {
 }
 
 #[tokio::test]
+async fn pty_hangup_drains_output_larger_than_the_client_window() {
+    let config = client::Config {
+        window_size: 4,
+        ..client::Config::default()
+    };
+    let addr = serve_one(LOGIN_GRACE).await;
+    let mut client = client::connect(Arc::new(config), addr, AcceptAnyHost { opened: None })
+        .await
+        .expect("connect");
+    assert!(
+        client
+            .authenticate_none(test_account())
+            .await
+            .expect("auth")
+            .success()
+    );
+    let mut channel = client.channel_open_session().await.expect("open session");
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .expect("request pty");
+    channel
+        .exec(true, "printf completed; exit 23")
+        .await
+        .expect("exec");
+    let (output, code) = drain(&mut channel).await;
+    assert_eq!(output, "completed");
+    assert_eq!(code, Some(23));
+}
+
+#[tokio::test]
 async fn direct_tcpip_channel_carries_a_forwarded_connection() {
     // `ssh -L`, `ssh -D` and `ProxyJump` all open this channel type. With
     // no handler for it russh refuses the open ("administratively

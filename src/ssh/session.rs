@@ -271,9 +271,9 @@ pub(super) async fn run_pty_session(
         }
     });
     let p2c = tokio::spawn(async move {
-        let mut chan_write = channel_write.make_writer();
-        let _ = tokio::io::copy(&mut pty_read, &mut chan_write).await;
-        let _ = chan_write.shutdown().await;
+        // A Linux PTY reports EIO on hangup. Finish sending each read before
+        // reading again so a closed slave cannot discard pending SSH output.
+        copy_output(&mut pty_read, |bytes| channel_write.data_bytes(bytes)).await;
     });
 
     let status = child.wait().await.context("waiting on child")?;
