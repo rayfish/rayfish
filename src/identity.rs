@@ -81,16 +81,18 @@ pub fn delete_device_cert() -> Result<()> {
 
 pub fn load_device_cert() -> Result<Option<DeviceCert>> {
     let path = device_cert_path()?;
-    if path.exists() {
-        let bytes = std::fs::read(&path).context("read device cert")?;
-        let cert: DeviceCert = rmp_serde::from_slice(&bytes).context("decode device cert")?;
-        if !cert.verify() {
-            anyhow::bail!("stored device certificate has invalid signature");
-        }
-        Ok(Some(cert))
-    } else {
-        Ok(None)
+    // Read without an `exists()` check first: unpairing can delete the file
+    // between the check and the read.
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("read device cert"),
+    };
+    let cert: DeviceCert = rmp_serde::from_slice(&bytes).context("decode device cert")?;
+    if !cert.verify() {
+        anyhow::bail!("stored device certificate has invalid signature");
     }
+    Ok(Some(cert))
 }
 
 #[cfg(test)]
