@@ -4,6 +4,53 @@ All notable changes to Rayfish are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.18] - 2026-11-26
+
+### Added
+
+- Run `ray config set mesh-offload off` and restart the Linux daemon to disable TUN offload and mesh QUIC UDP segmentation together.
+- Add a top-level Firewall view across desktop (macOS, Windows, `ray gui`) and mobile (iOS, Android) with a per-network rule view, a general view for cross-network rules and default policies, coordinator suggestion review, per-network auto-accept toggles, and quick rule presets.
+- Add direct `+ Rule` peer actions and per-network Firewall shortcuts on network cards so rules can be scoped to a network or peer in one step.
+
+### Changed
+
+- Publish and discover networks and peers through the Mainline DHT as well as
+  HTTPS, so discovery can continue if the default HTTPS server is down.
+- The benchmark suites and performance results now live in [Rayfish benchmarks](https://github.com/rayfish/benchmarks).
+- You can now send one person invites to many networks at once. Someone who
+  shares no network with you holds one pending invite from you; the rest wait
+  and arrive automatically once they accept it. People you already share a
+  network with can hold up to 64 pending invites from you.
+- Improve UI comfort for large meshes with collapsible network cards, network and peer search filters, an active-only peer filter in Devices, compact `•••` network action menus that tuck destructive actions out of the primary header, and immediate copy feedback.
+
+### Fixed
+
+- Linux exit nodes detect uplinks that use policy routing or split default routes
+  and reject unreachable defaults.
+- macOS: validate network and Mac names while typing, explain invalid names
+  beside each field, and keep create/join errors visible until editing or retrying.
+- macOS: show network errors without internal Swift type names and escaping.
+- Exit-node status lists IPv4 and IPv6 capabilities, marks unsupported families
+  as blocked, and says when traffic still goes out directly.
+- Daemon shutdown releases its startup lock even when a subprocess inherits the
+  lock descriptor, allowing an immediate restart.
+- The macOS app can save received files to Downloads and other protected
+  folders. Auto-accepted files move to Downloads when the app is open.
+- Choosing Replace when accepting a file replaces the existing copy.
+- Confirm the signed roster before reporting a successful admin grant, so a
+  coordinator can stop after handing over responsibility.
+- An invite sent past the recipient's limit is no longer refused for good. The
+  sender keeps retrying it until it expires, so it lands once the recipient
+  has room.
+- The first Linux mesh transfer recovers faster when the network card rejects UDP segmentation offload.
+- SSH commands run with a terminal now deliver their final output even when the client reads slowly.
+
+### Performance
+
+- The `fq-codel` forwarding engine lets QUIC queue about 3 ms of traffic instead of a fixed 16 KiB, which raises its throughput on fast links by roughly a quarter while keeping latency on slow links where it was.
+- Linux peers use TUN offload and QUIC UDP segmentation together to improve throughput. If the kernel rejects segmented UDP sends, existing connections fall back to single datagrams.
+- Release builds use link-time optimization, which makes forwarding about 12% faster and the binaries about a quarter smaller.
+
 ## [0.5.17] - 2026-11-19
 
 ### Added
@@ -3377,6 +3424,7 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
+[0.5.18]: https://github.com/rayfish/rayfish/releases/tag/v0.5.18
 [0.5.14]: https://github.com/rayfish/rayfish/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/rayfish/rayfish/compare/v0.5.12...v0.5.13
 [0.5.12]: https://github.com/rayfish/rayfish/compare/v0.5.11...v0.5.12
