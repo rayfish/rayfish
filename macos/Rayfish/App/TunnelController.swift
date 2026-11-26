@@ -36,11 +36,17 @@ final class TunnelController: ObservableObject {
     /// The last status from the extension, before `FileHandoff.present`.
     private var providerStatus: ProviderStatus?
 
-    @Published var status: ProviderStatus? {
-        didSet {
-            providerStatus = status
-            status = FileHandoff.present(status, delivered: deliveredFiles, incoming: fileHandoff.incoming)
-            notifications.update(status)
+    /// What the UI shows. Kept separate from `status` because assigning a
+    /// `@Published` property inside its own `didSet` recurses until the
+    /// stack overflows.
+    @Published private var presentedStatus: ProviderStatus?
+
+    var status: ProviderStatus? {
+        get { presentedStatus }
+        set {
+            providerStatus = newValue
+            presentedStatus = FileHandoff.present(newValue, delivered: deliveredFiles, incoming: fileHandoff.incoming)
+            notifications.update(presentedStatus)
             deliverReceivedFiles()
         }
     }
