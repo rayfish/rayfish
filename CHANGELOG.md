@@ -4,6 +4,12 @@ All notable changes to Rayfish are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.19] - 2026-11-26
+
+### Fixed
+
+- The macOS app no longer crashes on launch when connecting.
+
 ## [0.5.18] - 2026-11-26
 
 ### Added
@@ -3424,6 +3430,7 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
+[0.5.19]: https://github.com/rayfish/rayfish/releases/tag/v0.5.19
 [0.5.18]: https://github.com/rayfish/rayfish/releases/tag/v0.5.18
 [0.5.14]: https://github.com/rayfish/rayfish/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/rayfish/rayfish/compare/v0.5.12...v0.5.13
