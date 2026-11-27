@@ -48,6 +48,13 @@ impl Mainline {
             .context("Mainline DHT client unavailable")
     }
 
+    /// A DHT that stays unavailable for as long as the sender lives.
+    #[cfg(test)]
+    pub(super) fn never_ready() -> (watch::Sender<Option<Dht>>, Self) {
+        let (sender, client) = watch::channel(None);
+        (sender, Self(client))
+    }
+
     #[cfg(test)]
     pub(super) fn for_test(dht: Dht) -> Self {
         Self(watch::channel(Some(dht)).1)

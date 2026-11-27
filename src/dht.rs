@@ -64,31 +64,32 @@ impl PkarrClient {
         self
     }
 
+    /// Any relay answer, found or not, is final. Mainline is only the fallback
+    /// for an unreachable relay: its iterative queries take seconds, and every
+    /// network restore on startup resolves two records through here.
     pub(crate) async fn resolve(&self, key: EndpointId) -> Result<Option<SignedPacket>> {
         let relay = resolve_relay(&self.relay, key);
         let Some(mainline) = &self.mainline else {
             return relay.await;
         };
-        match tokio::join!(mainline.resolve(key), relay) {
-            (Ok(Some(dht)), Ok(Some(relay))) => {
-                // Destruction is terminal across both backends, even if a
-                // stale coordinator published another roster in the meantime.
-                let prefer_relay = match (
-                    destruction::is_destroyed(&dht),
-                    destruction::is_destroyed(&relay),
-                ) {
-                    (true, false) => false,
-                    (false, true) => true,
-                    _ => relay.more_recent_than(&dht),
-                };
-                Ok(Some(if prefer_relay { relay } else { dht }))
+        // Start the DHT query now so a relay failure does not wait twice.
+        let dht = mainline.resolve(key);
+        tokio::pin!(relay, dht);
+        let mut dht_result = None;
+        let relay_error = loop {
+            tokio::select! {
+                relay = &mut relay => match relay {
+                    Ok(found) => return Ok(found),
+                    Err(error) => break error,
+                },
+                dht = &mut dht, if dht_result.is_none() => dht_result = Some(dht),
             }
-            (Ok(Some(packet)), _) | (_, Ok(Some(packet))) => Ok(Some(packet)),
-            (Ok(None), _) | (_, Ok(None)) => Ok(None),
-            (Err(dht), Err(relay)) => {
-                Err(dht.context(format!("pkarr relay lookup failed: {relay:#}")))
-            }
-        }
+        };
+        let dht = match dht_result {
+            Some(dht) => dht,
+            None => dht.await,
+        };
+        dht.map_err(|dht| dht.context(format!("pkarr relay lookup failed: {relay_error:#}")))
     }
 
     async fn publish(&self, packet: &SignedPacket) -> Result<()> {
@@ -355,7 +356,9 @@ mod tests {
                 ("200 OK", forged),
                 ("404 Not Found", vec![]),
                 ("200 OK", valid.clone()),
+                ("200 OK", valid.clone()),
                 ("200 OK", valid),
+                ("404 Not Found", vec![]),
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -403,9 +406,26 @@ mod tests {
                 .unwrap(),
         );
         dht.publish(&updated).await.unwrap();
-        let dual = client.with_mainline(Some(dht));
+        let dual = client.clone().with_mainline(Some(dht));
         let resolved = dual.resolve(network.public()).await.unwrap().unwrap();
-        assert_eq!(resolved.as_bytes(), updated.as_bytes());
+        assert_eq!(decode_network_record(&resolved).unwrap().0, hash);
+        assert_ne!(resolved.as_bytes(), updated.as_bytes());
+
+        // A DHT that never answers must not delay a relay answer, found or not.
+        let (_never, stalled) = Mainline::never_ready();
+        let stalled = client.with_mainline(Some(stalled));
+        let quick = std::time::Duration::from_secs(2);
+        let found = tokio::time::timeout(quick, stalled.resolve(network.public()))
+            .await
+            .expect("relay answer returns without the DHT");
+        assert_eq!(
+            decode_network_record(&found.unwrap().unwrap()).unwrap().0,
+            hash
+        );
+        let missing = tokio::time::timeout(quick, stalled.resolve(network.public()))
+            .await
+            .expect("relay miss returns without the DHT");
+        assert!(missing.unwrap().is_none());
 
         server.await.unwrap();
         endpoint.close().await;
