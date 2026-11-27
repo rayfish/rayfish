@@ -47,6 +47,12 @@ struct TunnelIPCTests {
         precondition(noServices.needsTCPHelper)
         print("PASS: settings, peer requests, and independent machine inventory round-trip")
 
+        for action in [ProviderRequest.Action.join, .acceptInvitation, .connectPeer, .approveConnection] {
+            precondition(TunnelIPC.timeout(for: action) == 90, "\(action) must outlast a slow join")
+        }
+        precondition(TunnelIPC.timeout(for: .acceptFile) == 10)
+        print("PASS: joins get the long provider timeout")
+
         let barrier = ReplyBarrier()
         async let first = TunnelIPC.send(Data("first".utf8), using: barrier.send)
         async let second = TunnelIPC.send(Data("second".utf8), using: barrier.send)

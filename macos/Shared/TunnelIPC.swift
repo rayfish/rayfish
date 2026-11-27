@@ -160,9 +160,7 @@ enum TunnelIPC {
             }
             // NetworkExtension authenticates the containing app and routes messages to its provider.
             let data = try JSONEncoder().encode(request)
-            // acceptFile returns once the receive starts, so it takes the default.
-            let timeout: TimeInterval = request.action == .connectPeer || request.action == .approveConnection ? 90 : 10
-            let reply = try await send(data, timeout: timeout) { data, reply in
+            let reply = try await send(data, timeout: timeout(for: request.action)) { data, reply in
                 try session.sendProviderMessage(data, responseHandler: reply)
             }
             let response = try JSONDecoder().decode(ProviderResponse.self, from: reply)
@@ -171,6 +169,15 @@ enum TunnelIPC {
         } catch {
             RayfishLog.ipc.error("\(request.action.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             throw error
+        }
+    }
+
+    /// Joins wait for the coordinator to admit us, often well past 10s.
+    /// acceptFile returns once the receive starts, so it takes the default.
+    static func timeout(for action: ProviderRequest.Action) -> TimeInterval {
+        switch action {
+        case .connectPeer, .approveConnection, .join, .acceptInvitation: return 90
+        default: return 10
         }
     }
 
