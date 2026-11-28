@@ -43,7 +43,7 @@ enum RayfishTheme {
 
 struct RayfishButtonStyle: ButtonStyle {
     enum Kind { case secondary, primary, danger, connected, subtle }
-    enum Size { case regular, compact }
+    enum Size { case regular, compact, inline }
     var kind: Kind = .secondary
     var size: Size = .regular
 
@@ -60,16 +60,44 @@ struct RayfishButtonStyle: ButtonStyle {
 
         var body: some View {
             configuration.label
-                .font(RayfishTheme.heading(size == .compact ? 12 : 13))
+                .font(RayfishTheme.heading(fontSize))
                 .foregroundColor(foreground)
-                .padding(.horizontal, size == .compact ? 10 : 13)
-                .frame(minHeight: size == .compact ? 28 : 32)
+                .padding(.horizontal, horizontalPadding)
+                .frame(minHeight: minHeight)
                 .background(backgroundFill)
-                .clipShape(RoundedRectangle(cornerRadius: 7))
-                .overlay(RoundedRectangle(cornerRadius: 7).stroke(border, lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius).stroke(border, lineWidth: 1))
                 .opacity(isEnabled ? 1 : 0.42)
-                .contentShape(RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: cornerRadius))
                 .onHover { isHovered = $0 }
+        }
+
+        private var fontSize: CGFloat {
+            switch size {
+            case .regular: 13
+            case .compact: 12
+            case .inline: 11.5
+            }
+        }
+
+        private var horizontalPadding: CGFloat {
+            switch size {
+            case .regular: 13
+            case .compact: 10
+            case .inline: 8
+            }
+        }
+
+        private var minHeight: CGFloat {
+            switch size {
+            case .regular: 32
+            case .compact: 28
+            case .inline: 22
+            }
+        }
+
+        private var cornerRadius: CGFloat {
+            size == .inline ? 6 : 7
         }
 
         private var foreground: Color {

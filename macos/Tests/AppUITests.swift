@@ -1,6 +1,8 @@
 import AppKit
 import Combine
+import CoreText
 import NetworkExtension
+import SwiftUI
 
 // A view model fixture keeps these UI tests away from the installed VPN.
 @MainActor
@@ -41,9 +43,10 @@ struct AppUITests {
     @MainActor
     static func main() throws {
         firewallPartitioningAndLabels()
+        _ = NSApplication.shared
+        peerRowHoverPreservesSize()
         try shellCommandAliases()
         try fishCommandInstallation()
-        _ = NSApplication.shared
         let controller = TunnelController()
         let menu = NSMenu()
         var updateVersion: String?
@@ -299,5 +302,76 @@ struct AppUITests {
         precondition(FirewallModel.trafficSummary(for: firewall.rules[1]) == "TCP · port 443")
         precondition(FirewallModel.originLabel(for: firewall.rules[1]) == "SUGGESTED")
         print("PASS: per-network and general firewall views preserve global rule indices and resolve peers")
+    }
+
+    @MainActor
+    private static func peerRowHoverPreservesSize() {
+        for name in ["ChakraPetch-Regular", "ChakraPetch-SemiBold", "IBMPlexMono-Regular"] {
+            let url = URL(fileURLWithPath: "macos/Rayfish/Fonts/\(name).ttf")
+            if FileManager.default.fileExists(atPath: url.path) {
+                CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+            }
+        }
+        let remote = ProviderPeer(
+            hostname: "peer-host-alpha",
+            ipv6: "200:aaaa:bbbb:cccc:dddd:eeee:ffff:0001",
+            state: "relay",
+            latencyMs: 510,
+            isOwnDevice: false,
+            identity: "abcdef1234567890"
+        )
+        let own = ProviderPeer(
+            hostname: "own-device",
+            ipv6: "200:aaaa:bbbb:cccc:dddd:eeee:ffff:0002",
+            state: "idle",
+            latencyMs: nil,
+            isOwnDevice: true,
+            identity: "1234567890abcdef"
+        )
+        for width: CGFloat in [820, 560] {
+            let unhovered = renderedSize(
+                PeerRow(peer: remote, domains: ["peer-host-alpha.testnet.ray"],
+                        copyText: { _, _ in }, onAddFirewallRule: {}, isHovered: false),
+                width: width
+            )
+            let hovered = renderedSize(
+                PeerRow(peer: remote, domains: ["peer-host-alpha.testnet.ray"],
+                        copyText: { _, _ in }, onAddFirewallRule: {}, isHovered: true),
+                width: width
+            )
+            let ownUnhovered = renderedSize(
+                PeerRow(peer: own, domains: ["own-device.testnet.ray"],
+                        copyText: { _, _ in }, onAddFirewallRule: nil, isHovered: false),
+                width: width
+            )
+            let ownHovered = renderedSize(
+                PeerRow(peer: own, domains: ["own-device.testnet.ray"],
+                        copyText: { _, _ in }, onAddFirewallRule: nil, isHovered: true),
+                width: width
+            )
+            let devicesUnhovered = renderedSize(
+                PeerRow(peer: remote, domains: ["peer-host-alpha.testnet.ray"],
+                        copyText: { _, _ in }, onAddFirewallRule: nil, isHovered: false),
+                width: width
+            )
+            let devicesHovered = renderedSize(
+                PeerRow(peer: remote, domains: ["peer-host-alpha.testnet.ray"],
+                        copyText: { _, _ in }, onAddFirewallRule: nil, isHovered: true),
+                width: width
+            )
+            precondition(hovered == unhovered, "hovered peer row changed size: \(unhovered) -> \(hovered)")
+            precondition(ownHovered == ownUnhovered, "hovered own peer row changed size: \(ownUnhovered) -> \(ownHovered)")
+            precondition(devicesHovered == devicesUnhovered, "hovered devices peer row changed size: \(devicesUnhovered) -> \(devicesHovered)")
+            precondition(ownUnhovered.height == unhovered.height, "own peer row height \(ownUnhovered.height) != \(unhovered.height)")
+            precondition(devicesUnhovered.height == unhovered.height, "devices peer row height \(devicesUnhovered.height) != \(unhovered.height)")
+        }
+        print("PASS: peer rows keep a uniform size on hover")
+    }
+
+    @MainActor
+    private static func renderedSize<V: View>(_ view: V, width: CGFloat) -> NSSize {
+        let hosting = NSHostingView(rootView: view.frame(width: width))
+        hosting.layoutSubtreeIfNeeded()
+        return hosting.fittingSize
     }
 }
